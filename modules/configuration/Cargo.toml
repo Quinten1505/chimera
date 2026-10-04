@@ -1,0 +1,5 @@
+[package]
+name = "chimera-configuration"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true

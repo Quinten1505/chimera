@@ -1,0 +1,8 @@
+[package]
+name = "chimera-github"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chimera-core.workspace = true
