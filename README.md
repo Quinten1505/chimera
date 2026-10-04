@@ -8,7 +8,7 @@ modules in a Cargo workspace. All modules run in the same process.
 | Path | Responsibility |
 | --- | --- |
 | `src/main.rs` | Composition root: load configuration, construct modules, and start the application. |
-| `modules/core` | Shared domain concepts and rules, independent of configuration and external systems. |
+| `modules/core` | Shared application concepts and Herdr connection, worktree, and pane operations. |
 | `modules/workflow` | Workflow use cases and orchestration. |
 | `modules/github` | GitHub integration and translation between GitHub data and domain concepts. |
 | `modules/configuration` | Loading and validating application settings. |
@@ -39,8 +39,8 @@ and passes configuration into the modules that need it. Introduce interfaces
 for cross-module behavior when concrete use cases require them, keeping this
 dependency direction and avoiding cycles.
 
-This is an architectural scaffold: module interfaces are intentionally empty
-until behavior is added. The executable retains its initial hello-world output.
+Workflow, GitHub, and configuration remain scaffolds. Core provides the Herdr
+client below. The executable retains its initial hello-world output.
 
 ## Development
 
@@ -59,3 +59,52 @@ All five packages are default workspace members, so plain `cargo build` and
 `cargo test` also include every module. Run a focused module check with, for
 example, `cargo test -p chimera-workflow`. The deployable binary is
 `target/release/chimera` after `cargo build --release -p chimera`.
+
+## Herdr integration
+
+Core exposes a synchronous client for Herdr's local Unix socket API (Linux,
+macOS, and WSL). Start Herdr first and supply its socket path explicitly, for
+example from HERDR_SOCKET_PATH or ~/.config/herdr/herdr.sock. Native Windows
+named pipes are not implemented.
+
+```rust
+use chimera_core::{
+    HerdrClient, PaneOptions, SplitDirection, WorktreeOptions, WorktreeSource,
+};
+
+fn provision() -> Result<(), Box<dyn std::error::Error>> {
+    let client = HerdrClient::connect(std::env::var("HERDR_SOCKET_PATH")?)?;
+    let options = WorktreeOptions::new(
+        WorktreeSource::Directory { cwd: std::env::current_dir()? },
+        "feature/my-task",
+    );
+    let worktree = client.create_worktree(&options)?;
+    let pane = client.add_pane(&PaneOptions::new(
+        worktree.root_pane.pane_id,
+        SplitDirection::Right,
+    ))?;
+    println!("Created pane {}", pane.pane_id);
+    Ok(())
+}
+```
+
+Use WorktreeSource::Workspace to target an existing Herdr workspace instead.
+Worktree options also accept a base revision, absolute checkout path, label, and
+focus flag. Herdr checks out an existing branch or creates one from the base
+(default HEAD). Pane options accept an absolute working directory and focus
+flag; call add_pane repeatedly to add more panes, targeting returned pane IDs.
+Both operations default to leaving focus unchanged.
+
+Connections are verified with ping. Requests use a fresh connection and a
+30-second read/write timeout, configurable with connect_with_timeout. Transport,
+JSON, protocol, validation, and server errors are returned as HerdrError.
+A timeout can happen after a mutation succeeds; requests are not retried
+automatically. Repository trust and worktree location policies remain Herdr-owned.
+
+Tests use isolated fake Unix sockets. An optional read-only live connection test:
+```sh
+HERDR_SOCKET_PATH="$HOME/.config/herdr/herdr.sock" cargo test -p chimera-core live_connection -- --ignored
+```
+
+The request shapes were checked against the installed Herdr 0.9.3 schema
+(protocol 22); see the [Herdr socket API](https://herdr.dev/docs/socket-api/).
