@@ -1,6 +1,6 @@
 [workspace]
-members = ["modules/core", "modules/workflow", "modules/github", "modules/configuration"]
-default-members = [".", "modules/core", "modules/workflow", "modules/github", "modules/configuration"]
+members = ["crates/core", "crates/workflow", "crates/github", "crates/configuration"]
+default-members = [".", "crates/core", "crates/workflow", "crates/github", "crates/configuration"]
 resolver = "3"
 
 [workspace.package]
@@ -9,10 +9,10 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
-chimera-core = { path = "modules/core" }
-chimera-workflow = { path = "modules/workflow" }
-chimera-github = { path = "modules/github" }
-chimera-configuration = { path = "modules/configuration" }
+chimera-core = { path = "crates/core" }
+chimera-workflow = { path = "crates/workflow" }
+chimera-github = { path = "crates/github" }
+chimera-configuration = { path = "crates/configuration" }
 
 [package]
 name = "chimera"

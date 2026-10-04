@@ -8,10 +8,10 @@ modules in a Cargo workspace. All modules run in the same process.
 | Path | Responsibility |
 | --- | --- |
 | `src/main.rs` | Composition root: load configuration, construct modules, and start the application. |
-| `modules/core` | Shared application concepts and Herdr connection, worktree, and pane operations. |
-| `modules/workflow` | Workflow use cases and orchestration. |
-| `modules/github` | GitHub integration and translation between GitHub data and domain concepts. |
-| `modules/configuration` | Loading and validating application settings. |
+| `crates/core` | Shared application concepts and Herdr connection, worktree, and pane operations. |
+| `crates/workflow` | Workflow use cases and orchestration. |
+| `crates/github` | GitHub integration and translation between GitHub data and domain concepts. |
+| `crates/configuration` | Loading and validating application settings. |
 
 Package names use the `chimera-` prefix (for example, `chimera-core`) to
 avoid colliding with Rust's built-in `core` crate.
