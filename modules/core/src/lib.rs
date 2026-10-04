@@ -1,11 +1,14 @@
 //! Shared application concepts and the Herdr integration.
 
+mod agent;
 mod herdr;
 mod session;
 
+pub use agent::{Agent, AgentSessionReference};
+
 pub use herdr::{
-    CreatedWorktree, HerdrClient, HerdrError, Pane, PaneOptions, SplitDirection, Tab, Workspace,
-    Worktree, WorktreeOptions, WorktreeSource,
+    CreatedWorkspace, CreatedWorktree, HerdrClient, HerdrError, Pane, PaneOptions, SplitDirection,
+    Tab, Workspace, WorkspaceOptions, Worktree, WorktreeOptions, WorktreeSource,
 };
 
-pub use session::{Session, WorkspacePanes};
+pub use session::{Session, SessionTarget, WorkspacePanes};

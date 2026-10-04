@@ -39,6 +39,15 @@ impl HerdrClient {
         Ok(client)
     }
 
+    /// Open an existing directory in a new Herdr workspace, without creating a Git checkout.
+    pub fn create_workspace(
+        &self,
+        options: &WorkspaceOptions,
+    ) -> Result<CreatedWorkspace, HerdrError> {
+        require_absolute(&options.cwd)?;
+        self.request("workspace.create", options, "workspace_created")
+    }
+
     /// Create a Git checkout and open it as a Herdr workspace.
     ///
     /// Herdr uses an existing local branch when present, or creates it from
@@ -108,6 +117,34 @@ impl HerdrClient {
         )
         .into())
     }
+}
+
+/// Options for opening an existing directory in Herdr.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceOptions {
+    /// Absolute directory on the Herdr server.
+    pub cwd: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub focus: bool,
+}
+
+impl WorkspaceOptions {
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            label: None,
+            focus: false,
+        }
+    }
+}
+
+/// A workspace and its initial tab and pane returned by Herdr.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreatedWorkspace {
+    pub workspace: Workspace,
+    pub tab: Tab,
+    pub root_pane: Pane,
 }
 
 /// Explicitly select the repository without depending on Herdr's focused workspace.

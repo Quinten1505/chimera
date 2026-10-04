@@ -108,3 +108,28 @@ HERDR_SOCKET_PATH="$HOME/.config/herdr/herdr.sock" cargo test -p chimera-core li
 
 The request shapes were checked against the installed Herdr 0.9.3 schema
 (protocol 22); see the [Herdr socket API](https://herdr.dev/docs/socket-api/).
+
+## Starting an application session
+
+Call HerdrClient::start_session with an application-owned ID and either
+SessionTarget::Workspace for an existing directory or SessionTarget::Worktree
+with WorktreeOptions for a new checkout.
+
+```rust
+use chimera_core::{HerdrClient, Session, SessionTarget, WorkspaceOptions};
+
+fn start(client: &HerdrClient) -> Result<Session, chimera_core::HerdrError> {
+    client.start_session(
+        "my-session",
+        &SessionTarget::Workspace(WorkspaceOptions::new("/home/me/git/project")),
+    )
+}
+```
+
+The returned Session records the workspace ID, initial pane ID, and known
+checkout path. For new worktrees, the path comes from Herdr's creation result.
+For ordinary workspaces, it is populated only when Herdr reports checkout
+metadata; a pane's working directory alone does not establish a Git checkout.
+State is held in the returned struct and supports Serde serialization. Startup
+does not write a session file or launch an AI agent. Additional panes created
+with add_pane must be recorded in the session by the caller.
