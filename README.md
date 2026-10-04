@@ -147,9 +147,12 @@ fn launch(client: &HerdrClient, session: &mut Session) -> Result<(), Box<dyn std
 }
 ```
 
-The YAML requires `model`, `reasoning_effort`, `service_tier`, and
+The YAML defines named profiles under `agents`. Each requires `kind: codex`,
+`model`, `reasoning_effort`, `service_tier`, and
 `approve_for_me`. The example selects `gpt-6-luna`, medium reasoning, fast
-service, and automatic approval review. Unknown fields and empty string
+service, and automatic approval review for `builder`; `reviewer` uses high reasoning.
+`start_session_agents` currently selects `builder` for every pane in Rust.
+Other callers can select profiles with `CodexConfiguration::load(path)?.profile(name)?`. Unknown fields and empty string
 settings are rejected before launching. Codex validates model-specific setting
 support. The mapping uses Codex's
 [configuration overrides](https://learn.chatgpt.com/docs/config-file/config-reference)

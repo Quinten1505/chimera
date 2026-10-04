@@ -2,4 +2,4 @@
 
 mod codex;
 
-pub use codex::{CodexOptions, ConfigurationError};
+pub use codex::{AgentKind, CodexConfiguration, CodexOptions, ConfigurationError};

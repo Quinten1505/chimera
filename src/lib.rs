@@ -1,10 +1,10 @@
 //! Composition helpers connecting configuration to the core modules.
 
-use chimera_configuration::CodexOptions;
+use chimera_configuration::CodexConfiguration;
 use chimera_core::{HerdrClient, Session};
 use std::path::Path;
 
-/// Load and validate YAML before starting one Codex agent in each tracked pane.
+/// Load and validate YAML before starting one builder-profile Codex agent in each tracked pane.
 ///
 /// Records successful launches in the session's workspaces and stops on the first
 /// failure. Does not create worktrees or panes, persist state, or retry requests.
@@ -13,7 +13,9 @@ pub fn start_session_agents(
     session: &mut Session,
     config_path: impl AsRef<Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let args = CodexOptions::load(config_path)?.launch_args()?;
+    let args = CodexConfiguration::load(config_path)?
+        .profile("builder")?
+        .launch_args()?;
     for workspace in &mut session.workspaces {
         client.start_codex_agents(workspace, &args)?;
     }
