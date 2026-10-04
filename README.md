@@ -39,7 +39,7 @@ and passes configuration into the modules that need it. Introduce interfaces
 for cross-module behavior when concrete use cases require them, keeping this
 dependency direction and avoiding cycles.
 
-Workflow, GitHub, and configuration remain scaffolds. Core provides the Herdr
+Workflow and GitHub remain scaffolds. Configuration loads Codex settings from YAML. Core provides the Herdr
 client below. The executable retains its initial hello-world output.
 
 ## Development
@@ -133,3 +133,36 @@ metadata; a pane's working directory alone does not establish a Git checkout.
 State is held in the returned struct and supports Serde serialization. Startup
 does not write a session file or launch an AI agent. Additional panes created
 with add_pane must be recorded in the session by the caller.
+
+## Starting Codex agents in an existing session
+
+Load the checked-in `codex.yaml` and launch one Codex agent per tracked pane:
+
+```rust,no_run
+use chimera::start_session_agents;
+use chimera_core::{HerdrClient, Session};
+
+fn launch(client: &HerdrClient, session: &mut Session) -> Result<(), Box<dyn std::error::Error>> {
+    start_session_agents(client, session, "codex.yaml")
+}
+```
+
+The YAML requires `model`, `reasoning_effort`, `service_tier`, and
+`approve_for_me`. The example selects `gpt-6-luna`, medium reasoning, fast
+service, and automatic approval review. Unknown fields and empty string
+settings are rejected before launching. Codex validates model-specific setting
+support. The mapping uses Codex's
+[configuration overrides](https://learn.chatgpt.com/docs/config-file/config-reference)
+and the installed CLI's `--approve-for-me` option.
+
+Herdr's `agent.start` launches into an existing shell pane and waits for
+interactive readiness. Each successful launch is appended to
+`WorkspacePanes.agents`, including its provider session reference when available.
+Already tracked panes are skipped. Launching stops at the first error and retains
+earlier successes; it is not a transaction and does not roll them back. A timeout
+can leave an agent running without a recorded success, so inspect Herdr before
+retrying. Startup allows Herdr 30 seconds for readiness and at least 35 seconds
+for the socket response.
+
+This helper consumes an already populated session. It does not create the layout,
+save session files, or change the executable's hello-world entry point.

@@ -1,4 +1,4 @@
-use crate::{HerdrClient, HerdrError, WorkspaceOptions, WorktreeOptions};
+use crate::{Agent, HerdrClient, HerdrError, WorkspaceOptions, WorktreeOptions};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -8,6 +8,9 @@ pub struct WorkspacePanes {
     /// The Herdr workspace ID, including for workspaces opened at the repo root.
     pub workspace_id: String,
     pub pane_ids: Vec<String>,
+    /// Agents successfully started in this workspace, one per pane.
+    #[serde(default)]
+    pub agents: Vec<Agent>,
     /// Associated Git checkout, when known; may be the repo root or a linked worktree.
     /// None means the association is unknown, not necessarily that this is outside Git.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,6 +52,7 @@ impl HerdrClient {
             SessionTarget::Workspace(options) => {
                 let created = self.create_workspace(options)?;
                 WorkspacePanes {
+                    agents: Vec::new(),
                     workspace_id: created.workspace.workspace_id,
                     pane_ids: vec![created.root_pane.pane_id],
                     checkout_path: created.workspace.checkout_path,
@@ -57,6 +61,7 @@ impl HerdrClient {
             SessionTarget::Worktree(options) => {
                 let created = self.create_worktree(options)?;
                 WorkspacePanes {
+                    agents: Vec::new(),
                     workspace_id: created.workspace.workspace_id,
                     pane_ids: vec![created.root_pane.pane_id],
                     checkout_path: Some(created.worktree.path),

@@ -291,6 +291,7 @@ fn starts_session_in_existing_directory_and_saves_returned_ids() {
             session_id: "session-123".into(),
             workspaces: vec![crate::WorkspacePanes {
                 workspace_id: "w4".into(),
+                agents: Vec::new(),
                 pane_ids: vec!["w4:p1".into()],
                 checkout_path: None,
             }],
@@ -327,6 +328,7 @@ fn starts_session_with_new_checkout_and_saves_actual_path() {
             session_id: "session-123".into(),
             workspaces: vec![crate::WorkspacePanes {
                 workspace_id: "w3".into(),
+                agents: Vec::new(),
                 pane_ids: vec!["w3:p1".into()],
                 checkout_path: Some("/herdr/worktrees/feature-session".into()),
             }],

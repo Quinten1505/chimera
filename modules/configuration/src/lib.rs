@@ -2,4 +2,4 @@
 
 mod codex;
 
-pub use codex::CodexOptions;
+pub use codex::{CodexOptions, ConfigurationError};
