@@ -3,12 +3,14 @@
 //!
 //! Expose the module interface here; keep implementation submodules private.
 
+mod agent_turn;
 mod driver;
 mod environment;
 mod error;
 mod merge_lock;
 mod policy;
 
+pub use agent_turn::{AgentTurns, CompletedTurn, TurnError, TurnRequest};
 pub use driver::{Pipeline, PipelineState, drive};
 pub use environment::{
     AgentLaunch, Environment, EnvironmentAgent, EnvironmentService, ProvisionSpec,
