@@ -59,8 +59,8 @@ impl PipelineState for ImplementationState {
 /// `(WorkItem, AgentConfiguration)` to `MergedOk`: provisioning, the implementation/review loop,
 /// the merge under the feature branch's merge lock, its verification and the cleanup.
 ///
-/// The merge agent ends the explanation of `MergeSuccessful` with the commit it pushed; that
-/// commit is what verification looks for on the remote.
+/// The merge agent names the commit it pushed in the explanation of `MergeSuccessful`, as any
+/// word of it; verification accepts a remote head that the explanation names.
 pub struct ImplementationPipeline {
     pub run: RunId,
     /// Names this task in the store and its agents in the history.
@@ -524,8 +524,11 @@ impl ImplementationPipeline {
             Outcome::MergeBlocked(_) => ImplementationState::Merging {
                 attempt: attempt + 1,
             },
+            // Every conflict review counts as a merge attempt, so the loop ends at the limit.
             Outcome::ReviewApproved(_) | Outcome::ChangesRequested(_) => {
-                ImplementationState::Merging { attempt }
+                ImplementationState::Merging {
+                    attempt: attempt + 1,
+                }
             }
             other => unreachable!("{other:?} is not valid for the {role:?} role"),
         })
@@ -579,7 +582,7 @@ impl ImplementationPipeline {
                     valid_turns(&history)
                         .last()
                         .and_then(|(_, outcome)| match outcome {
-                            Outcome::MergeSuccessful(text) => pushed_commit(text),
+                            Outcome::MergeSuccessful(text) => Some(text.as_str()),
                             _ => None,
                         });
                 let expected = self.expected_head().await?;
@@ -591,7 +594,7 @@ impl ImplementationPipeline {
                             attempt: attempt + 1,
                         });
                     }
-                    Some(actual) if reported.as_ref() == Some(&actual) => {
+                    Some(actual) if reported.is_some_and(|text| names_commit(text, &actual)) => {
                         pending.verified = Some(actual.clone());
                         self.save_pending(&pending).await?;
                         actual
@@ -609,18 +612,26 @@ impl ImplementationPipeline {
                                 PauseReason::UnexpectedRemoteChange
                             }
                         };
+                        // The driver saves no state on an error, so the pause is saved here.
+                        self.policy.save(self.store.as_ref(), &self.run).await?;
                         return Err(PipelineError::Paused(reason));
                     }
                 }
             }
         };
-        self.store
-            .save_pipeline_state(
-                &self.run,
-                &self.expected_head_key(),
-                serde_json::to_value(&merged)?,
-            )
-            .await?;
+        // Recorded once, before the lock is released: after that another instance may have
+        // moved the expected head on, and a replay must not move it back.
+        if !pending.recorded {
+            self.store
+                .save_pipeline_state(
+                    &self.run,
+                    &self.expected_head_key(),
+                    serde_json::to_value(&merged)?,
+                )
+                .await?;
+            pending.recorded = true;
+            self.save_pending(&pending).await?;
+        }
         if self.lock.holder().as_deref() == Some(self.instance.as_str()) {
             self.lock.release(&self.instance).await?;
         }
@@ -659,10 +670,11 @@ fn valid_count(history: &[TurnResult]) -> usize {
     valid_turns(history).len()
 }
 
-/// The commit a merge agent ends its explanation with.
-fn pushed_commit(text: &str) -> Option<CommitId> {
-    let last = text.split_whitespace().next_back()?;
-    CommitId::new(last.trim_matches(|c: char| !c.is_alphanumeric())).ok()
+/// Whether the explanation of a merge agent names `commit` as one of its words, ignoring the
+/// punctuation around it.
+fn names_commit(text: &str, commit: &CommitId) -> bool {
+    text.split_whitespace()
+        .any(|word| word.trim_matches(|c: char| !c.is_alphanumeric()) == commit.as_str())
 }
 
 /// What a turn needs besides its role: how it counts against its limit and what it is told.
@@ -695,6 +707,9 @@ struct Pending {
     /// The pushed commit that was verified.
     #[serde(default)]
     verified: Option<CommitId>,
+    /// The verified commit was recorded as the expected remote head.
+    #[serde(default)]
+    recorded: bool,
 }
 
 /// A merge-phase turn that finished in `state`, when `valid` valid results were in the history.
@@ -1930,8 +1945,8 @@ mod tests {
             [
                 ImplementationState::Merging { attempt: 1 },
                 ImplementationState::ConflictReview { attempt: 1 },
-                ImplementationState::Merging { attempt: 1 },
-                ImplementationState::Verifying { attempt: 1 },
+                ImplementationState::Merging { attempt: 2 },
+                ImplementationState::Verifying { attempt: 2 },
                 ImplementationState::CleaningUp {
                     merged: commit("c1")
                 },
@@ -2091,8 +2106,8 @@ mod tests {
             ImplementationState::WaitingForMerge,
             ImplementationState::Merging { attempt: 1 },
             ImplementationState::ConflictReview { attempt: 1 },
-            ImplementationState::Merging { attempt: 1 },
-            ImplementationState::Verifying { attempt: 1 },
+            ImplementationState::Merging { attempt: 2 },
+            ImplementationState::Verifying { attempt: 2 },
             ImplementationState::CleaningUp {
                 merged: commit("c1"),
             },
@@ -2131,11 +2146,127 @@ mod tests {
     }
 
     #[test]
-    fn the_pushed_commit_ends_the_explanation() {
-        assert_eq!(pushed_commit("merged and pushed c1."), Some(commit("c1")));
-        assert_eq!(pushed_commit("pushed (abc123)"), Some(commit("abc123")));
-        assert_eq!(pushed_commit(" "), None);
-        assert_eq!(pushed_commit("..."), None);
+    fn an_explanation_names_the_pushed_commit_as_any_of_its_words() {
+        let c1 = commit("c1");
+        assert!(names_commit("merged and pushed c1.", &c1));
+        assert!(names_commit("pushed c1; tests passed", &c1));
+        assert!(names_commit("pushed (c1) after a rebase", &c1));
+        assert!(!names_commit("pushed c10; tests passed", &c1));
+        assert!(!names_commit("merged; tests passed", &c1));
+        assert!(!names_commit(" ", &c1));
+    }
+
+    #[tokio::test]
+    async fn an_explanation_may_continue_after_the_pushed_commit() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(
+            &f,
+            &[r#"{"MergeSuccessful":"pushed c1; tests passed"}"#],
+            &[],
+        )
+        .await;
+        f.repository.set_remote_head(feature(), commit("c1"));
+
+        assert_eq!(
+            f.drive_through().await.unwrap(),
+            ImplementationState::Done(MergedOk {
+                commit: commit("c1")
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explanation_without_the_pushed_commit_pauses_the_run_and_keeps_the_lock() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[r#"{"MergeSuccessful":"merged; tests passed"}"#], &[]).await;
+        f.repository.set_remote_head(feature(), commit("c1"));
+
+        let error = f.drive_through().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Paused(PauseReason::UnexpectedRemoteChange)
+        ));
+        assert_eq!(holder(&f), Some("t31".into()));
+        assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c0"));
+    }
+
+    #[tokio::test]
+    async fn the_unexpected_change_pause_survives_a_restart() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[MERGED], &[]).await;
+        f.repository.set_remote_head(feature(), commit("c9"));
+
+        f.drive_through().await.unwrap_err();
+
+        let restarted = Policy::load_or_new(f.store.as_ref(), &f.pipeline.run, &Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.check_start(),
+            Err(PauseReason::UnexpectedRemoteChange)
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_review_loops_count_against_the_merge_limit_and_keep_the_lock() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[CONFLICTS; 3], &[CHANGES; 3]).await;
+
+        assert_eq!(
+            f.drive_through().await.unwrap(),
+            ImplementationState::Paused {
+                reason: PauseReason::LimitExhausted,
+                resume_at: Box::new(ImplementationState::Merging { attempt: 4 }),
+            }
+        );
+
+        assert_eq!(holder(&f), Some("t31".into()));
+        assert_eq!(
+            assignments(&f.prompts(Role::Merge).await, "merger").len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_verification_does_not_move_the_expected_head_back() {
+        let a = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&a, &[MERGED], &[]).await;
+        let b = fixture_for(WorkItem::Ticket(ticket()), 5, "t32", Some(&a));
+        ready_to_merge(&b, &[r#"{"MergeSuccessful":"pushed c2"}"#], &[]).await;
+        a.repository.set_remote_head(feature(), commit("c1"));
+        a.pipeline
+            .step(ImplementationState::WaitingForMerge)
+            .await
+            .unwrap();
+        let queued = tokio::time::timeout(
+            Duration::from_millis(20),
+            b.pipeline.step(ImplementationState::WaitingForMerge),
+        )
+        .await;
+        assert!(queued.is_err());
+        // A verifies c1 and releases the lock, but the CleaningUp state is not saved.
+        let merging = ImplementationState::Merging { attempt: 1 };
+        let verifying = a.pipeline.step(merging.clone()).await.unwrap();
+        assert_eq!(verifying, ImplementationState::Verifying { attempt: 1 });
+        a.pipeline.step(verifying.clone()).await.unwrap();
+        assert_eq!(holder(&a), Some("t32".into()));
+
+        // B merges c2 while A is down.
+        save_state(&b, merging).await;
+        b.repository.set_remote_head(feature(), commit("c2"));
+        b.drive_through().await.unwrap();
+        assert_eq!(b.pipeline.expected_head().await.unwrap(), commit("c2"));
+
+        // A restarts from Verifying.
+        save_state(&a, verifying).await;
+        assert_eq!(
+            a.drive_through().await.unwrap(),
+            ImplementationState::Done(MergedOk {
+                commit: commit("c1")
+            })
+        );
+        assert_eq!(a.pipeline.expected_head().await.unwrap(), commit("c2"));
     }
 
     #[test]
