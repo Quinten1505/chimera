@@ -115,7 +115,11 @@ pub(crate) fn exists(runner: &Runner, repo: &Path, path: &Path) -> Result<bool, 
                 Effect::Read,
             )
             .ok()
-            .map(|output| PathBuf::from(output.stdout.trim()))
+            .and_then(|output| {
+                // Strip only the terminator: the path itself may end in whitespace.
+                let path = output.stdout.strip_suffix('\n')?;
+                Some(PathBuf::from(path))
+            })
     };
     let (Some(top), Some(common), Some(repo_common)) = (
         query(path, "--show-toplevel"),
@@ -184,9 +188,14 @@ struct Worktree {
 }
 
 fn registered(runner: &Runner, repo: &Path) -> Result<Vec<Worktree>, GitError> {
-    let output = runner.run(repo, &["worktree", "list", "--porcelain"], Effect::Read)?;
+    // NUL-terminated fields keep paths containing newlines intact.
+    let output = runner.run(
+        repo,
+        &["worktree", "list", "--porcelain", "-z"],
+        Effect::Read,
+    )?;
     let mut worktrees: Vec<Worktree> = Vec::new();
-    for line in output.stdout.lines() {
+    for line in output.stdout.split('\0') {
         if let Some(path) = line.strip_prefix("worktree ") {
             worktrees.push(Worktree {
                 path: PathBuf::from(path),
@@ -331,6 +340,22 @@ mod tests {
         remove(&runner, repo.work(), relative, "task/a").unwrap();
         assert!(!created.exists());
         assert!(!branch_exists_in(&repo, "task/a"));
+    }
+
+    #[test]
+    fn create_exists_and_remove_with_newline_in_path() {
+        let (repo, _) = repo_with_feature();
+        let runner = Runner::new();
+        let path = repo.work().join("../wt\nline");
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        assert!(path.join("f.txt").exists());
+        assert!(exists(&runner, repo.work(), &path).unwrap());
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        remove(&runner, repo.work(), &path, "task/a").unwrap();
+        assert!(!path.exists());
+        assert!(!exists(&runner, repo.work(), &path).unwrap());
+        assert!(!branch_exists_in(&repo, "task/a"));
+        assert_eq!(registered(&runner, repo.work()).unwrap().len(), 1);
     }
 
     #[test]
