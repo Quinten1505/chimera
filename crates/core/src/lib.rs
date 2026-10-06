@@ -3,6 +3,7 @@
 pub mod error;
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +87,148 @@ impl Default for Limits {
     }
 }
 
+/// Error returned when an identifier is constructed from an empty or whitespace-only value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmptyIdentifier {
+    kind: &'static str,
+}
+
+impl fmt::Display for EmptyIdentifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} must not be empty or whitespace-only", self.kind)
+    }
+}
+
+impl std::error::Error for EmptyIdentifier {}
+
+fn non_blank(kind: &'static str, value: String) -> Result<String, EmptyIdentifier> {
+    if value.trim().is_empty() {
+        Err(EmptyIdentifier { kind })
+    } else {
+        Ok(value)
+    }
+}
+
+macro_rules! string_identifier {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, EmptyIdentifier> {
+                non_blank(stringify!($name), value.into()).map(Self)
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = EmptyIdentifier;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> String {
+                value.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+string_identifier!(
+    /// Identifies one run of the workflow.
+    RunId
+);
+string_identifier!(
+    /// Name of a git branch.
+    BranchName
+);
+string_identifier!(
+    /// Identifies a git commit.
+    CommitId
+);
+string_identifier!(
+    /// Identifies a terminal workspace.
+    WorkspaceId
+);
+string_identifier!(
+    /// Identifies a terminal pane.
+    PaneId
+);
+string_identifier!(
+    /// Identifies an agent.
+    AgentId
+);
+
+/// Identifies a GitHub issue by owner, repository, and number.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "IssueRefParts")]
+pub struct IssueRef {
+    owner: String,
+    repository: String,
+    number: u64,
+}
+
+#[derive(Deserialize)]
+struct IssueRefParts {
+    owner: String,
+    repository: String,
+    number: u64,
+}
+
+impl TryFrom<IssueRefParts> for IssueRef {
+    type Error = EmptyIdentifier;
+
+    fn try_from(parts: IssueRefParts) -> Result<Self, Self::Error> {
+        Self::new(parts.owner, parts.repository, parts.number)
+    }
+}
+
+impl IssueRef {
+    pub fn new(
+        owner: impl Into<String>,
+        repository: impl Into<String>,
+        number: u64,
+    ) -> Result<Self, EmptyIdentifier> {
+        Ok(Self {
+            owner: non_blank("IssueRef owner", owner.into())?,
+            repository: non_blank("IssueRef repository", repository.into())?,
+            number,
+        })
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+}
+
+impl fmt::Display for IssueRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}#{}", self.owner, self.repository, self.number)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +285,44 @@ mod tests {
         assert_eq!(serde_json::from_str::<Limits>(&json).unwrap(), limits);
         let json = serde_json::to_string(&Role::Merge).unwrap();
         assert_eq!(serde_json::from_str::<Role>(&json).unwrap(), Role::Merge);
+    }
+
+    macro_rules! string_identifier_tests {
+        ($($test:ident: $name:ident),* $(,)?) => {$(
+            #[test]
+            fn $test() {
+                let id = $name::new("abc").unwrap();
+                assert_eq!(id.to_string(), "abc");
+                let json = serde_json::to_string(&id).unwrap();
+                assert_eq!(json, "\"abc\"");
+                assert_eq!(serde_json::from_str::<$name>(&json).unwrap(), id);
+                assert!($name::new("").is_err());
+                assert!($name::new(" \t\n").is_err());
+                assert!(serde_json::from_str::<$name>("\"  \"").is_err());
+            }
+        )*};
+    }
+
+    string_identifier_tests! {
+        run_id: RunId,
+        branch_name: BranchName,
+        commit_id: CommitId,
+        workspace_id: WorkspaceId,
+        pane_id: PaneId,
+        agent_id: AgentId,
+    }
+
+    #[test]
+    fn issue_ref() {
+        let issue = IssueRef::new("octo", "repo", 9).unwrap();
+        assert_eq!(issue.to_string(), "octo/repo#9");
+        let json = serde_json::to_string(&issue).unwrap();
+        assert_eq!(serde_json::from_str::<IssueRef>(&json).unwrap(), issue);
+        assert!(IssueRef::new("", "repo", 9).is_err());
+        assert!(IssueRef::new("octo", "  ", 9).is_err());
+        assert!(
+            serde_json::from_str::<IssueRef>(r#"{"owner":"","repository":"r","number":1}"#)
+                .is_err()
+        );
     }
 }
