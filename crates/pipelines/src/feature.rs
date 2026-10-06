@@ -410,10 +410,6 @@ mod tests {
             self.forge.mark_pull_request_ready(pull_request).await
         }
 
-        async fn issue_status(&self, issue: &IssueRef) -> Result<IssueStatus, PortError> {
-            self.forge.issue_status(issue).await
-        }
-
         async fn pull_request_is_draft(&self, pull_request: &IssueRef) -> Result<bool, PortError> {
             self.forge.pull_request_is_draft(pull_request).await
         }
