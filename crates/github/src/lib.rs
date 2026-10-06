@@ -5,6 +5,7 @@
 mod client;
 mod close_issue;
 mod error;
+mod plan;
 mod pulls;
 
 pub use client::{Access, Client, DEFAULT_API_URL};
