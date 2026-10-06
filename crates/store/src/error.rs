@@ -12,6 +12,12 @@ pub enum StoreError {
     InvalidRunId { root: PathBuf, id: String },
     #[error("unknown run: no run data in the run directory {}", directory.display())]
     RunNotFound { directory: PathBuf },
+    #[error("invalid pipeline id {id:?}: it must be a single plain path component")]
+    InvalidPipelineId { id: String },
+    #[error("effect {key:?} of pipeline {pipeline:?} already has an intent recorded")]
+    EffectAlreadyRecorded { pipeline: String, key: String },
+    #[error("effect {key:?} of pipeline {pipeline:?} has no intent recorded")]
+    EffectNotRecorded { pipeline: String, key: String },
     #[error("file system error at {}: {source}", path.display())]
     Io {
         path: PathBuf,

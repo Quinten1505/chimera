@@ -8,6 +8,7 @@ mod history;
 mod merge_lock;
 mod paths;
 mod run_data;
+mod pipeline;
 
 pub use error::StoreError;
 pub use history::{HistoryEntry, TurnKind, append_history};

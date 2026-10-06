@@ -15,14 +15,23 @@ pub fn state_root() -> Result<PathBuf, StoreError> {
 /// path component, so it cannot escape or alias the root.
 pub fn run_directory(root: &Path, run: &RunId) -> Result<PathBuf, StoreError> {
     let id = run.as_str();
-    let mut components = Path::new(id).components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(name)), None) if name == id => Ok(root.join(id)),
-        _ => Err(StoreError::InvalidRunId {
+    if is_plain_component(id) {
+        Ok(root.join(id))
+    } else {
+        Err(StoreError::InvalidRunId {
             root: root.to_path_buf(),
             id: id.to_string(),
-        }),
+        })
     }
+}
+
+/// Whether `id` is a single plain path component.
+pub(crate) fn is_plain_component(id: &str) -> bool {
+    let mut components = Path::new(id).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(name)), None) if name == id
+    )
 }
 
 fn non_empty(value: Option<OsString>) -> Option<PathBuf> {
