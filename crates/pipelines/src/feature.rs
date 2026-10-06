@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use chimera_core::error::PortError;
 use chimera_core::forge::Forge;
 use chimera_core::repository::Repository;
-use chimera_core::{BranchName, CommitId, Feature, Specification};
+use chimera_core::run_store::RunStore;
+use chimera_core::{BranchName, CommitId, Feature, RunId, Specification};
 use serde::{Deserialize, Serialize};
 
 use crate::driver::{Pipeline, PipelineState};
@@ -85,6 +86,9 @@ pub struct FeaturePipeline {
     repository: Arc<dyn Repository>,
     forge: Arc<dyn Forge>,
     policy: Arc<Policy>,
+    /// Where the policy is saved once a retry consumed from its budget.
+    store: Arc<dyn RunStore>,
+    run: RunId,
     /// The state this instance last returned. A creation state that is not this one was loaded
     /// from the saved state, so an earlier process may already have performed the creation.
     last_returned: Mutex<Option<FeatureState>>,
@@ -97,6 +101,8 @@ impl FeaturePipeline {
         repository: Arc<dyn Repository>,
         forge: Arc<dyn Forge>,
         policy: Arc<Policy>,
+        store: Arc<dyn RunStore>,
+        run: RunId,
     ) -> Self {
         let feature_branch = BranchName::new(format!("feature/{}", specification.issue.number()))
             .expect("a feature branch name is never blank");
@@ -106,6 +112,8 @@ impl FeaturePipeline {
             repository,
             forge,
             policy,
+            store,
+            run,
             last_returned: Mutex::new(None),
         }
     }
@@ -236,7 +244,9 @@ impl Pipeline for FeaturePipeline {
     /// the policy permits, otherwise the pipeline pauses. A creation is repeated only after the
     /// reconciling step found it missing, so `reconciled` is always true here. A creation state
     /// loaded from a saved state is reconciled first, as the saved state cannot tell whether the
-    /// creation already took effect before a crash.
+    /// creation already took effect before a crash. The budget a retry consumed, or the pause
+    /// its exhaustion caused, is saved before the retry state is returned, so a restart can
+    /// neither retry on a restored budget nor lose the pause.
     async fn step(&self, state: FeatureState) -> Result<FeatureState, PipelineError> {
         if let Err(reason) = self.policy.check_start() {
             return Ok(FeatureState::Paused {
@@ -247,7 +257,9 @@ impl Pipeline for FeaturePipeline {
         let next = match self.advance(&state).await {
             Ok(next) => next,
             Err((error, retry_from)) => {
-                match self.policy.permit_retry(Budget::GithubRetry, &error, true) {
+                let permit = self.policy.permit_retry(Budget::GithubRetry, &error, true);
+                self.policy.save(self.store.as_ref(), &self.run).await?;
+                match permit {
                     Ok(()) => retry_from,
                     Err(RetryRefused::Paused(reason)) => FeatureState::Paused {
                         reason,
@@ -420,7 +432,7 @@ mod tests {
         forge: Arc<FakeForge>,
         policy: Arc<Policy>,
         lost: Arc<LostResponse>,
-        store: FakeRunStore,
+        store: Arc<FakeRunStore>,
     }
 
     impl World {
@@ -442,7 +454,7 @@ mod tests {
                 repository,
                 forge,
                 policy: Arc::new(Policy::new(&limits)),
-                store: FakeRunStore::new(),
+                store: Arc::new(FakeRunStore::new()),
             }
         }
 
@@ -452,11 +464,19 @@ mod tests {
                 self.lost.clone(),
                 self.lost.clone(),
                 self.policy.clone(),
+                self.store.clone(),
+                run(),
             )
         }
 
         fn drive(&self) -> FeatureState {
-            block_on(drive(&self.store, &run(), "feature", &self.pipeline())).unwrap()
+            block_on(drive(
+                self.store.as_ref(),
+                &run(),
+                "feature",
+                &self.pipeline(),
+            ))
+            .unwrap()
         }
 
         fn save(&self, state: &FeatureState) {
@@ -685,6 +705,37 @@ mod tests {
         );
         assert!(!world.repository.has_branch(&feature_branch()));
         assert_eq!(world.drive(), paused);
+        let restored = block_on(Policy::load_or_new(
+            world.store.as_ref(),
+            &run(),
+            &Limits::default(),
+        ))
+        .unwrap();
+        assert_eq!(
+            restored.check_start(),
+            Err(PauseReason::GithubRetriesExhausted)
+        );
+    }
+
+    #[test]
+    fn a_consumed_retry_is_saved_before_the_retry_runs() {
+        let world = World::new();
+        world.repository.fail_next(PortError::failed("down"));
+
+        // The step that permits the retry returns; the process dies before the retry runs.
+        let retry = block_on(world.pipeline().step(FeatureState::SelectingBase)).unwrap();
+        assert_eq!(retry, FeatureState::SelectingBase);
+
+        let restored = block_on(Policy::load_or_new(
+            world.store.as_ref(),
+            &run(),
+            &Limits::default(),
+        ))
+        .unwrap();
+        assert_eq!(
+            restored.snapshot().github_retries_remaining,
+            Limits::default().github_retries - 1
+        );
     }
 
     #[test]

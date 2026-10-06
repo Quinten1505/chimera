@@ -497,7 +497,13 @@ impl<I: Implement> PrReviewPipeline<I> {
                     .ok_or_else(|| PipelineError::Environment("no review launch in spec".into()))?
                     .command_line;
                 self.environment
-                    .relaunch(environment, Role::Review, command_line)
+                    .relaunch(
+                        self.store.as_ref(),
+                        &self.run,
+                        environment,
+                        Role::Review,
+                        command_line,
+                    )
                     .await?;
                 self.save_pending(None).await?;
                 Ok(Err(state.clone()))
@@ -705,6 +711,8 @@ mod tests {
         launches: Mutex<usize>,
         /// Every prompt in the order it was sent.
         sent: Mutex<Vec<String>>,
+        /// Fails the next launch, as a lost connection would.
+        fail_launch: Mutex<Option<PortError>>,
     }
 
     #[async_trait]
@@ -724,6 +732,9 @@ mod tests {
         }
         async fn launch_agent(&self, pane: &PaneId, command_line: &str) -> Result<(), PortError> {
             *self.launches.lock().unwrap() += 1;
+            if let Some(error) = self.fail_launch.lock().unwrap().take() {
+                return Err(error);
+            }
             self.inner.launch_agent(pane, command_line).await
         }
         async fn send_prompt(&self, pane: &PaneId, prompt: &str) -> Result<(), PortError> {
@@ -826,6 +837,7 @@ mod tests {
                 replies: Mutex::new(replies.iter().map(|r| r.to_string()).collect()),
                 launches: Mutex::new(0),
                 sent: Mutex::default(),
+                fail_launch: Mutex::default(),
             }),
             implement: Arc::new(FakeImplement {
                 store: store.clone(),
@@ -955,6 +967,32 @@ mod tests {
         PrReviewState::Done(PrReady {
             pull_request: pull_request(),
         })
+    }
+
+    #[test]
+    fn a_consumed_recovery_is_saved_before_the_relaunch() {
+        let f = fixture(5, &[]);
+        let pipeline = f.pipeline();
+        let reviewing = block_on(pipeline.step(pipeline.initial_state())).unwrap();
+        assert_eq!(reviewing, PrReviewState::Reviewing { cycle: 1 });
+        let environment = block_on(pipeline.load_environment(1)).unwrap();
+        let pane = environment.pane(Role::Review).unwrap();
+        f.terminal.inner.script_statuses(pane, [TurnStatus::Gone]);
+        *f.terminal.fail_launch.lock().unwrap() = Some(PortError::uncertain("lost"));
+
+        let error = block_on(pipeline.step(reviewing)).unwrap_err();
+
+        assert!(error.is_uncertain());
+        let restored = block_on(Policy::load_or_new(
+            f.store.as_ref(),
+            &run(),
+            &Limits::default(),
+        ))
+        .unwrap();
+        assert_eq!(
+            restored.snapshot().agent_recovery_remaining,
+            Limits::default().agent_recovery - 1
+        );
     }
 
     #[test]

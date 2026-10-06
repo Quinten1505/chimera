@@ -165,9 +165,12 @@ impl EnvironmentService {
     }
 
     /// Launches `role`'s agent again in its pane after it is `Gone`, consuming one agent
-    /// recovery from the policy.
+    /// recovery from the policy. The consumed budget, or the pause its exhaustion caused, is
+    /// saved under `run` before the launch, so a restart cannot relaunch on a restored budget.
     pub async fn relaunch(
         &self,
+        store: &dyn RunStore,
+        run: &RunId,
         environment: &Environment,
         role: Role,
         command_line: &str,
@@ -180,11 +183,13 @@ impl EnvironmentService {
                 "the {role:?} agent is not gone"
             )));
         }
-        match self.policy.permit_retry(
+        let permit = self.policy.permit_retry(
             Budget::AgentRecovery,
             &PortError::failed("agent is gone"),
             false,
-        ) {
+        );
+        self.policy.save(store, run).await?;
+        match permit {
             Ok(()) => {}
             Err(RetryRefused::Paused(reason)) => return Err(PipelineError::Paused(reason)),
             Err(RetryRefused::NeedsReconciliation) => unreachable!("the error is not uncertain"),
@@ -236,6 +241,7 @@ mod tests {
         inner: FakeTerminal,
         calls: Mutex<Vec<&'static str>>,
         close_failure: Mutex<Option<PortError>>,
+        launch_failure: Mutex<Option<PortError>>,
     }
 
     impl CountingTerminal {
@@ -271,6 +277,9 @@ mod tests {
         }
         async fn launch_agent(&self, pane: &PaneId, command_line: &str) -> Result<(), PortError> {
             self.log("launch");
+            if let Some(error) = self.launch_failure.lock().unwrap().take() {
+                return Err(error);
+            }
             self.inner.launch_agent(pane, command_line).await
         }
         async fn send_prompt(&self, pane: &PaneId, prompt: &str) -> Result<(), PortError> {
@@ -307,6 +316,7 @@ mod tests {
             inner: FakeTerminal::new(),
             calls: Mutex::new(Vec::new()),
             close_failure: Mutex::new(None),
+            launch_failure: Mutex::new(None),
         });
         let policy = Arc::new(Policy::new(&Limits {
             agent_recovery,
@@ -460,20 +470,35 @@ mod tests {
         let spec = triplet();
         let environment = provision(&f, &spec).unwrap();
         let pane = environment.pane(Role::Review).unwrap().clone();
+        let store = FakeRunStore::new();
 
-        let error = block_on(f.service.relaunch(&environment, Role::Review, "again")).unwrap_err();
+        let error =
+            block_on(
+                f.service
+                    .relaunch(&store, &run(), &environment, Role::Review, "again"),
+            )
+            .unwrap_err();
         assert!(matches!(error, PipelineError::Environment(_)));
         assert_eq!(f.policy.snapshot().agent_recovery_remaining, 1);
 
         f.terminal.inner.script_statuses(&pane, [TurnStatus::Gone]);
-        block_on(f.service.relaunch(&environment, Role::Review, "again")).unwrap();
+        block_on(
+            f.service
+                .relaunch(&store, &run(), &environment, Role::Review, "again"),
+        )
+        .unwrap();
         assert_eq!(
             f.terminal.inner.launched_command(&pane).as_deref(),
             Some("again")
         );
         assert_eq!(f.policy.snapshot().agent_recovery_remaining, 0);
 
-        let error = block_on(f.service.relaunch(&environment, Role::Review, "third")).unwrap_err();
+        let error =
+            block_on(
+                f.service
+                    .relaunch(&store, &run(), &environment, Role::Review, "third"),
+            )
+            .unwrap_err();
         assert!(matches!(
             error,
             PipelineError::Paused(PauseReason::AgentRecoveryExhausted)
@@ -482,6 +507,32 @@ mod tests {
             f.terminal.inner.launched_command(&pane).as_deref(),
             Some("again")
         );
+        let restored = block_on(Policy::load_or_new(&store, &run(), &Limits::default())).unwrap();
+        assert_eq!(
+            restored.check_start(),
+            Err(PauseReason::AgentRecoveryExhausted)
+        );
+    }
+
+    #[test]
+    fn a_consumed_recovery_is_saved_before_the_launch() {
+        let f = fixture(2);
+        let environment = provision(&f, &triplet()).unwrap();
+        let pane = environment.pane(Role::Review).unwrap().clone();
+        f.terminal.inner.script_statuses(&pane, [TurnStatus::Gone]);
+        *f.terminal.launch_failure.lock().unwrap() = Some(PortError::uncertain("lost"));
+        let store = FakeRunStore::new();
+
+        let error =
+            block_on(
+                f.service
+                    .relaunch(&store, &run(), &environment, Role::Review, "again"),
+            )
+            .unwrap_err();
+
+        assert!(error.is_uncertain());
+        let restored = block_on(Policy::load_or_new(&store, &run(), &Limits::default())).unwrap();
+        assert_eq!(restored.snapshot().agent_recovery_remaining, 1);
     }
 
     #[test]

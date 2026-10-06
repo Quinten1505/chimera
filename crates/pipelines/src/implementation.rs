@@ -440,7 +440,13 @@ impl ImplementationPipeline {
                     })?
                     .command_line;
                 self.environment
-                    .relaunch(&environment, role, command_line)
+                    .relaunch(
+                        self.store.as_ref(),
+                        &self.run,
+                        &environment,
+                        role,
+                        command_line,
+                    )
                     .await?;
                 pending.turn = None;
                 self.save_pending(pending).await?;
@@ -852,6 +858,8 @@ mod tests {
         fail_correction_after_send: Mutex<Option<PortError>>,
         /// Every prompt delivered, kept after the pane is closed.
         sent: Mutex<HashMap<PaneId, Vec<String>>>,
+        /// Fails the next launch, as a lost connection would.
+        fail_launch: Mutex<Option<PortError>>,
     }
 
     #[async_trait]
@@ -871,6 +879,9 @@ mod tests {
         }
         async fn launch_agent(&self, pane: &PaneId, command_line: &str) -> Result<(), PortError> {
             *self.launches.lock().unwrap() += 1;
+            if let Some(error) = self.fail_launch.lock().unwrap().take() {
+                return Err(error);
+            }
             self.gone.lock().unwrap().remove(pane);
             self.inner.launch_agent(pane, command_line).await
         }
@@ -983,6 +994,7 @@ mod tests {
             fail_send: Mutex::default(),
             fail_correction_after_send: Mutex::default(),
             sent: Mutex::default(),
+            fail_launch: Mutex::default(),
         });
         let store = other.map_or_else(|| Arc::new(FakeRunStore::new()), |f| f.store.clone());
         let policy = other.map_or_else(
@@ -1389,6 +1401,63 @@ mod tests {
             f.drive().await.unwrap(),
             ImplementationState::WaitingForMerge
         );
+    }
+
+    #[tokio::test]
+    async fn a_consumed_recovery_is_saved_before_the_relaunch() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        f.script(Role::Implementation, &[READY]).await;
+        let pane = f.pane(Role::Implementation).await;
+        f.terminal.gone.lock().unwrap().insert(pane);
+        *f.terminal.fail_launch.lock().unwrap() = Some(PortError::uncertain("lost"));
+
+        let error = f
+            .pipeline
+            .step(ImplementationState::Implementing { cycle: 1 })
+            .await
+            .unwrap_err();
+
+        assert!(error.is_uncertain());
+        let restored = Policy::load_or_new(f.store.as_ref(), &f.pipeline.run, &Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.snapshot().agent_recovery_remaining,
+            Limits::default().agent_recovery - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_recovery_pause_survives_a_restart() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        f.script(Role::Implementation, &[READY]).await;
+        for _ in 0..Limits::default().agent_recovery {
+            f.policy
+                .permit_retry(
+                    crate::policy::Budget::AgentRecovery,
+                    &PortError::failed("gone"),
+                    false,
+                )
+                .unwrap();
+        }
+        let pane = f.pane(Role::Implementation).await;
+        f.terminal.gone.lock().unwrap().insert(pane);
+
+        let error = f.drive().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Paused(PauseReason::AgentRecoveryExhausted)
+        ));
+        assert_eq!(*f.terminal.launches.lock().unwrap(), 3);
+        let restored = Policy::load_or_new(f.store.as_ref(), &f.pipeline.run, &Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.check_start(),
+            Err(PauseReason::AgentRecoveryExhausted)
+        );
+        assert_eq!(restored.snapshot().agent_recovery_remaining, 0);
     }
 
     fn assignments(prompts: &[String], who: &str) -> Vec<String> {
