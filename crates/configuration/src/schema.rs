@@ -6,7 +6,7 @@ use std::{fs, path::Path};
 use chimera_core::{AgentConfiguration, AgentProfile, Limits};
 use serde::Deserialize;
 
-use crate::ConfigurationError;
+use crate::{ConfigurationError, codex_args::validate_settings};
 
 const DEFAULT_RESET_COMMAND: &str = "/clear";
 
@@ -25,7 +25,25 @@ impl Configuration {
 
     pub fn from_yaml(yaml: &str) -> Result<Self, ConfigurationError> {
         let file: File = serde_yaml::from_str(yaml)?;
-        Ok(file.resolve())
+        let configuration = file.resolve();
+        configuration.validate_codex_settings()?;
+        Ok(configuration)
+    }
+}
+
+impl Configuration {
+    /// Rejects unknown or ill-typed Codex settings, naming the field path.
+    fn validate_codex_settings(&self) -> Result<(), ConfigurationError> {
+        for (section, agents) in [("ticket", &self.ticket), ("final", &self.final_review)] {
+            for (role, profile) in [
+                ("implementation", &agents.implementation),
+                ("review", &agents.review),
+                ("merge", &agents.merge),
+            ] {
+                validate_settings(profile, &format!("{section}.{role}"))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -183,10 +201,11 @@ limits:
   github_retries: 6
 {MINIMAL}"
         )
-        .replace("model: m1,", "model: m1, settings: {effort: high, n: 2},");
+        .replace("model: m3,", "model: m3, settings: {effort: high, n: 2},");
         let configuration = Configuration::from_yaml(&yaml).unwrap();
-        let profile = &configuration.final_review.implementation;
-        assert_eq!(profile.reset_command, "/new");
+        let profile = &configuration.final_review.merge;
+        assert_eq!(profile.reset_command, "/clear");
+        assert_eq!(configuration.ticket.implementation.reset_command, "/new");
         assert_eq!(profile.settings["effort"], "high");
         assert_eq!(profile.settings["n"], 2);
         assert_eq!(configuration.ticket.merge.reset_command, "/clear");
@@ -248,5 +267,25 @@ limits:
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_bad_codex_settings_with_field_path() {
+        for (settings, path) in [
+            ("{service_tier: 3}", "ticket.review.settings.service_tier"),
+            ("{typo: true}", "ticket.review.settings.typo"),
+            (
+                "{approve_for_me: maybe}",
+                "ticket.review.settings.approve_for_me",
+            ),
+        ] {
+            let yaml = MINIMAL.replacen(
+                "model: m2,",
+                &format!("model: m2, settings: {settings},"),
+                1,
+            );
+            let message = Configuration::from_yaml(&yaml).unwrap_err().to_string();
+            assert!(message.contains(path), "{message}");
+        }
     }
 }

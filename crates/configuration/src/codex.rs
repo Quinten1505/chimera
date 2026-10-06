@@ -2,6 +2,8 @@ use serde::Deserialize;
 use std::{fs, io, path::Path};
 use thiserror::Error;
 
+use crate::codex_args::toml_string;
+
 /// Named agent profiles. Workspace assignment and workflow remain in Rust.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,10 +96,6 @@ impl CodexOptions {
     }
 }
 
-fn toml_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 #[derive(Debug, Error)]
 pub enum ConfigurationError {
     #[error("cannot read configuration file: {0}")]
@@ -111,6 +109,15 @@ pub enum ConfigurationError {
     },
     #[error("{field} must be nonempty and contain no control characters")]
     Invalid { field: String },
+    #[error("unknown Codex setting {field}")]
+    UnknownSetting { field: String },
+    #[error("{field} must be {expected}")]
+    InvalidSetting {
+        field: String,
+        expected: &'static str,
+    },
+    #[error("cannot build Codex arguments for provider {0}")]
+    NotCodex(String),
     #[error("unknown agent profile: {0}")]
     UnknownProfile(String),
 }
@@ -204,9 +211,5 @@ mod tests {
         ] {
             assert!(CodexConfiguration::from_yaml(&invalid).is_err());
         }
-    }
-    #[test]
-    fn quotes_config_values_as_toml_strings() {
-        assert_eq!(toml_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
     }
 }
