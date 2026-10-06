@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 
+use chimera_core::error::PortError;
 use chimera_core::forge::Forge;
 use chimera_core::run_store::RunStore;
 use chimera_core::{Blocker, IssueRef, IssueStatus, MergedOk, RunId, Ticket, TicketPlan};
@@ -162,8 +163,10 @@ where
         {
             Some(saved) => serde_json::from_value(saved)?,
             None => {
-                let state =
-                    TicketState::from_plan(self.forge.read_plan(&self.specification).await?);
+                let plan = self
+                    .read(|| self.forge.read_plan(&self.specification))
+                    .await?;
+                let state = TicketState::from_plan(plan);
                 self.save(&state).await?;
                 state
             }
@@ -175,18 +178,22 @@ where
         let mut pause = None;
         let mut halted = HashSet::new();
         let mut close_paused = false;
+        // A close that cannot go on stops new starts like a pause; the active tasks still
+        // finish and are saved before the error is returned.
+        let mut close_failed = None;
         loop {
-            if !close_paused {
+            if !close_paused && close_failed.is_none() {
                 match self.close_merged(&mut state).await {
                     Ok(()) => {}
                     Err(PipelineError::Paused(reason)) => {
                         close_paused = true;
                         pause.get_or_insert(reason);
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => close_failed = Some(error),
                 }
             }
-            let may_start = pause.is_none() && self.policy.check_start().is_ok();
+            let may_start =
+                pause.is_none() && close_failed.is_none() && self.policy.check_start().is_ok();
             let mut to_start = Vec::new();
             for entry in &state.entries {
                 let issue = &entry.ticket.issue;
@@ -222,9 +229,10 @@ where
                 tasks.spawn(async move { (issue, task.await) });
             }
             let Some(joined) = tasks.join_next().await else {
-                return match pause {
-                    Some(reason) => Err(PipelineError::Paused(reason)),
-                    None => Ok(state),
+                return match (close_failed, pause) {
+                    (Some(error), _) => Err(error),
+                    (None, Some(reason)) => Err(PipelineError::Paused(reason)),
+                    (None, None) => Ok(state),
                 };
             };
             let (issue, result) = joined.map_err(|error| {
@@ -324,19 +332,39 @@ where
             if error.is_uncertain() && self.is_closed(issue).await? {
                 return Ok(());
             }
-            let permit = self.policy.permit_retry(Budget::GithubRetry, &error, true);
-            // The budget and pause outlive a restart, so they are saved before acting on them.
-            self.policy.save(self.store.as_ref(), &self.run).await?;
-            permit.map_err(|refused| match refused {
-                RetryRefused::Paused(reason) => PipelineError::Paused(reason),
-                RetryRefused::NeedsReconciliation => PipelineError::from(error),
-            })?;
+            self.permit_github_retry(error).await?;
         }
     }
 
     /// Reads the current status of `issue` for reconciliation; the saved plan is not read.
     async fn is_closed(&self, issue: &IssueRef) -> Result<bool, PipelineError> {
-        Ok(self.forge.issue_status(issue).await? == IssueStatus::Closed)
+        Ok(self.read(|| self.forge.issue_status(issue)).await? == IssueStatus::Closed)
+    }
+
+    /// Reads from GitHub, repeating only this read while the policy permits. A read has no
+    /// effect, so a lost response needs no reconciliation.
+    async fn read<T, R>(&self, read: impl Fn() -> R) -> Result<T, PipelineError>
+    where
+        R: Future<Output = Result<T, PortError>>,
+    {
+        loop {
+            match read().await {
+                Ok(value) => return Ok(value),
+                Err(error) => self.permit_github_retry(error).await?,
+            }
+        }
+    }
+
+    /// Asks permission to repeat a GitHub call that failed with `error`, which is reconciled or
+    /// has no effect. The budget and pause outlive a restart, so they are saved before acting
+    /// on them.
+    async fn permit_github_retry(&self, error: PortError) -> Result<(), PipelineError> {
+        let permit = self.policy.permit_retry(Budget::GithubRetry, &error, true);
+        self.policy.save(self.store.as_ref(), &self.run).await?;
+        permit.map_err(|refused| match refused {
+            RetryRefused::Paused(reason) => PipelineError::Paused(reason),
+            RetryRefused::NeedsReconciliation => PipelineError::from(error),
+        })
     }
 }
 
@@ -863,5 +891,114 @@ mod tests {
             f.saved_progress().await,
             [(1, TicketProgress::Merged(merged()))]
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_plan_read_is_retried_with_a_saved_budget() {
+        let f = Fixture::new(vec![ticket(1, &[])]);
+        f.forge.fail_next(PortError::failed("rate limited"));
+
+        let state = f.run(Script::default()).await.unwrap();
+
+        assert!(state.is_complete());
+        assert_eq!(f.reads(), 2);
+        let limits = Limits::default();
+        assert_eq!(
+            f.saved_policy(&limits)
+                .await
+                .snapshot()
+                .github_retries_remaining,
+            limits.github_retries - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_read_that_keeps_failing_pauses_with_the_pause_saved() {
+        let limits = Limits {
+            github_retries: 0,
+            ..Limits::default()
+        };
+        let mut f = Fixture::new(vec![ticket(1, &[])]);
+        f.policy = Arc::new(Policy::new(&limits));
+        f.forge.fail_next(PortError::uncertain("lost"));
+
+        let error = f.run(Script::default()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Paused(PauseReason::GithubRetriesExhausted)
+        ));
+        assert!(f.started().is_empty());
+        assert_eq!(
+            f.saved_policy(&limits).await.check_start(),
+            Err(PauseReason::GithubRetriesExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_reconciliation_lookup_is_retried_alone() {
+        let f = Fixture::new(vec![ticket(1, &[]), ticket(2, &[1])]);
+        f.save_state(vec![
+            (ticket(1, &[]), TicketProgress::Merged(merged())),
+            (ticket(2, &[1]), TicketProgress::Waiting),
+        ])
+        .await;
+        // A close was started before the restart; its lookup fails once.
+        f.store
+            .record_effect_intent(&run_id(), "close/o/r#1", "close ticket issue")
+            .await
+            .unwrap();
+        f.forge.fail_next(PortError::failed("rate limited"));
+
+        let state = f.run(Script::default()).await.unwrap();
+
+        assert!(state.is_complete());
+        assert_eq!(f.reads(), 0);
+        assert_eq!(f.closes(), [1, 2]);
+        let limits = Limits::default();
+        assert_eq!(
+            f.saved_policy(&limits)
+                .await
+                .snapshot()
+                .github_retries_remaining,
+            limits.github_retries - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_reconciliation_lookup_pauses_without_dropping_running_tasks() {
+        let limits = Limits {
+            github_retries: 0,
+            ..Limits::default()
+        };
+        let mut f = Fixture::new(vec![ticket(1, &[]), ticket(2, &[])]);
+        f.policy = Arc::new(Policy::new(&limits));
+        f.save_state(vec![
+            (ticket(1, &[]), TicketProgress::Merged(merged())),
+            (ticket(2, &[]), TicketProgress::Running),
+        ])
+        .await;
+        f.store
+            .record_effect_intent(&run_id(), "close/o/r#1", "close ticket issue")
+            .await
+            .unwrap();
+        f.forge.fail_next(PortError::failed("rate limited"));
+
+        let error = f.run(Script::default()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Paused(PauseReason::GithubRetriesExhausted)
+        ));
+        // The running task finished and was saved; the plan and its progress are kept.
+        assert_eq!(f.started(), [2]);
+        assert_eq!(
+            f.saved_progress().await,
+            [
+                (1, TicketProgress::Merged(merged())),
+                (2, TicketProgress::Merged(merged())),
+            ]
+        );
+        assert!(f.closes().is_empty());
     }
 }
