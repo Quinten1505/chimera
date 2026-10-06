@@ -61,9 +61,11 @@ dependencies = [
 name = "chimera-git"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chimera-core",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

@@ -21,6 +21,8 @@ pub(crate) enum Effect {
 #[derive(Debug)]
 pub(crate) struct Output {
     pub stdout: String,
+    // Kept for operations that need git's diagnostics; none do yet.
+    #[allow(dead_code)]
     pub stderr: String,
 }
 
