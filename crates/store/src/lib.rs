@@ -4,7 +4,9 @@
 
 mod atomic;
 mod error;
+mod history;
 mod paths;
 
 pub use error::StoreError;
+pub use history::{HistoryEntry, TurnKind, append_history};
 pub use paths::{run_directory, state_root};
