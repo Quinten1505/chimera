@@ -8,8 +8,8 @@ use serde::Deserialize;
 
 use crate::{
     ConfigurationError,
-    codex::is_plain_text,
     codex_args::{CODEX_PROVIDER, validate_settings},
+    error::is_plain_text,
 };
 
 const DEFAULT_RESET_COMMAND: &str = "/clear";

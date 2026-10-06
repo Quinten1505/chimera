@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use chimera_core::AgentProfile;
 use serde_json::Value;
 
-use crate::{ConfigurationError, codex::is_plain_text};
+use crate::{ConfigurationError, error::is_plain_text};
 
 pub const CODEX_PROVIDER: &str = "codex";
 

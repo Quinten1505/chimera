@@ -42,7 +42,7 @@ and passes configuration into the modules that need it. Introduce interfaces
 for cross-module behavior when concrete use cases require them, keeping this
 dependency direction and avoiding cycles.
 
-Pipelines remains a scaffold. Configuration loads Codex settings from YAML. The `crates/herdr` crate provides the Herdr
+Pipelines remains a scaffold. Configuration loads and validates the YAML settings. The `crates/herdr` crate provides the Herdr
 client below. The executable retains its initial hello-world output.
 
 ## Development
@@ -130,25 +130,24 @@ with add_pane must be recorded in the session by the caller.
 
 ## Starting Codex agents in an existing session
 
-Load the checked-in `codex.yaml` and launch one Codex agent per tracked pane:
+Load a Chimera YAML file (see `chimera.example.yaml`) and launch one Codex agent
+per tracked pane:
 
 ```rust,no_run
 use chimera::start_session_agents;
 use chimera_herdr::{HerdrClient, Session};
 
 fn launch(client: &HerdrClient, session: &mut Session) -> Result<(), Box<dyn std::error::Error>> {
-    start_session_agents(client, session, "codex.yaml")
+    start_session_agents(client, session, "chimera.yaml")
 }
 ```
 
-The YAML defines named profiles under `agents`. Each requires `kind: codex`,
-`model`, `reasoning_effort`, `service_tier`, and
-`approve_for_me`. The example selects `gpt-6-luna`, medium reasoning, fast
-service, and automatic approval review for `builder`; `reviewer` uses high reasoning.
-`start_session_agents` currently selects `builder` for every pane in Rust.
-Other callers can select profiles with `CodexConfiguration::load(path)?.profile(name)?`. Unknown fields and empty string
-settings are rejected before launching. Codex validates model-specific setting
-support. The mapping uses Codex's
+`chimera_configuration::load(path)` returns the validated ticket and final
+`AgentConfiguration`s and the `Limits`, or a `ConfigurationError` naming the
+field. `start_session_agents` currently launches the `ticket.implementation`
+profile in every pane, with argv from `codex_launch_args`. The `chimera` binary
+loads its configuration first (path argument, default `chimera.yaml`) and exits
+with the error before any Herdr workspace is created. The mapping uses Codex's
 [configuration overrides](https://learn.chatgpt.com/docs/config-file/config-reference)
 and the installed CLI's `--approve-for-me` option.
 

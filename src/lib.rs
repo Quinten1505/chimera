@@ -1,10 +1,10 @@
 //! Composition helpers connecting configuration to the core modules.
 
-use chimera_configuration::CodexConfiguration;
+use chimera_configuration::codex_launch_args;
 use chimera_herdr::{HerdrClient, Session};
 use std::path::Path;
 
-/// Load and validate YAML before starting one builder-profile Codex agent in each tracked pane.
+/// Load and validate YAML before starting one ticket-implementation Codex agent in each tracked pane.
 ///
 /// Records successful launches in the session's workspaces and stops on the first
 /// failure. Does not create worktrees or panes, persist state, or retry requests.
@@ -13,9 +13,8 @@ pub fn start_session_agents(
     session: &mut Session,
     config_path: impl AsRef<Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let args = CodexConfiguration::load(config_path)?
-        .profile("builder")?
-        .launch_args()?;
+    let configuration = chimera_configuration::load(config_path)?;
+    let args = codex_launch_args(&configuration.ticket.implementation)?;
     for workspace in &mut session.workspaces {
         client.start_codex_agents(workspace, &args)?;
     }
@@ -86,7 +85,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let yaml = concat!(env!("CARGO_MANIFEST_DIR"), "/codex.yaml");
+        let yaml = concat!(env!("CARGO_MANIFEST_DIR"), "/chimera.example.yaml");
         let result = start_session_agents(&client, &mut session, yaml);
         assert_eq!(result.is_err(), fail_at.is_some());
         let requests = server.join().unwrap();
@@ -100,8 +99,7 @@ mod tests {
                 json!({
                     "name":format!("codex-{}", panes[index]),
                     "kind":"codex","pane_id":panes[index],"timeout_ms":30000,
-                    "args":["--model","gpt-6-luna","--config","model_reasoning_effort=\"medium\"",
-                        "--config","service_tier=\"fast\"","--approve-for-me"]
+                    "args":["--model","gpt-6-luna","--config","model_reasoning_effort=\"medium\""]
                 })
             );
         }
