@@ -4,7 +4,9 @@ use std::time::Duration;
 use chimera_core::error::PortError;
 use chimera_core::run_store::RunStore;
 use chimera_core::terminal::{Terminal, TurnStatus};
-use chimera_core::{AgentId, AgentProfile, IssueRef, Outcome, PaneId, Role, RunId, TurnResult};
+use chimera_core::{
+    AgentId, AgentProfile, IssueRef, Outcome, PaneId, Role, RunId, TurnOutcome, TurnResult,
+};
 use thiserror::Error;
 
 use crate::error::{PauseReason, PipelineError};
@@ -52,6 +54,9 @@ pub struct TurnRequest<'a> {
 pub struct CompletedTurn {
     pub result: TurnResult,
     pub corrections: u32,
+    /// Set when a handoff's receiver turn completed but the sender's reset failed. The sender
+    /// still holds its old context; the caller must reset it without re-running the receiver.
+    pub sender_reset_failed: Option<String>,
 }
 
 /// Runs agent turns: prompt in, validated [`TurnResult`] out.
@@ -107,10 +112,15 @@ impl AgentTurns {
         self.terminal
             .send_prompt(receiver.pane, &prompt(receiver))
             .await?;
-        self.terminal
+        // The receiver has started, so its turn is finished and saved even if the reset fails;
+        // abandoning it would make a retry duplicate its work.
+        let reset = self
+            .terminal
             .send_prompt(sender_pane, &sender_profile.reset_command)
-            .await?;
-        self.finish_turn(receiver, max_corrections).await
+            .await;
+        let mut completed = self.finish_turn(receiver, max_corrections).await?;
+        completed.sender_reset_failed = reset.err().map(|error| error.to_string());
+        Ok(completed)
     }
 
     fn check_policy(&self) -> Result<(), TurnError> {
@@ -126,17 +136,26 @@ impl AgentTurns {
         loop {
             self.wait_until_finished(request.pane).await?;
             let output = self.terminal.read_output(request.pane).await?;
-            match parse_outcome(&output, request.role) {
-                Ok(outcome) => {
-                    let result = TurnResult {
-                        agent: request.agent.clone(),
-                        role: request.role,
-                        outcome,
-                    };
-                    self.store.append_turn(request.run, result.clone()).await?;
+            let parsed = parse_outcome(&output, request.role);
+            let outcome = match &parsed {
+                Ok(outcome) => TurnOutcome::Valid(outcome.clone()),
+                Err(problem) => TurnOutcome::Invalid {
+                    output,
+                    problem: problem.clone(),
+                },
+            };
+            let result = TurnResult {
+                agent: request.agent.clone(),
+                role: request.role,
+                outcome,
+            };
+            self.store.append_turn(request.run, result.clone()).await?;
+            match parsed {
+                Ok(_) => {
                     return Ok(CompletedTurn {
                         result,
                         corrections,
+                        sender_reset_failed: None,
                     });
                 }
                 Err(problem) if corrections >= max_corrections => {
@@ -420,7 +439,7 @@ mod tests {
             TurnResult {
                 agent: id,
                 role: Role::Review,
-                outcome: Outcome::ReviewApproved("good".into()),
+                outcome: TurnOutcome::Valid(Outcome::ReviewApproved("good".into())),
             }
         );
         assert_eq!(
@@ -453,7 +472,21 @@ mod tests {
         assert!(log[1].1.contains("no outcome found"));
         assert!(log[2].1.contains("malformed outcome"));
         assert!(log[1].1.contains("ReviewApproved, ChangesRequested"));
-        assert_eq!(f.store.history(&f.run), [completed.result]);
+        let history = f.store.history(&f.run);
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history[0].outcome,
+            TurnOutcome::Invalid {
+                output: "no outcome here".into(),
+                problem: "no outcome found".into(),
+            }
+        );
+        assert!(matches!(
+            &history[1].outcome,
+            TurnOutcome::Invalid { output, problem }
+                if output == "{\"ReviewApproved\":" && problem.starts_with("malformed outcome")
+        ));
+        assert_eq!(history[2], completed.result);
     }
 
     #[tokio::test(start_paused = true)]
@@ -474,7 +507,11 @@ mod tests {
             TurnError::CorrectionsExhausted { corrections: 2, .. }
         ));
         assert_eq!(f.terminal.log().len(), 3);
-        assert!(f.store.history(&f.run).is_empty());
+        let history = f.store.history(&f.run);
+        assert_eq!(history.len(), 3);
+        assert!(history.iter().all(
+            |turn| matches!(&turn.outcome, TurnOutcome::Invalid { output, .. } if output == "nope")
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -499,6 +536,10 @@ mod tests {
                 .1
                 .contains("not valid for the Implementation role")
         );
+        assert!(matches!(
+            &f.store.history(&f.run)[0].outcome,
+            TurnOutcome::Invalid { output, .. } if output == "{\"MergeSuccessful\":\"done\"}"
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -547,8 +588,14 @@ mod tests {
         assert_eq!(
             outcomes,
             [
-                (implementer, Outcome::ImplementationReady("one".into())),
-                (reviewer, Outcome::ChangesRequested("two".into())),
+                (
+                    implementer,
+                    TurnOutcome::Valid(Outcome::ImplementationReady("one".into()))
+                ),
+                (
+                    reviewer,
+                    TurnOutcome::Valid(Outcome::ChangesRequested("two".into()))
+                ),
             ]
         );
     }
@@ -596,6 +643,30 @@ mod tests {
 
         assert!(matches!(error, TurnError::Port(_)));
         assert!(f.terminal.log().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_sender_reset_still_finishes_and_saves_the_receiver_turn() {
+        let f = fixture().await;
+        f.all_finished();
+        f.terminal.reply_with(&["{\"ChangesRequested\":\"fix\"}"]);
+        f.terminal.refuse.lock().unwrap().insert(f.panes[0].clone());
+        let id = agent("rev");
+
+        let completed = f
+            .turns
+            .handoff(
+                &f.panes[0],
+                &f.profile,
+                &f.request(&id, 1, Role::Review, None),
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert!(completed.sender_reset_failed.is_some());
+        assert_eq!(f.store.history(&f.run), [completed.result]);
+        assert_eq!(f.terminal.log().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
