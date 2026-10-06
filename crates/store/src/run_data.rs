@@ -14,6 +14,7 @@ const FILE_NAME: &str = "run.json";
 pub struct RunInput {
     pub repository: PathBuf,
     pub specification: IssueRef,
+    pub configuration_file: PathBuf,
 }
 
 /// The contents of `run.json`: fixed for the run once the Configuration and Feature pipelines
@@ -63,6 +64,7 @@ mod tests {
             input: RunInput {
                 repository: PathBuf::from("/work/repo"),
                 specification: issue(8),
+                configuration_file: PathBuf::from("/work/chimera.toml"),
             },
             ticket_plan: TicketPlan {
                 tickets: vec![Ticket {
@@ -92,7 +94,12 @@ mod tests {
 
         save_run_data(root.path(), &run(), &data()).unwrap();
 
-        assert_eq!(load_run_data(root.path(), &run()).unwrap(), data());
+        let loaded = load_run_data(root.path(), &run()).unwrap();
+        assert_eq!(loaded, data());
+        assert_eq!(
+            loaded.input.configuration_file,
+            PathBuf::from("/work/chimera.toml")
+        );
         assert!(root.path().join("run-1/run.json").is_file());
     }
 
