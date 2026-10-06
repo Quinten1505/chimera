@@ -1,0 +1,58 @@
+# Example Chimera configuration.
+
+# Optional per-provider settings. reset_command defaults to /clear.
+providers:
+  codex:
+    reset_command: /clear
+
+# Optional; every field is optional and defaults to the value shown.
+limits:
+  implementation_review_cycles: 100
+  merge_attempts: 100
+  final_review_fix_cycles: 100
+  agent_recovery: 5
+  github_retries: 5
+
+# Agents for the per-ticket pipeline.
+ticket:
+  implementation:
+    provider: codex
+    model: gpt-6-luna
+    settings:
+      reasoning_effort: medium
+    prompt_template: |
+      Implement the ticket. Follow the repository's test requirements.
+  review:
+    provider: codex
+    model: gpt-6-luna
+    settings:
+      reasoning_effort: high
+    prompt_template: |
+      Review the implementation against the ticket.
+  merge:
+    provider: codex
+    model: claude-sonnet-5-5
+    prompt_template: |
+      Merge the approved change and resolve conflicts.
+
+# Agents for the final pipeline over the integrated feature branch.
+final:
+  implementation:
+    provider: codex
+    model: gpt-6-luna
+    settings:
+      reasoning_effort: medium
+    prompt_template: |
+      Fix the findings from the final review.
+  review:
+    provider: codex
+    model: gpt-6-luna
+    settings:
+      reasoning_effort: high
+    prompt_template: |
+      Review the whole feature branch against the specification.
+  merge:
+    provider: codex
+    model: claude-sonnet-5-5
+    prompt_template: |
+      Merge the feature branch.
