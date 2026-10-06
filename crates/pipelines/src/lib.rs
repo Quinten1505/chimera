@@ -11,6 +11,7 @@ mod feature;
 mod implementation;
 mod merge_lock;
 mod policy;
+mod ticket;
 
 pub use agent_turn::{AgentTurns, CompletedTurn, TurnError, TurnRequest};
 pub use driver::{Pipeline, PipelineState, drive};
@@ -22,3 +23,4 @@ pub use feature::{FeaturePipeline, FeatureState};
 pub use implementation::{ImplementationPipeline, ImplementationState};
 pub use merge_lock::{MergeLock, Sequence};
 pub use policy::{Budget, Policy, PolicyState, RetryRefused};
+pub use ticket::{TicketEntry, TicketPause, TicketPipeline, TicketProgress, TicketState};
