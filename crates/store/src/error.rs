@@ -35,6 +35,14 @@ pub enum StoreError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// Appending to the file failed, and so did durably removing what the append wrote: the
+    /// appended content may be in the file, now or after a crash.
+    #[error("appending to {} failed ({source}), and removing the partial append failed too, so it may remain: {revert}", path.display())]
+    Unreverted {
+        path: PathBuf,
+        source: Box<StoreError>,
+        revert: std::io::Error,
+    },
     #[error("cannot serialize {}: {source}", path.display())]
     Serialize {
         path: PathBuf,
@@ -56,12 +64,15 @@ impl StoreError {
     }
 }
 
-/// A change that took effect but may not survive a crash is uncertain; every other failure leaves
-/// the stored state unchanged and is classified as failed.
+/// A change that took effect but may not survive a crash, or a failed change that may not have been
+/// undone, is uncertain; every other failure leaves the stored state unchanged and is classified as
+/// failed.
 impl From<StoreError> for PortError {
     fn from(error: StoreError) -> Self {
         match error {
-            StoreError::Unsynced { .. } => PortError::uncertain(error.to_string()),
+            StoreError::Unsynced { .. } | StoreError::Unreverted { .. } => {
+                PortError::uncertain(error.to_string())
+            }
             _ => PortError::failed(error.to_string()),
         }
     }
@@ -93,6 +104,24 @@ mod tests {
         let port: PortError = error.into();
         assert!(port.is_uncertain());
         assert!(port.to_string().contains("/state/run/file.json"));
+    }
+
+    #[test]
+    fn unreverted_append_is_uncertain_with_both_causes() {
+        let error = StoreError::Unreverted {
+            path: "/state/run/history.md".into(),
+            source: Box::new(StoreError::io(
+                "/state/run/history.md",
+                std::io::Error::other("disk on fire"),
+            )),
+            revert: std::io::Error::other("still on fire"),
+        };
+        let port: PortError = error.into();
+        assert!(port.is_uncertain());
+        let text = port.to_string();
+        assert!(text.contains("/state/run/history.md"));
+        assert!(text.contains("disk on fire"));
+        assert!(text.contains("still on fire"));
     }
 
     #[test]

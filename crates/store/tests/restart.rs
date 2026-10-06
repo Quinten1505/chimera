@@ -238,65 +238,112 @@ async fn entry_bytes(turn: &TurnResult, before: &[TurnResult]) -> Vec<u8> {
     std::fs::read(root.path().join("run-1/history.md")).unwrap()
 }
 
-#[tokio::test]
-async fn append_interrupted_at_any_byte_is_not_loaded_and_later_appends_are() {
-    let committed = [turn("first")];
-    // Fenced output with its own backticks, and multibyte characters in every field.
-    let torn = TurnResult {
+/// The turn whose append is interrupted: fenced output with its own backticks, and multibyte
+/// characters in every field.
+fn torn_turn() -> TurnResult {
+    TurnResult {
         agent: AgentId::new("a3").unwrap(),
         role: Role::Implementation,
         outcome: TurnOutcome::Invalid {
             output: "h\u{e9}llo \u{1F600}\n```\n## fake\n\u{4e2d}\u{6587}".into(),
             problem: "pr\u{f6}blem \u{1F980}".into(),
         },
+    }
+}
+
+/// Starts a store on a `history.md` holding `bytes`: the entry of `committed`, then what
+/// interrupted appends left. Only `committed` loads; retrying the torn turn and appending another
+/// records both, and both are visible when the Markdown is rendered.
+async fn assert_recovers(bytes: Vec<u8>, committed: &TurnResult, label: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let id = run();
+    std::fs::create_dir_all(root.path().join("run-1")).unwrap();
+    // The interrupted entry may end in a partial character.
+    let (torn_headings, torn_blocks) = rendered(&String::from_utf8_lossy(&bytes));
+    std::fs::write(root.path().join("run-1/history.md"), bytes).unwrap();
+
+    let store = open(&root);
+    assert_eq!(
+        store.load_history(&id).await.unwrap(),
+        std::slice::from_ref(committed),
+        "{label}"
+    );
+    let torn = torn_turn();
+    store.append_turn(&id, torn.clone()).await.unwrap();
+    store.append_turn(&id, turn("last")).await.unwrap();
+    drop(store);
+
+    let expected = [committed.clone(), torn.clone(), turn("last")];
+    assert_eq!(
+        open(&root).load_history(&id).await.unwrap(),
+        expected,
+        "{label}"
+    );
+
+    let bytes = std::fs::read(root.path().join("run-1/history.md")).unwrap();
+    let (headings, blocks) = rendered(&String::from_utf8_lossy(&bytes));
+    assert_eq!(headings.len(), torn_headings.len() + 2, "{label}");
+    assert!(headings[headings.len() - 2].ends_with(" · Implementation"));
+    assert!(headings[headings.len() - 1].ends_with(" · Review"));
+    let TurnOutcome::Invalid { output, .. } = &torn.outcome else {
+        unreachable!()
     };
-    let prefix = entry_bytes(&committed[0], &[]).await;
-    let full = entry_bytes(&torn, &committed).await;
+    assert_eq!(blocks.len(), torn_blocks.len() + 2, "{label}");
+    assert_eq!(
+        blocks[blocks.len() - 2..],
+        [format!("{output}\n"), "last\n".to_string()],
+        "{label}"
+    );
+}
+
+#[tokio::test]
+async fn append_interrupted_at_any_byte_is_not_loaded_and_later_appends_are() {
+    let committed = turn("first");
+    let prefix = entry_bytes(&committed, &[]).await;
+    let full = entry_bytes(&torn_turn(), std::slice::from_ref(&committed)).await;
     assert!(full.starts_with(&prefix));
     let tail = &full[prefix.len()..];
 
     for cut in 0..tail.len() {
-        let root = tempfile::tempdir().unwrap();
-        let id = run();
-        std::fs::create_dir_all(root.path().join("run-1")).unwrap();
         let mut bytes = prefix.clone();
         bytes.extend_from_slice(&tail[..cut]);
-        // The interrupted entry may end in a partial character.
-        let (torn_headings, torn_blocks) = rendered(&String::from_utf8_lossy(&bytes));
-        std::fs::write(root.path().join("run-1/history.md"), bytes).unwrap();
+        assert_recovers(bytes, &committed, &format!("cut {cut}")).await;
+    }
+}
 
-        let store = open(&root);
-        assert_eq!(
-            store.load_history(&id).await.unwrap(),
-            committed,
-            "cut {cut}"
-        );
-        // The interrupted append is retried, then another turn follows.
-        store.append_turn(&id, torn.clone()).await.unwrap();
-        store.append_turn(&id, turn("last")).await.unwrap();
-        drop(store);
+#[tokio::test]
+async fn append_interrupted_while_recovering_an_interrupted_append_is_recovered_too() {
+    let committed = turn("first");
+    let prefix = entry_bytes(&committed, &[]).await;
+    let full = entry_bytes(&torn_turn(), std::slice::from_ref(&committed)).await;
+    let tail = &full[prefix.len()..];
 
-        let expected = [committed[0].clone(), torn.clone(), turn("last")];
-        assert_eq!(
-            open(&root).load_history(&id).await.unwrap(),
-            expected,
-            "cut {cut}"
-        );
+    for cut in 0..tail.len() {
+        let mut bytes = prefix.clone();
+        bytes.extend_from_slice(&tail[..cut]);
+        // What the next append writes: the repair of the interrupted entry, then its own entry.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("run-1")).unwrap();
+        let history = root.path().join("run-1/history.md");
+        std::fs::write(&history, &bytes).unwrap();
+        open(&root).append_turn(&run(), torn_turn()).await.unwrap();
+        let appended = std::fs::read(&history).unwrap()[bytes.len()..].to_vec();
+        let repair = appended.len() - tail.len();
 
-        // Both entries after the interrupted one are visible when the Markdown is rendered.
-        let bytes = std::fs::read(root.path().join("run-1/history.md")).unwrap();
-        let (headings, blocks) = rendered(&String::from_utf8_lossy(&bytes));
-        assert_eq!(headings.len(), torn_headings.len() + 2, "cut {cut}");
-        assert!(headings[headings.len() - 2].ends_with(" · Implementation"));
-        assert!(headings[headings.len() - 1].ends_with(" · Review"));
-        let TurnOutcome::Invalid { output, .. } = &torn.outcome else {
-            unreachable!()
-        };
-        assert_eq!(blocks.len(), torn_blocks.len() + 2, "cut {cut}");
-        assert_eq!(
-            blocks[blocks.len() - 2..],
-            [format!("{output}\n"), "last\n".to_string()],
-            "cut {cut}"
-        );
+        // That append is interrupted within the repair, and the next one within its own repair.
+        for first in 1..repair {
+            let mut once = bytes.clone();
+            once.extend_from_slice(&appended[..first]);
+            assert_recovers(once.clone(), &committed, &format!("cut {cut}, {first}")).await;
+            std::fs::write(&history, &once).unwrap();
+            open(&root).append_turn(&run(), torn_turn()).await.unwrap();
+            let appended = std::fs::read(&history).unwrap()[once.len()..].to_vec();
+            for second in 1..appended.len() - tail.len() {
+                let mut twice = once.clone();
+                twice.extend_from_slice(&appended[..second]);
+                let label = format!("cut {cut}, {first}, {second}");
+                assert_recovers(twice, &committed, &label).await;
+            }
+        }
     }
 }

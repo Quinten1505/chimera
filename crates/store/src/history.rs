@@ -47,22 +47,33 @@ pub(crate) struct HistoryEntry<'a> {
 }
 
 /// Appends `entry` to `history.md` in `run_directory`, creating the file on first append. Existing
-/// content is never rewritten; the entry, and the file's directory entry when the file was empty,
-/// are flushed to disk before this returns. On failure the entry is not left in the file; if the
-/// process dies mid-append instead, the next append first closes what the interrupted entry left
-/// open, so that entry is never loaded and later entries are, and are visible when rendered.
+/// content is never rewritten; the entry and the file's directory entry are flushed to disk before
+/// this returns. On failure the entry is removed from the file again, durably, or the error is
+/// [`StoreError::Unreverted`]; if the process dies mid-append instead, the next append first closes
+/// what the interrupted entry left open, so that entry is never loaded and later entries are, and
+/// are visible when rendered.
 pub(crate) fn append_history(
     run_directory: &Path,
     entry: &HistoryEntry<'_>,
 ) -> Result<(), StoreError> {
-    append_history_with(run_directory, entry, &mut sync_directory)
+    append_history_with(run_directory, entry, &mut |_| Ok(()))
 }
 
-/// `sync` flushes a directory.
+/// A file system operation of an append, before which tests can inject a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Write,
+    SyncFile,
+    SyncDirectory,
+    Truncate,
+    SyncTruncation,
+}
+
+/// `fault` runs before each step; an error it returns is that step's failure.
 fn append_history_with(
     run_directory: &Path,
     entry: &HistoryEntry<'_>,
-    sync: &mut dyn FnMut(&Path) -> io::Result<()>,
+    fault: &mut dyn FnMut(Step) -> io::Result<()>,
 ) -> Result<(), StoreError> {
     let path: PathBuf = run_directory.join(HISTORY_FILE);
     let _guard = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -79,21 +90,35 @@ fn append_history_with(
         .open(&path)
         .map_err(|e| StoreError::io(&path, e))?;
     let length = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
-    let written = file
-        .write_all(text.as_bytes())
+    let written = fault(Step::Write)
+        .and_then(|()| file.write_all(text.as_bytes()))
+        .and_then(|()| fault(Step::SyncFile))
         .and_then(|()| file.sync_all())
         .map_err(|e| StoreError::io(&path, e))
-        // A new file is lost in a crash until its directory entry is flushed. An empty file may
-        // be one whose earlier first append failed at this step, so it is flushed again.
-        .and_then(|()| match length {
-            0 => sync(run_directory).map_err(|e| StoreError::io(run_directory, e)),
-            _ => Ok(()),
+        // The file may be new, or left by an append that died before flushing its directory
+        // entry, which is lost in a crash until then, so the directory is flushed every time.
+        .and_then(|()| {
+            fault(Step::SyncDirectory)
+                .and_then(|()| sync_directory(run_directory))
+                .map_err(|e| StoreError::io(run_directory, e))
         });
-    if written.is_err() {
-        // A failed append must leave no entry behind, or a retry would record the turn twice.
-        let _ = file.set_len(length);
-    }
-    written
+    let Err(error) = written else {
+        return Ok(());
+    };
+    // A failed append must leave no entry behind, or a retry would record the turn twice; it is
+    // only known not to have happened once its removal is on disk.
+    let reverted = fault(Step::Truncate)
+        .and_then(|()| file.set_len(length))
+        .and_then(|()| fault(Step::SyncTruncation))
+        .and_then(|()| file.sync_all());
+    Err(match reverted {
+        Ok(()) => error,
+        Err(revert) => StoreError::Unreverted {
+            path,
+            source: Box::new(error),
+            revert,
+        },
+    })
 }
 
 /// What must precede the next entry so that it starts on its own line outside any fence or HTML
@@ -122,19 +147,25 @@ struct Scan<'a> {
     records: Vec<&'a str>,
     /// The number of backticks of the fence still open at the end of the text.
     open_fence: Option<usize>,
-    /// Whether the last line opens an HTML comment it does not close.
+    /// Whether an HTML comment is still open at the end of the text.
     open_comment: bool,
 }
 
 /// Finds the records of complete entries. Turn output is never read as structure: lines inside a
-/// fence are skipped. A record only counts when followed by an empty line, the last thing an entry
-/// writes, so an entry cut anywhere has none.
+/// fence are skipped, as are lines inside an HTML comment, which rendering hides. A record only
+/// counts when followed by an empty line, the last thing an entry writes, so an entry cut anywhere
+/// has none.
 fn scan(text: &str) -> Scan<'_> {
     let lines: Vec<&str> = text.lines().collect();
     let mut records = Vec::new();
     let mut fence: Option<usize> = None;
+    let mut comment = false;
     for (n, line) in lines.iter().enumerate() {
         let ticks = line.chars().take_while(|&c| c == '`').count();
+        if comment {
+            comment = !line.contains(COMMENT_CLOSE);
+            continue;
+        }
         match fence {
             Some(open) if ticks >= open && line.len() == ticks => fence = None,
             Some(_) => {}
@@ -147,19 +178,14 @@ fn scan(text: &str) -> Scan<'_> {
                 {
                     records.push(json);
                 }
+                comment = line.starts_with(COMMENT_OPEN) && !line.contains(COMMENT_CLOSE);
             }
         }
     }
-    // Each append closes what an interrupted one left open, so only the last line, a record cut
-    // short, can leave a comment open.
-    let open_comment = fence.is_none()
-        && lines
-            .last()
-            .is_some_and(|line| line.starts_with(COMMENT_OPEN) && !line.contains(COMMENT_CLOSE));
     Scan {
         records,
         open_fence: fence,
-        open_comment,
+        open_comment: comment,
     }
 }
 
@@ -530,55 +556,127 @@ mod tests {
         assert_eq!(headings(&read(dir.path())).len(), 1);
     }
 
-    #[test]
-    fn creating_the_file_syncs_its_directory_after_the_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let turn = valid("first");
-        let entry = HistoryEntry {
+    fn entry(turn: &TurnResult) -> HistoryEntry<'_> {
+        HistoryEntry {
             time: UNIX_EPOCH,
             pipeline: None,
             kind: None,
-            turn: &turn,
-        };
-        let mut synced = Vec::new();
-        let mut sync = |directory: &Path| {
-            synced.push((directory.to_path_buf(), load_turns(directory).unwrap()));
-            Ok(())
-        };
-
-        append_history_with(dir.path(), &entry, &mut sync).unwrap();
-        append_history_with(dir.path(), &entry, &mut sync).unwrap();
-
-        // Only the creating append syncs, once its entry is complete in the file.
-        assert_eq!(synced, [(dir.path().to_path_buf(), vec![turn])]);
+            turn,
+        }
     }
 
     #[test]
-    fn failed_directory_sync_leaves_nothing_to_load_and_a_retry_syncs_and_records_once() {
+    fn every_append_syncs_its_directory_after_the_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let turn = valid("retry me");
-        let entry = HistoryEntry {
-            time: UNIX_EPOCH,
-            pipeline: None,
-            kind: None,
-            turn: &turn,
+        let turn = valid("first");
+        let mut synced = Vec::new();
+        let mut fault = |step| {
+            if step == Step::SyncDirectory {
+                synced.push(load_turns(dir.path()).unwrap());
+            }
+            Ok(())
         };
 
-        let error = append_history_with(dir.path(), &entry, &mut |_| {
-            Err(io::Error::other("disk on fire"))
-        })
-        .unwrap_err();
+        append_history_with(dir.path(), &entry(&turn), &mut fault).unwrap();
+        append_history_with(dir.path(), &entry(&turn), &mut fault).unwrap();
 
-        assert!(matches!(error, StoreError::Io { .. }));
-        assert!(load_turns(dir.path()).unwrap().is_empty());
-        let mut synced = 0;
-        append_history_with(dir.path(), &entry, &mut |_| {
-            synced += 1;
+        // Each sync follows a complete entry in the file.
+        assert_eq!(synced, [vec![turn.clone()], vec![turn.clone(), turn]]);
+    }
+
+    #[test]
+    fn a_file_left_by_an_interrupted_first_append_has_its_directory_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        // The process died after writing part of the first entry, before syncing the directory.
+        let torn = render(&entry(&valid("torn")));
+        fs::write(dir.path().join("history.md"), &torn[..torn.len() / 2]).unwrap();
+        let turn = valid("next");
+        let mut steps = Vec::new();
+
+        append_history_with(dir.path(), &entry(&turn), &mut |step| {
+            steps.push(step);
             Ok(())
         })
         .unwrap();
-        assert_eq!(synced, 1);
+
+        assert_eq!(steps, [Step::Write, Step::SyncFile, Step::SyncDirectory]);
         assert_eq!(load_turns(dir.path()).unwrap(), [turn]);
+    }
+
+    /// Runs an append whose `failing` steps fail, after `before` was appended; returns the error,
+    /// the steps that ran and whether the file changed.
+    fn fail_append(before: &[TurnResult], failing: &[Step]) -> (StoreError, Vec<Step>, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        for turn in before {
+            append_history(dir.path(), &entry(turn)).unwrap();
+        }
+        let path = dir.path().join("history.md");
+        let previous = fs::read(&path).ok();
+        let mut steps = Vec::new();
+        let turn = valid("retry me");
+
+        let error = append_history_with(dir.path(), &entry(&turn), &mut |step| {
+            steps.push(step);
+            match failing.contains(&step) {
+                true => Err(io::Error::other(format!("{step:?} on fire"))),
+                false => Ok(()),
+            }
+        })
+        .unwrap_err();
+
+        let content = fs::read(&path).unwrap();
+        let changed = content != previous.unwrap_or_default();
+        if !changed {
+            // The retry records the turn once.
+            append_history(dir.path(), &entry(&turn)).unwrap();
+            let mut expected = before.to_vec();
+            expected.push(turn);
+            assert_eq!(load_turns(dir.path()).unwrap(), expected);
+        }
+        (error, steps, changed)
+    }
+
+    #[test]
+    fn a_failed_append_is_removed_durably_and_reported_as_failed() {
+        for before in [vec![], vec![valid("earlier")]] {
+            for (failing, ran) in [
+                (Step::Write, 1),
+                (Step::SyncFile, 2),
+                (Step::SyncDirectory, 3),
+            ] {
+                let (error, steps, changed) = fail_append(&before, &[failing]);
+
+                assert!(matches!(error, StoreError::Io { .. }), "{failing:?}");
+                assert!(error.to_string().contains(&format!("{failing:?} on fire")));
+                let all = [Step::Write, Step::SyncFile, Step::SyncDirectory];
+                let mut expected = all[..ran].to_vec();
+                expected.extend([Step::Truncate, Step::SyncTruncation]);
+                assert_eq!(steps, expected, "{failing:?}");
+                assert!(!changed, "{failing:?}");
+                assert!(chimera_core::error::PortError::from(error).is_failed());
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_append_whose_removal_fails_is_uncertain() {
+        for before in [vec![], vec![valid("earlier")]] {
+            for failing in [Step::Write, Step::SyncFile, Step::SyncDirectory] {
+                for revert in [Step::Truncate, Step::SyncTruncation] {
+                    let (error, steps, _) = fail_append(&before, &[failing, revert]);
+
+                    assert_eq!(steps.last(), Some(&revert));
+                    let text = error.to_string();
+                    assert!(matches!(error, StoreError::Unreverted { .. }), "{text}");
+                    assert!(text.contains(&format!("{failing:?} on fire")), "{text}");
+                    assert!(text.contains(&format!("{revert:?} on fire")), "{text}");
+                    assert!(chimera_core::error::PortError::from(error).is_uncertain());
+                }
+            }
+        }
+        // When the entry could not be removed, it may well be in the file.
+        let (_, _, changed) = fail_append(&[], &[Step::SyncDirectory, Step::Truncate]);
+        assert!(changed);
     }
 
     #[test]
@@ -589,6 +687,86 @@ mod tests {
         // A complete record line, or a comment inside a fence, needs no terminator.
         assert_eq!(repair(format!("{cut}{RECORD_SUFFIX}").as_bytes()), "\n");
         assert_eq!(repair(b"```text\n<!-- x\n"), "```\n");
+        // A comment stays open over later lines until one closes it.
+        assert_eq!(repair(format!("{cut}\n-").as_bytes()), "\n-->\n");
+        assert_eq!(repair(format!("{cut}\n-\n--").as_bytes()), "\n-->\n");
+        assert_eq!(repair(format!("{cut}\n-\n-->").as_bytes()), "\n");
+    }
+
+    /// Adds to `states` the text, then every text its repair leaves when interrupted, up to
+    /// `depth` interruptions deep.
+    fn interrupted_repairs(text: String, depth: usize, states: &mut Vec<String>) {
+        let repair = repair(text.as_bytes());
+        if depth > 0 {
+            for cut in 1..repair.len() {
+                interrupted_repairs(format!("{text}{}", &repair[..cut]), depth - 1, states);
+            }
+        }
+        states.push(text);
+    }
+
+    /// The text of each level-2 heading and code block of the rendered Markdown.
+    fn rendered(markdown: &str) -> (Vec<String>, Vec<String>) {
+        use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+
+        let (mut headings, mut blocks) = (Vec::new(), Vec::new());
+        let mut current: Option<String> = None;
+        for event in Parser::new(markdown) {
+            match event {
+                Event::Start(Tag::Heading {
+                    level: HeadingLevel::H2,
+                    ..
+                })
+                | Event::Start(Tag::CodeBlock(_)) => current = Some(String::new()),
+                Event::Text(text) => {
+                    if let Some(current) = &mut current {
+                        current.push_str(&text);
+                    }
+                }
+                Event::End(TagEnd::Heading(HeadingLevel::H2)) => headings.extend(current.take()),
+                Event::End(TagEnd::CodeBlock) => blocks.extend(current.take()),
+                _ => {}
+            }
+        }
+        (headings, blocks)
+    }
+
+    #[test]
+    fn repeatedly_interrupted_repairs_keep_later_entries_loaded_and_visible() {
+        let committed = valid("committed");
+        let after = valid("after");
+        let prefix = render(&entry(&committed));
+        let torn = render(&entry(&invalid("torn\n```\n## fake")));
+        let mut states = Vec::new();
+        // Cuts inside a character are covered by the restart tests.
+        for cut in (0..torn.len()).filter(|&cut| torn.is_char_boundary(cut)) {
+            interrupted_repairs(format!("{prefix}{}", &torn[..cut]), 3, &mut states);
+        }
+
+        for state in states {
+            let text = format!(
+                "{state}{}{}",
+                repair(state.as_bytes()),
+                render(&entry(&after))
+            );
+            let loaded: Result<Vec<TurnResult>, _> = scan(&text)
+                .records
+                .into_iter()
+                .map(serde_json::from_str)
+                .collect();
+            assert_eq!(
+                loaded.unwrap(),
+                [committed.clone(), after.clone()],
+                "{text}"
+            );
+            let (headings, blocks) = rendered(&text);
+            assert_eq!(
+                headings.last().unwrap(),
+                "1970-01-01T00:00:00Z · Review",
+                "{text}"
+            );
+            assert_eq!(blocks.last().unwrap(), "after\n", "{text}");
+        }
     }
 
     #[test]
