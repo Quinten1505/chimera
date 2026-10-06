@@ -126,7 +126,13 @@ fn plain_string(value: Option<String>, field: &str) -> Result<String, Configurat
     Ok(value)
 }
 
-/// Prompt templates are multi-line, so newlines and tabs are allowed.
+/// A required prompt template: nonempty, and free of control characters except
+/// line feed, carriage return and tab.
+///
+/// Per the clarified spec (issue #21), `prompt_template` is the only string
+/// exempt from the "no control characters" rule, and only for `\n`, `\r` and
+/// `\t`, because templates are multi-line. Every other control character
+/// (e.g. NUL, ESC) is rejected with the field path.
 fn template_string(value: Option<String>, field: &str) -> Result<String, ConfigurationError> {
     let value = value.ok_or_else(|| missing(field))?;
     if value.trim().is_empty()
@@ -453,19 +459,33 @@ limits:
         assert!(err(&control).contains("ticket.implementation.model"));
         let reset = format!("providers:\n  codex: {{ reset_command: \"\" }}\n{MINIMAL}");
         assert!(err(&reset).contains("providers.codex.reset_command"));
-        let template = MINIMAL.replacen(
-            "prompt_template: implement",
-            "prompt_template: \"a\\x00b\"",
-            1,
-        );
-        assert!(err(&template).contains("ticket.implementation.prompt_template"));
+        for bad in ["a\\x00b", "a\\x1bb"] {
+            let template = MINIMAL.replacen(
+                "prompt_template: implement",
+                &format!("prompt_template: \"{bad}\""),
+                1,
+            );
+            assert!(
+                err(&template).contains("ticket.implementation.prompt_template"),
+                "{bad}"
+            );
+        }
+        for bad in ["m\\n", "m\\t", "m\\r"] {
+            let model = MINIMAL.replacen("model: m1", &format!("model: \"{bad}\""), 1);
+            assert!(err(&model).contains("ticket.implementation.model"), "{bad}");
+            let reset = format!("providers:\n  codex: {{ reset_command: \"{bad}\" }}\n{MINIMAL}");
+            assert!(
+                err(&reset).contains("providers.codex.reset_command"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
     fn multiline_prompt_templates_are_valid() {
         let yaml = MINIMAL.replacen(
             "prompt_template: implement",
-            "prompt_template: \"a\\nb\\tc\"",
+            "prompt_template: \"a\\nb\\r\\nc\\td\"",
             1,
         );
         assert!(Configuration::from_yaml(&yaml).is_ok());
