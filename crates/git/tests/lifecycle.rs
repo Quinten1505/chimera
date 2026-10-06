@@ -199,6 +199,40 @@ async fn deleted_or_replaced_worktree_directory_does_not_exist() {
 }
 
 #[tokio::test]
+async fn create_rejects_directory_replacing_unpruned_worktree() {
+    let (dir, work) = setup();
+    let repository = GitRepository::new(&work);
+    let feature = branch("feature/x");
+    let task = branch("task/1");
+    let worktree = dir.path().join("wt-1");
+    repository
+        .create_feature_branch(&feature, &branch("main"))
+        .await
+        .unwrap();
+    repository
+        .create_worktree(&worktree, &task, &feature)
+        .await
+        .unwrap();
+
+    // Delete without pruning, so the stale registration on task/1 remains.
+    std::fs::remove_dir_all(&worktree).unwrap();
+    std::fs::create_dir(&worktree).unwrap();
+    std::fs::write(worktree.join("keep.txt"), "unrelated").unwrap();
+    assert!(!repository.worktree_exists(&worktree).await.unwrap());
+
+    let error = repository
+        .create_worktree(&worktree, &task, &feature)
+        .await
+        .unwrap_err();
+    assert!(error.is_failed(), "{error:?}");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("keep.txt")).unwrap(),
+        "unrelated"
+    );
+    assert!(!repository.worktree_exists(&worktree).await.unwrap());
+}
+
+#[tokio::test]
 async fn update_worktree_fetches_commit_outside_configured_refspec() {
     let (dir, work) = setup();
     let repository = GitRepository::new(&work);

@@ -8,7 +8,8 @@ use crate::runner::{Effect, Runner};
 /// Creates the worktree for `task_branch` at `path` and returns the path.
 ///
 /// A missing `task_branch` is created from the latest `origin/<feature>` after a fetch; an
-/// existing one is reused as is. A worktree already at `path` on `task_branch` is left alone.
+/// existing one is reused as is. A usable worktree already at `path` on `task_branch` is left
+/// alone; anything else at `path`, including a directory replacing a deleted worktree, fails.
 pub(crate) fn create(
     runner: &Runner,
     repo: &Path,
@@ -23,7 +24,7 @@ pub(crate) fn create(
             same_path(&worktree.path, path)
                 && worktree.branch.as_deref() == Some(branch_ref.as_str())
         });
-        if on_task_branch {
+        if on_task_branch && exists(runner, repo, path)? {
             return Ok(path.to_path_buf());
         }
         return Err(GitError::Failed {
