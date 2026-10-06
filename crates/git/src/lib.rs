@@ -2,6 +2,9 @@
 //!
 //! Expose the module interface here; keep implementation submodules private.
 
+// Unused until the Repository adapter builds on the operations.
+#[allow(dead_code)]
+mod branch;
 mod error;
 // Unused until the operation tickets build on the runner.
 #[allow(dead_code)]
