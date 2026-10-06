@@ -3,6 +3,7 @@
 //! Expose the module interface here; keep implementation submodules private.
 
 mod client;
+mod close_issue;
 mod error;
 
 pub use client::{Access, Client, DEFAULT_API_URL};
