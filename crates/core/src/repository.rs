@@ -27,6 +27,9 @@ pub trait Repository: Send + Sync {
         feature: &BranchName,
     ) -> Result<(), PortError>;
 
+    /// Whether a worktree exists at `path`, used to reconcile an uncertain creation.
+    async fn worktree_exists(&self, path: &Path) -> Result<bool, PortError>;
+
     /// Moves the task branch checked out in the worktree at `path` to `commit` on the remote,
     /// fetching it if needed. Succeeds when the worktree is already there.
     async fn update_worktree(&self, path: &Path, commit: &CommitId) -> Result<(), PortError>;
@@ -187,6 +190,12 @@ mod fake {
             Ok(())
         }
 
+        async fn worktree_exists(&self, path: &Path) -> Result<bool, PortError> {
+            let mut state = self.state.lock().unwrap();
+            state.begin()?;
+            Ok(state.worktrees.contains_key(path))
+        }
+
         async fn update_worktree(&self, path: &Path, commit: &CommitId) -> Result<(), PortError> {
             let mut state = self.state.lock().unwrap();
             state.begin()?;
@@ -273,13 +282,16 @@ mod fake {
             let fake = FakeRepository::new(branch("main"), commit("c0"));
             let path = Path::new("/wt/15");
             block_on(fake.create_feature_branch(&branch("feat"), &branch("main"))).unwrap();
+            assert!(!block_on(fake.worktree_exists(path)).unwrap());
             block_on(fake.create_worktree(path, &branch("task"), &branch("feat"))).unwrap();
             assert!(fake.has_branch(&branch("task")));
             assert_eq!(fake.worktree_branch(path), Some(branch("task")));
+            assert!(block_on(fake.worktree_exists(path)).unwrap());
 
             block_on(fake.remove_worktree(path, &branch("task"))).unwrap();
             assert!(!fake.has_branch(&branch("task")));
             assert_eq!(fake.worktree_branch(path), None);
+            assert!(!block_on(fake.worktree_exists(path)).unwrap());
         }
 
         #[test]
