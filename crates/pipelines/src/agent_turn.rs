@@ -287,7 +287,21 @@ fn prompt(request: &TurnRequest<'_>) -> String {
     if let Some(description) = request.previous_description {
         prompt.push_str(&format!("\n\nPrevious agent:\n{description}"));
     }
+    if request.role == Role::Merge {
+        prompt.push_str(&format!("\n\n{MERGE_SUCCESS_CONTRACT}"));
+    }
     prompt
+}
+
+const MERGE_SUCCESS_CONTRACT: &str = "When you report MergeSuccessful, the explanation must start \
+     with the full SHA of the commit you pushed to the feature branch, followed by a space and \
+     your explanation, e.g. {\"MergeSuccessful\":\"<sha> merged and tests pass\"}.";
+
+/// The commit a `MergeSuccessful` explanation reports as pushed: its first word, which must be a
+/// hexadecimal commit id. Any other mention of a commit in the explanation is ignored.
+pub(crate) fn pushed_commit(explanation: &str) -> Option<&str> {
+    let word = explanation.split_whitespace().next()?;
+    word.chars().all(|c| c.is_ascii_hexdigit()).then_some(word)
 }
 
 fn correction_prompt(role: Role, problem: &str) -> String {
@@ -338,10 +352,12 @@ fn parse_outcome(output: &str, role: Role) -> Result<Outcome, String> {
         .ok_or("no outcome found")?;
     let outcome: Outcome =
         serde_json::from_str(line).map_err(|error| format!("malformed outcome: {error}"))?;
-    if is_valid_for(role, &outcome) {
-        Ok(outcome)
-    } else {
+    if !is_valid_for(role, &outcome) {
         Err(format!("outcome is not valid for the {role:?} role"))
+    } else if matches!(&outcome, Outcome::MergeSuccessful(text) if pushed_commit(text).is_none()) {
+        Err(format!("MergeSuccessful: {MERGE_SUCCESS_CONTRACT}"))
+    } else {
+        Ok(outcome)
     }
 }
 
