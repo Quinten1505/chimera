@@ -12,6 +12,7 @@ modules in a Cargo workspace. All modules run in the same process.
 | `crates/herdr` | Herdr client: connection, workspace, pane, session, and agent operations. |
 | `crates/pipelines` | The four orchestration pipelines and the shared services. |
 | `crates/github` | GitHub integration and translation between GitHub data and domain concepts. |
+| `crates/git` | `Repository` adapter: branches, worktrees, and remote heads through the `git` CLI. |
 | `crates/configuration` | Loading and validating application settings. |
 
 Package names use the `chimera-` prefix (for example, `chimera-core`) to
@@ -31,11 +32,12 @@ chimera (executable)
   -> core
   -> pipelines -> core
   -> github -> core
+  -> git -> core
   -> configuration
 ```
 
-Core and configuration have no internal dependencies. Pipelines and GitHub may
-use core, but do not depend on each other. The executable owns module assembly
+Core and configuration have no internal dependencies. Pipelines, GitHub, and Git
+may use core, but do not depend on each other. The executable owns module assembly
 and passes configuration into the modules that need it. Introduce interfaces
 for cross-module behavior when concrete use cases require them, keeping this
 dependency direction and avoiding cycles.
@@ -56,7 +58,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-All five packages are default workspace members, so plain `cargo build` and
+All workspace packages are default members, so plain `cargo build` and
 `cargo test` also include every module. Run a focused module check with, for
 example, `cargo test -p chimera-pipelines`. The deployable binary is
 `target/release/chimera` after `cargo build --release -p chimera`.
@@ -161,3 +163,44 @@ for the socket response.
 
 This helper consumes an already populated session. It does not create the layout,
 save session files, or change the executable's hello-world entry point.
+
+## Git integration
+
+The `crates/git` crate (`chimera-git`) implements core's `Repository` port as
+`GitRepository` by running the `git` CLI; there is no libgit2 dependency, so
+`git` must be installed and on `PATH` at runtime. Construct it with the
+repository's working directory, which must have an `origin` remote:
+
+```rust,no_run
+use chimera_core::repository::Repository;
+use chimera_git::GitRepository;
+
+async fn base() -> Result<(), chimera_core::error::PortError> {
+    let repo = GitRepository::new("/home/me/git/project");
+    let base = repo.resolve_base_branch().await?;
+    println!("Base branch: {}", base.as_str());
+    Ok(())
+}
+```
+
+The base branch is `develop` if `origin` has one, otherwise the remote's
+default branch. Feature branches are created from the fetched base and pushed
+with upstream tracking; task worktrees are created from the feature branch.
+`remote_head` queries `origin` directly with `git ls-remote`, so it reflects
+pushes that were never fetched locally; it returns `None` only when the branch
+is absent, and an unreachable remote is an error.
+
+Each `git` invocation runs once, without retries, on a blocking thread, with
+interactive prompts disabled (credential, SSH, editor, and pager). Failures are
+reported as `PortError`s classified as failed (the effect did not happen) or
+uncertain (a push whose outcome is unknown, such as a dropped connection).
+Operations tolerate already-applied state where it is safe, for example
+removing a missing worktree or recreating an existing branch at the expected
+commit, so they can be repeated during reconciliation after a restart.
+
+Tests run against real repositories with a bare `origin` in temporary
+directories and need only `git`:
+
+```sh
+cargo test -p chimera-git
+```
