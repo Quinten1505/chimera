@@ -343,8 +343,9 @@ impl<I: Implement> PrReviewPipeline<I> {
         })
     }
 
-    /// Starts the review turn, or continues it after a restart, and returns its outcome. When
-    /// the turn cannot finish now, returns the state to continue from instead.
+    /// Starts the review turn, or continues it, by at most one prompt and returns its outcome
+    /// once it has one. Until then, or when the turn cannot finish now, returns the state to
+    /// continue from instead.
     async fn run_turn(
         &self,
         state: &PrReviewState,
@@ -421,52 +422,55 @@ impl<I: Implement> PrReviewPipeline<I> {
             }
             turn.phase = TurnPhase::Awaiting;
             self.save_pending(Some(&turn)).await?;
+            if created {
+                // The prompt was this step's effect; the next step collects the result.
+                return Ok(Err(state.clone()));
+            }
         }
-        loop {
-            if turn.phase == TurnPhase::Correcting {
-                if let Err(error) = self.confirm_delivery(&request, &turn, "correction").await {
-                    return self.turn_failed(error, state, &environment).await;
-                }
-                turn.corrections += 1;
-                turn.phase = TurnPhase::Awaiting;
-                self.save_pending(Some(&turn)).await?;
-            }
-            let collected = match self.turns.collect(&request).await {
-                Ok(collected) => collected,
-                Err(error) => return self.turn_failed(error, state, &environment).await,
-            };
-            // A crash after the result was saved but before the phase moved on leaves the
-            // result in the history: saving it again would count it twice.
-            let saved = invalid(&self.history().await?) - turn.invalid_before;
-            if collected.parsed.is_ok() || saved <= turn.corrections as usize {
-                self.turns.record(&request, &collected).await?;
-            }
-            let problem = match collected.parsed {
-                Ok(outcome) => {
-                    self.save_pending(None).await?;
-                    return Ok(Ok(outcome));
-                }
-                Err(problem) => problem,
-            };
-            if turn.corrections >= max_corrections {
-                self.save_pending(None).await?;
-                return Ok(Err(paused(PauseReason::LimitExhausted, state.clone())));
-            }
-            turn.phase = TurnPhase::Correcting;
-            turn.output_before = collected.output;
-            self.save_pending(Some(&turn)).await?;
-            if let Err(error) = self.turns.send_correction(&request, &problem).await {
-                if !error.is_uncertain() {
-                    // Not delivered: the saved result is corrected on the next attempt.
-                    turn.phase = TurnPhase::Awaiting;
-                    self.save_pending(Some(&turn)).await?;
-                }
-                return Err(error.into());
+        if turn.phase == TurnPhase::Correcting {
+            if let Err(error) = self.confirm_delivery(&request, &turn, "correction").await {
+                return self.turn_failed(error, state, &environment).await;
             }
             turn.corrections += 1;
             turn.phase = TurnPhase::Awaiting;
             self.save_pending(Some(&turn)).await?;
         }
+        let collected = match self.turns.collect(&request).await {
+            Ok(collected) => collected,
+            Err(error) => return self.turn_failed(error, state, &environment).await,
+        };
+        // A crash after the result was saved but before the phase moved on leaves the result in
+        // the history: saving it again would count it twice.
+        let saved = invalid(&self.history().await?) - turn.invalid_before;
+        if collected.parsed.is_ok() || saved <= turn.corrections as usize {
+            self.turns.record(&request, &collected).await?;
+        }
+        let problem = match collected.parsed {
+            Ok(outcome) => {
+                self.save_pending(None).await?;
+                return Ok(Ok(outcome));
+            }
+            Err(problem) => problem,
+        };
+        if turn.corrections >= max_corrections {
+            self.save_pending(None).await?;
+            return Ok(Err(paused(PauseReason::LimitExhausted, state.clone())));
+        }
+        turn.phase = TurnPhase::Correcting;
+        turn.output_before = collected.output;
+        self.save_pending(Some(&turn)).await?;
+        if let Err(error) = self.turns.send_correction(&request, &problem).await {
+            if !error.is_uncertain() {
+                // Not delivered: the saved result is corrected on the next attempt.
+                turn.phase = TurnPhase::Awaiting;
+                self.save_pending(Some(&turn)).await?;
+            }
+            return Err(error.into());
+        }
+        turn.corrections += 1;
+        turn.phase = TurnPhase::Awaiting;
+        self.save_pending(Some(&turn)).await?;
+        Ok(Err(state.clone()))
     }
 
     /// A prompt sent before a restart is known to have arrived only if the agent is working or
@@ -676,6 +680,8 @@ impl<I: Implement> PrReviewPipeline<I> {
             return Ok(paused(reason, state));
         }
         Ok(match self.review(state.clone(), cycle).await {
+            // Still in flight: the next step goes on collecting it.
+            Ok(next) if next == state => next,
             Ok(next) if next.is_paused() => next,
             Ok(next) => paused(reason, next),
             Err(PipelineError::Paused(_)) => paused(reason, state),
@@ -1017,6 +1023,11 @@ mod tests {
         f.terminal.inner.script_statuses(pane, [TurnStatus::Gone]);
         *f.terminal.fail_launch.lock().unwrap() = Some(PortError::uncertain("lost"));
 
+        // The assignment, then the relaunch of the agent found gone.
+        assert_eq!(
+            block_on(pipeline.step(reviewing.clone())).unwrap(),
+            reviewing
+        );
         let error = block_on(pipeline.step(reviewing)).unwrap_err();
 
         assert!(error.is_uncertain());

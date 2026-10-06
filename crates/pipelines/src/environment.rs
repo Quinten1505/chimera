@@ -430,14 +430,15 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use chimera_core::Limits;
     use chimera_core::repository::FakeRepository;
-    use chimera_core::run_store::{EffectRecord, FakeRunStore};
+    use chimera_core::run_store::FakeRunStore;
     use chimera_core::terminal::FakeTerminal;
-    use chimera_core::{Limits, TurnResult};
     use futures_executor::block_on;
 
     use super::*;
     use crate::PauseReason;
+    use crate::test_support::CrashingStore;
 
     fn branch(name: &str) -> BranchName {
         BranchName::new(name).unwrap()
@@ -550,77 +551,6 @@ mod tests {
                 return Err(error);
             }
             self.inner.close_workspace(workspace).await
-        }
-    }
-
-    /// Wraps the fake store; the save with the armed number fails without storing anything, as
-    /// if the process stopped right before it.
-    #[derive(Default)]
-    struct CrashingStore {
-        inner: FakeRunStore,
-        saves: Mutex<usize>,
-        crash_at: Mutex<Option<usize>>,
-    }
-
-    #[async_trait]
-    impl RunStore for CrashingStore {
-        async fn save_pipeline_state(
-            &self,
-            run: &RunId,
-            pipeline: &str,
-            state: serde_json::Value,
-        ) -> Result<(), PortError> {
-            let number = {
-                let mut saves = self.saves.lock().unwrap();
-                *saves += 1;
-                *saves
-            };
-            if *self.crash_at.lock().unwrap() == Some(number) {
-                return Err(PortError::failed("process stopped"));
-            }
-            self.inner.save_pipeline_state(run, pipeline, state).await
-        }
-        async fn load_pipeline_state(
-            &self,
-            run: &RunId,
-            pipeline: &str,
-        ) -> Result<Option<serde_json::Value>, PortError> {
-            self.inner.load_pipeline_state(run, pipeline).await
-        }
-        async fn save_run_data(
-            &self,
-            run: &RunId,
-            data: serde_json::Value,
-        ) -> Result<(), PortError> {
-            self.inner.save_run_data(run, data).await
-        }
-        async fn load_run_data(&self, run: &RunId) -> Result<Option<serde_json::Value>, PortError> {
-            self.inner.load_run_data(run).await
-        }
-        async fn append_turn(&self, run: &RunId, turn: TurnResult) -> Result<(), PortError> {
-            self.inner.append_turn(run, turn).await
-        }
-        async fn load_history(&self, run: &RunId) -> Result<Vec<TurnResult>, PortError> {
-            self.inner.load_history(run).await
-        }
-        async fn record_effect_intent(
-            &self,
-            run: &RunId,
-            key: &str,
-            intent: &str,
-        ) -> Result<(), PortError> {
-            self.inner.record_effect_intent(run, key, intent).await
-        }
-        async fn record_effect_outcome(
-            &self,
-            run: &RunId,
-            key: &str,
-            outcome: &str,
-        ) -> Result<(), PortError> {
-            self.inner.record_effect_outcome(run, key, outcome).await
-        }
-        async fn load_effects(&self, run: &RunId) -> Result<Vec<EffectRecord>, PortError> {
-            self.inner.load_effects(run).await
         }
     }
 
@@ -831,11 +761,11 @@ mod tests {
             let saves = 2 * (2 + (spec.agents.len() - 1) + spec.agents.len()) + 1;
             for crash_at in 1..=saves {
                 let f = fixture(1);
-                *f.store.crash_at.lock().unwrap() = Some(crash_at);
+                f.store.crash_at(Some(crash_at));
                 let context = format!("{} agents, crash at save {crash_at}", spec.agents.len());
                 assert!(provision(&f, &spec).is_err(), "{context}");
 
-                *f.store.crash_at.lock().unwrap() = None;
+                f.store.crash_at(None);
                 let resumed = provision(&f, &spec).unwrap();
 
                 assert_provisioned_once(&f, &spec, &resumed);
@@ -1051,8 +981,7 @@ mod tests {
             let f = fixture(1);
             let spec = triplet();
             provision(&f, &spec).unwrap();
-            let saves = *f.store.saves.lock().unwrap();
-            *f.store.crash_at.lock().unwrap() = Some(saves + crash_at);
+            f.store.crash_at(Some(f.store.writes() + crash_at));
             assert!(clean_up(&f).is_err(), "crash at {crash_at}");
 
             clean_up(&f).unwrap();

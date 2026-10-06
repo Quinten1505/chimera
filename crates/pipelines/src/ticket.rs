@@ -374,11 +374,11 @@ mod tests {
 
     use chimera_core::error::PortError;
     use chimera_core::forge::{FakeForge, ForgeCall};
-    use chimera_core::run_store::FakeRunStore;
     use chimera_core::{CommitId, Limits};
     use tokio::sync::Barrier;
 
     use super::*;
+    use crate::test_support::CrashingStore;
 
     fn issue(number: u64) -> IssueRef {
         IssueRef::new("o", "r", number).unwrap()
@@ -433,7 +433,7 @@ mod tests {
     type Started = (u64, Option<ImplementationState>);
 
     struct Fixture {
-        store: Arc<FakeRunStore>,
+        store: Arc<CrashingStore>,
         forge: Arc<FakeForge>,
         policy: Arc<Policy>,
         /// Tickets started, in order, and the saved task state each found.
@@ -445,7 +445,7 @@ mod tests {
             let forge = Arc::new(FakeForge::new("o", "r"));
             forge.set_plan(issue(4), TicketPlan { tickets });
             Self {
-                store: Arc::new(FakeRunStore::new()),
+                store: Arc::new(CrashingStore::default()),
                 forge,
                 policy: Arc::new(Policy::new(&Limits::default())),
                 started: Arc::default(),
@@ -1000,5 +1000,36 @@ mod tests {
             ]
         );
         assert!(f.closes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_crash_at_every_write_closes_each_ticket_once() {
+        let tickets = || vec![ticket(1, &[]), ticket(2, &[1]), ticket(3, &[])];
+        let total = {
+            let f = Fixture::new(tickets());
+            f.run(Script::default()).await.unwrap();
+            f.store.writes()
+        };
+        for crash_at in 1..=total {
+            let f = Fixture::new(tickets());
+            f.store.crash_at(Some(crash_at));
+            assert!(
+                f.run(Script::default()).await.is_err(),
+                "crash at {crash_at}"
+            );
+            f.store.crash_at(None);
+
+            let state = f.run(Script::default()).await.unwrap();
+
+            assert!(state.is_complete(), "crash at {crash_at}");
+            let mut closes = f.closes();
+            closes.sort();
+            assert_eq!(closes, [1, 2, 3], "crash at {crash_at}");
+            assert_eq!(
+                f.reads(),
+                if crash_at == 1 { 2 } else { 1 },
+                "crash at {crash_at}"
+            );
+        }
     }
 }

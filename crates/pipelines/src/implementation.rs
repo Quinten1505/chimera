@@ -160,10 +160,11 @@ impl ImplementationPipeline {
         self.save_pending(pending).await
     }
 
-    /// Runs the turn described by `fresh` unless `pending` shows it already started, and
-    /// continues it from the phase `pending` records. What a restart cannot tell is never
-    /// repeated: a prompt that may have been delivered is reconciled instead of sent again, and
-    /// the sender is reset only once the receiver is known to have its prompt.
+    /// Advances the turn described by `fresh`, or the one `pending` shows already started, from
+    /// the phase `pending` records, sending at most one prompt. What a restart cannot tell is
+    /// never repeated: a prompt that may have been delivered is reconciled instead of sent
+    /// again. Once the receiver is known to have its prompt, the sender's reset is owed; the
+    /// next step performs it before anything else.
     async fn execute_turn(
         &self,
         pending: &mut Pending,
@@ -171,8 +172,7 @@ impl ImplementationPipeline {
         fresh: PendingTurn,
         sender: Option<Role>,
         max_corrections: u32,
-        reset_failed: &mut Option<PipelineError>,
-    ) -> Result<Result<Outcome, TurnError>, PipelineError> {
+    ) -> Result<Result<Progress, TurnError>, PipelineError> {
         let existing = pending
             .turn
             .clone()
@@ -211,75 +211,82 @@ impl ImplementationPipeline {
             pending.turn = Some(turn.clone());
             pending.reset = sender;
             self.save_pending(pending).await?;
-            if let Err(error) = self.reset_owed(pending).await {
-                *reset_failed = Some(error);
-            }
+            return Ok(Ok(Progress::Continue));
         }
-        loop {
-            if turn.phase == TurnPhase::Correcting {
-                // The correction was being sent: the pane shows what it showed before it.
-                match self
-                    .turns
-                    .delivered(request.pane, &turn.output_before)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let unknown = "the correction may or may not have been delivered";
-                        return Ok(Err(PortError::uncertain(unknown).into()));
-                    }
-                    Err(error) => return Ok(Err(error)),
+        if turn.phase == TurnPhase::Correcting {
+            // The correction was being sent: the pane shows what it showed before it.
+            match self
+                .turns
+                .delivered(request.pane, &turn.output_before)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    let unknown = "the correction may or may not have been delivered";
+                    return Ok(Err(PortError::uncertain(unknown).into()));
                 }
-                turn.corrections += 1;
-                turn.phase = TurnPhase::Awaiting;
-                pending.turn = Some(turn.clone());
-                self.save_pending(pending).await?;
-            }
-            let collected = match self.turns.collect(request).await {
-                Ok(collected) => collected,
                 Err(error) => return Ok(Err(error)),
-            };
-            // A crash after the result was saved but before the phase moved on leaves the
-            // result in the history: saving it again would count it twice.
-            let saved = self
-                .history()
-                .await?
-                .iter()
-                .filter(|turn| matches!(turn.outcome, TurnOutcome::Invalid { .. }))
-                .count()
-                - turn.invalid_before;
-            if collected.parsed.is_ok() || saved <= turn.corrections as usize {
-                self.turns.record(request, &collected).await?;
             }
-            let problem = match collected.parsed {
-                Ok(outcome) => return Ok(Ok(outcome)),
-                Err(problem) => problem,
-            };
-            if turn.corrections >= max_corrections {
-                return Ok(Err(TurnError::CorrectionsExhausted {
-                    corrections: turn.corrections,
-                    problem,
-                }));
-            }
-            turn.phase = TurnPhase::Correcting;
-            turn.output_before = collected.output;
-            pending.turn = Some(turn.clone());
-            self.save_pending(pending).await?;
-            if let Err(error) = self.turns.send_correction(request, &problem).await {
-                if !error.is_uncertain() {
-                    // Not delivered: the saved result is corrected on the next attempt.
-                    turn.phase = TurnPhase::Awaiting;
-                    pending.turn = Some(turn.clone());
-                    self.save_pending(pending).await?;
-                }
-                return Ok(Err(error.into()));
-            }
-            // Confirmed delivery: no reconciliation is needed on a restart.
             turn.corrections += 1;
             turn.phase = TurnPhase::Awaiting;
             pending.turn = Some(turn.clone());
             self.save_pending(pending).await?;
         }
+        let collected = match self.turns.collect(request).await {
+            Ok(collected) => collected,
+            Err(error) => return Ok(Err(error)),
+        };
+        // A crash after the result was saved but before the phase moved on leaves the result in
+        // the history: saving it again would count it twice.
+        let saved = self
+            .history()
+            .await?
+            .iter()
+            .filter(|turn| matches!(turn.outcome, TurnOutcome::Invalid { .. }))
+            .count()
+            - turn.invalid_before;
+        if collected.parsed.is_ok() || saved <= turn.corrections as usize {
+            self.turns.record(request, &collected).await?;
+        }
+        let problem = match collected.parsed {
+            Ok(outcome) => return Ok(Ok(Progress::Finished(outcome))),
+            Err(problem) => problem,
+        };
+        if turn.corrections >= max_corrections {
+            return Ok(Err(TurnError::CorrectionsExhausted {
+                corrections: turn.corrections,
+                problem,
+            }));
+        }
+        turn.phase = TurnPhase::Correcting;
+        turn.output_before = collected.output;
+        pending.turn = Some(turn.clone());
+        self.save_pending(pending).await?;
+        if let Err(error) = self.turns.send_correction(request, &problem).await {
+            if !error.is_uncertain() {
+                // Not delivered: the saved result is corrected on the next attempt.
+                turn.phase = TurnPhase::Awaiting;
+                pending.turn = Some(turn.clone());
+                self.save_pending(pending).await?;
+            }
+            return Ok(Err(error.into()));
+        }
+        // Confirmed delivery: no reconciliation is needed on a restart.
+        turn.corrections += 1;
+        turn.phase = TurnPhase::Awaiting;
+        pending.turn = Some(turn.clone());
+        self.save_pending(pending).await?;
+        Ok(Ok(Progress::Continue))
+    }
+
+    /// Performs the sender reset that is owed, if any, as a step of its own: a turn moves on
+    /// only once the agent that handed it over has been cleared.
+    async fn owed_reset_step(&self, pending: &mut Pending) -> Result<bool, PipelineError> {
+        if pending.reset.is_none() {
+            return Ok(false);
+        }
+        self.reset_owed(pending).await?;
+        Ok(true)
     }
 
     /// Runs the turn of `role` in `cycle` unless its result was already saved, then moves on.
@@ -292,7 +299,9 @@ impl ImplementationPipeline {
         cycle: u32,
     ) -> Result<ImplementationState, PipelineError> {
         let mut pending = self.load_pending().await?;
-        self.reset_owed(&mut pending).await?;
+        if self.owed_reset_step(&mut pending).await? {
+            return Ok(state);
+        }
         let history = self.history().await?;
         let valid = |role: Role| {
             history.iter().filter_map(move |turn| match &turn.outcome {
@@ -346,8 +355,9 @@ impl ImplementationPipeline {
         })
     }
 
-    /// Starts the turn of `plan`, or continues it after a restart, and returns its outcome. When
-    /// the turn cannot finish now, returns the state to continue from instead.
+    /// Starts the turn of `plan`, or continues it, by one effect and returns its outcome once it
+    /// has one. Until then, or when the turn cannot finish now, returns the state to continue
+    /// from instead.
     async fn run_turn(
         &self,
         pending: &mut Pending,
@@ -373,14 +383,16 @@ impl ImplementationPipeline {
             .turn
             .as_ref()
             .is_some_and(|turn| turn.role == role && turn.cycle == cycle);
-        if !started && previous_role == Some(role) {
+        if !started && previous_role == Some(role) && pending.cleared != Some((role, cycle)) {
             // A new assignment to the agent that reported the previous result, such as the next
             // merge attempt: its context is cleared before the prompt, as a handoff would.
-            // Corrections within a turn keep it. Resetting again after a restart is harmless.
+            // Corrections within a turn keep it.
             self.policy.check_start().map_err(PipelineError::Paused)?;
             pending.reset = Some(role);
+            pending.cleared = Some((role, cycle));
             self.save_pending(pending).await?;
             self.reset_owed(pending).await?;
+            return Ok(Err(state));
         }
         // Every assignment keeps the findings next to the latest description.
         let description = match (&self.work_item, previous) {
@@ -414,30 +426,18 @@ impl ImplementationPipeline {
             corrections: 0,
             phase: TurnPhase::Sending,
         };
-        let mut reset_failed = None;
         let result = self
-            .execute_turn(
-                pending,
-                &request,
-                fresh,
-                sender,
-                max_corrections,
-                &mut reset_failed,
-            )
+            .execute_turn(pending, &request, fresh, sender, max_corrections)
             .await?;
         match result {
-            Ok(outcome) => {
-                // A reset that failed stays owed: it is retried before the state moves on, and
-                // the saved result of the turn is kept.
+            Ok(Progress::Continue) => Ok(Err(state)),
+            Ok(Progress::Finished(outcome)) => {
                 pending.turn = None;
                 if remember {
                     let valid = valid_count(&self.history().await?);
                     pending.finished = Some(Finished { state, valid });
                 }
                 self.save_pending(pending).await?;
-                if let Some(error) = reset_failed {
-                    return Err(error);
-                }
                 Ok(Ok(outcome))
             }
             Err(TurnError::AgentLost) => {
@@ -489,7 +489,9 @@ impl ImplementationPipeline {
         attempt: u32,
     ) -> Result<ImplementationState, PipelineError> {
         let mut pending = self.load_pending().await?;
-        self.reset_owed(&mut pending).await?;
+        if self.owed_reset_step(&mut pending).await? {
+            return Ok(state);
+        }
         let history = self.history().await?;
         let valid = valid_turns(&history);
         let started = pending
@@ -743,6 +745,17 @@ struct Pending {
     /// The verified commit was recorded as the expected remote head.
     #[serde(default)]
     recorded: bool,
+    /// The agent of the role was cleared before its own next turn, of this cycle or attempt.
+    #[serde(default)]
+    cleared: Option<(Role, u32)>,
+}
+
+/// How far a step got with a turn.
+enum Progress {
+    /// The turn ended with a valid outcome.
+    Finished(Outcome),
+    /// A prompt was sent or delivered; the next step continues the turn.
+    Continue,
 }
 
 /// A merge-phase turn that finished in `state`, when `valid` valid results were in the history.
@@ -865,7 +878,6 @@ mod tests {
     use async_trait::async_trait;
     use chimera_core::error::PortError;
     use chimera_core::repository::FakeRepository;
-    use chimera_core::run_store::FakeRunStore;
     use chimera_core::terminal::{FakeTerminal, Terminal, TurnStatus};
     use chimera_core::{
         AgentProfile, Blocker, BranchName, IssueStatus, Limits, PaneId, Ticket, WorkspaceId,
@@ -877,6 +889,7 @@ mod tests {
     use crate::driver::drive;
     use crate::environment::AgentLaunch;
     use crate::policy::Policy;
+    use crate::test_support::CrashingStore;
 
     /// Answers each prompt to a pane with that pane's next scripted reply and finishes the turn.
     /// Prompts without a script left, and reset commands, get no reply.
@@ -992,7 +1005,7 @@ mod tests {
 
     struct Fixture {
         terminal: Arc<ScriptedTerminal>,
-        store: Arc<FakeRunStore>,
+        store: Arc<CrashingStore>,
         repository: Arc<FakeRepository>,
         policy: Arc<Policy>,
         pipeline: ImplementationPipeline,
@@ -1047,7 +1060,7 @@ mod tests {
             fail_launch: Mutex::default(),
             push: Mutex::default(),
         });
-        let store = other.map_or_else(|| Arc::new(FakeRunStore::new()), |f| f.store.clone());
+        let store = other.map_or_else(|| Arc::new(CrashingStore::default()), |f| f.store.clone());
         let policy = other.map_or_else(
             || Arc::new(Policy::new(&Limits::default())),
             |f| f.policy.clone(),
@@ -1146,6 +1159,18 @@ mod tests {
                 &self.pipeline,
             )
             .await
+        }
+
+        /// Steps until the state changes: a turn takes one step per prompt.
+        async fn advance(
+            &self,
+            state: ImplementationState,
+        ) -> Result<ImplementationState, PipelineError> {
+            let mut next = self.pipeline.step(state.clone()).await?;
+            while next == state {
+                next = self.pipeline.step(next).await?;
+            }
+            Ok(next)
         }
 
         async fn pane(&self, role: Role) -> PaneId {
@@ -1355,8 +1380,7 @@ mod tests {
         f.script(Role::Implementation, &[READY]).await;
         f.script(Role::Review, &[APPROVED]).await;
         let step = f
-            .pipeline
-            .step(ImplementationState::Implementing { cycle: 1 })
+            .advance(ImplementationState::Implementing { cycle: 1 })
             .await
             .unwrap();
         assert_eq!(step, ImplementationState::Reviewing { cycle: 1 });
@@ -1443,11 +1467,11 @@ mod tests {
         let pane = f.pane(Role::Implementation).await;
         f.terminal.gone.lock().unwrap().insert(pane.clone());
 
-        let state = f
-            .pipeline
-            .step(ImplementationState::Implementing { cycle: 1 })
-            .await
-            .unwrap();
+        // The assignment, then the relaunch of the agent found gone.
+        let mut state = ImplementationState::Implementing { cycle: 1 };
+        for _ in 0..2 {
+            state = f.pipeline.step(state).await.unwrap();
+        }
         assert_eq!(state, ImplementationState::Implementing { cycle: 1 });
         assert_eq!(*f.terminal.launches.lock().unwrap(), 4);
         assert_eq!(
@@ -1468,12 +1492,10 @@ mod tests {
         let pane = f.pane(Role::Implementation).await;
         f.terminal.gone.lock().unwrap().insert(pane);
         *f.terminal.fail_launch.lock().unwrap() = Some(PortError::uncertain("lost"));
+        let implementing = ImplementationState::Implementing { cycle: 1 };
+        f.pipeline.step(implementing.clone()).await.unwrap();
 
-        let error = f
-            .pipeline
-            .step(ImplementationState::Implementing { cycle: 1 })
-            .await
-            .unwrap_err();
+        let error = f.pipeline.step(implementing).await.unwrap_err();
 
         assert!(error.is_uncertain());
         let restored = Policy::load_or_new(f.store.as_ref(), &f.pipeline.run, &Limits::default())
@@ -1824,17 +1846,15 @@ mod tests {
             let f = fixture(WorkItem::Ticket(ticket()), 5);
             f.script(Role::Implementation, &[READY]).await;
             f.script(Role::Review, &[APPROVED]).await;
-            f.pipeline
-                .step(ImplementationState::Implementing { cycle: 1 })
+            let reviewing = f
+                .advance(ImplementationState::Implementing { cycle: 1 })
                 .await
                 .unwrap();
             *f.terminal.fail_reset.lock().unwrap() = Some(error.clone());
 
-            let step = f
-                .pipeline
-                .step(ImplementationState::Reviewing { cycle: 1 })
-                .await
-                .unwrap_err();
+            // The handoff, then its reset as a step of its own.
+            assert_eq!(f.pipeline.step(reviewing.clone()).await.unwrap(), reviewing);
+            let step = f.pipeline.step(reviewing.clone()).await.unwrap_err();
             assert_eq!(step.is_uncertain(), error.is_uncertain());
             assert_eq!(
                 f.pipeline.load_pending().await.unwrap().reset,
@@ -1843,12 +1863,9 @@ mod tests {
             let implementation = f.prompts(Role::Implementation).await;
             assert!(!implementation.contains(&"/clear".to_string()));
 
-            // The receiver's saved result survives the restart and decides the next state.
-            let next = f
-                .pipeline
-                .step(ImplementationState::Reviewing { cycle: 1 })
-                .await
-                .unwrap();
+            // The receiver's result is collected only once the reset is done.
+            assert_eq!(f.pipeline.step(reviewing.clone()).await.unwrap(), reviewing);
+            let next = f.pipeline.step(reviewing).await.unwrap();
             assert_eq!(next, ImplementationState::WaitingForMerge);
             let implementation = f.prompts(Role::Implementation).await;
             assert_eq!(implementation.iter().filter(|p| *p == "/clear").count(), 1);
@@ -1859,55 +1876,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lost_receiver_is_relaunched_even_if_the_sender_reset_failed() {
+    async fn a_lost_receiver_is_relaunched_once_the_owed_reset_is_done() {
         let f = fixture(WorkItem::Ticket(ticket()), 5);
         f.script(Role::Implementation, &[READY]).await;
         f.script(Role::Review, &[APPROVED, APPROVED]).await;
-        f.pipeline
-            .step(ImplementationState::Implementing { cycle: 1 })
+        let reviewing = f
+            .advance(ImplementationState::Implementing { cycle: 1 })
             .await
             .unwrap();
         let reviewer = f.pane(Role::Review).await;
         f.terminal.gone.lock().unwrap().insert(reviewer.clone());
         *f.terminal.fail_reset.lock().unwrap() = Some(PortError::failed("refused"));
 
-        let state = f
-            .pipeline
-            .step(ImplementationState::Reviewing { cycle: 1 })
-            .await
-            .unwrap();
+        f.pipeline.step(reviewing.clone()).await.unwrap();
+        assert!(f.pipeline.step(reviewing.clone()).await.is_err());
+        // The reset, then the relaunch of the receiver found gone.
+        let mut state = reviewing.clone();
+        for _ in 0..2 {
+            state = f.pipeline.step(state).await.unwrap();
+        }
 
-        assert_eq!(state, ImplementationState::Reviewing { cycle: 1 });
+        assert_eq!(state, reviewing);
         assert_eq!(*f.terminal.launches.lock().unwrap(), 4);
         let pending = f.pipeline.load_pending().await.unwrap();
-        assert_eq!(pending.reset, Some(Role::Implementation));
+        assert_eq!(pending.reset, None);
         assert_eq!(pending.turn, None);
 
         assert_eq!(
-            f.pipeline.step(state).await.unwrap(),
+            f.advance(state).await.unwrap(),
             ImplementationState::WaitingForMerge
         );
-        // The owed reset, then the one of the repeated handoff.
+        // The reset of the first handoff, then the one of the repeated handoff.
         let implementation = f.prompts(Role::Implementation).await;
         assert_eq!(implementation.iter().filter(|p| *p == "/clear").count(), 2);
     }
 
     #[tokio::test]
-    async fn exhausted_corrections_pause_even_if_the_sender_reset_failed() {
+    async fn exhausted_corrections_pause_after_the_owed_reset() {
         let f = fixture(WorkItem::Ticket(ticket()), 2);
         f.script(Role::Implementation, &[READY]).await;
         f.script(Role::Review, &["nonsense", "more nonsense"]).await;
-        f.pipeline
-            .step(ImplementationState::Implementing { cycle: 1 })
+        let reviewing = f
+            .advance(ImplementationState::Implementing { cycle: 1 })
             .await
             .unwrap();
         *f.terminal.fail_reset.lock().unwrap() = Some(PortError::uncertain("lost"));
+        f.pipeline.step(reviewing.clone()).await.unwrap();
+        assert!(
+            f.pipeline
+                .step(reviewing.clone())
+                .await
+                .unwrap_err()
+                .is_uncertain()
+        );
 
-        let state = f
-            .pipeline
-            .step(ImplementationState::Reviewing { cycle: 1 })
-            .await
-            .unwrap();
+        let state = f.advance(reviewing).await.unwrap();
 
         assert_eq!(
             state,
@@ -1916,10 +1939,10 @@ mod tests {
                 resume_at: Box::new(ImplementationState::Reviewing { cycle: 1 }),
             }
         );
-        assert_eq!(
-            f.pipeline.load_pending().await.unwrap().reset,
-            Some(Role::Implementation)
-        );
+        let pending = f.pipeline.load_pending().await.unwrap();
+        assert_eq!((pending.reset, pending.turn), (None, None));
+        let implementation = f.prompts(Role::Implementation).await;
+        assert_eq!(implementation.iter().filter(|p| *p == "/clear").count(), 1);
     }
 
     #[tokio::test]
@@ -2110,7 +2133,7 @@ mod tests {
             .unwrap();
         let mut visited = vec![state.clone()];
         while !matches!(state, ImplementationState::CleaningUp { .. }) {
-            state = f.pipeline.step(state).await.unwrap();
+            state = f.advance(state).await.unwrap();
             if !matches!(state, ImplementationState::CleaningUp { .. }) {
                 assert_eq!(holder(&f), Some("t31".into()), "{state:?}");
             }
@@ -2151,17 +2174,17 @@ mod tests {
             .unwrap();
 
         // The agent reports a push, but the remote did not move.
-        state = f.pipeline.step(state).await.unwrap();
+        state = f.advance(state).await.unwrap();
         assert_eq!(state, ImplementationState::Verifying { attempt: 1 });
-        state = f.pipeline.step(state).await.unwrap();
+        state = f.advance(state).await.unwrap();
         assert_eq!(state, ImplementationState::Merging { attempt: 2 });
         assert_eq!(holder(&f), Some("t31".into()));
         assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c0"));
 
         f.push_on_merge(commit("c1"));
-        state = f.pipeline.step(state).await.unwrap();
+        state = f.advance(state).await.unwrap();
         assert_eq!(state, ImplementationState::Verifying { attempt: 2 });
-        state = f.pipeline.step(state).await.unwrap();
+        state = f.advance(state).await.unwrap();
         assert_eq!(
             state,
             ImplementationState::CleaningUp {
@@ -2183,7 +2206,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            f.pipeline.step(state).await.unwrap(),
+            f.advance(state).await.unwrap(),
             ImplementationState::Merging { attempt: 2 }
         );
         assert_eq!(holder(&f), Some("t31".into()));
@@ -2261,27 +2284,34 @@ mod tests {
 
     #[tokio::test]
     async fn the_reset_before_a_new_attempt_precedes_its_assignment_across_a_restart() {
-        let f = fixture(WorkItem::Ticket(ticket()), 5);
-        ready_to_merge(&f, &[BLOCKED, MERGED], &[]).await;
-        f.push_on_merge(commit("c1"));
-        let mut state = f
-            .pipeline
-            .step(ImplementationState::WaitingForMerge)
-            .await
-            .unwrap();
-        state = f.pipeline.step(state).await.unwrap();
-        assert_eq!(state, ImplementationState::Merging { attempt: 2 });
-        save_state(&f, state.clone()).await;
-        // The reset went out; the process stopped before the assignment was delivered.
-        *f.terminal.fail_send.lock().unwrap() = Some(PortError::failed("stopped"));
-        assert!(f.pipeline.step(state).await.unwrap_err().is_failed());
+        // The reset is lost, or delivered, before the process stops.
+        for lost in [true, false] {
+            let f = fixture(WorkItem::Ticket(ticket()), 5);
+            ready_to_merge(&f, &[BLOCKED, MERGED], &[]).await;
+            f.push_on_merge(commit("c1"));
+            let mut state = f
+                .pipeline
+                .step(ImplementationState::WaitingForMerge)
+                .await
+                .unwrap();
+            state = f.advance(state).await.unwrap();
+            assert_eq!(state, ImplementationState::Merging { attempt: 2 });
+            save_state(&f, state.clone()).await;
+            if lost {
+                *f.terminal.fail_reset.lock().unwrap() = Some(PortError::uncertain("lost"));
+                assert!(f.pipeline.step(state).await.unwrap_err().is_uncertain());
+            } else {
+                assert_eq!(f.pipeline.step(state.clone()).await.unwrap(), state);
+            }
 
-        f.drive_through().await.unwrap();
+            f.drive_through().await.unwrap();
 
-        assert_eq!(
-            merge_log(&f).await,
-            ["assignment 1", "/clear", "/clear", "assignment 2"]
-        );
+            assert_eq!(
+                merge_log(&f).await,
+                ["assignment 1", "/clear", "assignment 2"],
+                "lost: {lost}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2454,10 +2484,10 @@ mod tests {
             f.push_on_merge(commit("c1"));
             // Every step up to `crashed` ran, but the state it returned was not saved.
             for (state, next) in sequence[..=crashed].iter().zip(&sequence[1..]) {
-                assert_eq!(&f.pipeline.step(state.clone()).await.unwrap(), next);
+                assert_eq!(&f.advance(state.clone()).await.unwrap(), next);
             }
             if crashed + 1 == sequence.len() {
-                f.pipeline.step(sequence[crashed].clone()).await.unwrap();
+                f.advance(sequence[crashed].clone()).await.unwrap();
             }
             save_state(&f, sequence[crashed].clone()).await;
             let context = format!("from {:?}", sequence[crashed]);
@@ -2659,7 +2689,7 @@ mod tests {
         assert!(queued.is_err());
         // A verifies c1 and releases the lock, but the CleaningUp state is not saved.
         let merging = ImplementationState::Merging { attempt: 1 };
-        let verifying = a.pipeline.step(merging.clone()).await.unwrap();
+        let verifying = a.advance(merging.clone()).await.unwrap();
         assert_eq!(verifying, ImplementationState::Verifying { attempt: 1 });
         a.pipeline.step(verifying.clone()).await.unwrap();
         assert_eq!(holder(&a), Some("t32".into()));
@@ -2679,6 +2709,83 @@ mod tests {
             })
         );
         assert_eq!(a.pipeline.expected_head().await.unwrap(), commit("c2"));
+    }
+
+    /// Every prompt sent and every agent launched so far.
+    fn effects(f: &Fixture) -> usize {
+        let prompts: usize = f.terminal.sent.lock().unwrap().values().map(Vec::len).sum();
+        prompts + *f.terminal.launches.lock().unwrap()
+    }
+
+    /// The whole loop: changes requested, approval, a conflict review, and the merge. Every
+    /// reply differs from the one before, as a delivered prompt is recognised by new output.
+    async fn full_task(f: &Fixture) {
+        let fixed = r#"{"ImplementationReady":"fixed"}"#;
+        let conflicts_fine = r#"{"ReviewApproved":"conflicts fine"}"#;
+        f.script(Role::Implementation, &[READY, fixed]).await;
+        f.script(Role::Review, &[CHANGES, APPROVED, conflicts_fine])
+            .await;
+        f.script(Role::Merge, &[CONFLICTS, MERGED]).await;
+        f.push_on_merge(commit("c1"));
+    }
+
+    #[tokio::test]
+    async fn every_step_performs_at_most_one_external_effect() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        full_task(&f).await;
+        let mut state = ImplementationState::Implementing { cycle: 1 };
+        while !state.is_terminal() {
+            let before = effects(&f);
+            state = f.pipeline.step(state.clone()).await.unwrap();
+            assert!(effects(&f) - before <= 1, "{state:?}");
+        }
+        assert_eq!(
+            state,
+            ImplementationState::Done(MergedOk {
+                commit: commit("c1")
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crash_at_every_save_repeats_no_prompt() {
+        let total = {
+            let f = fixture(WorkItem::Ticket(ticket()), 5);
+            full_task(&f).await;
+            let before = f.store.writes();
+            f.drive_through().await.unwrap();
+            f.store.writes() - before
+        };
+        for crash_at in 1..=total {
+            let f = fixture(WorkItem::Ticket(ticket()), 5);
+            full_task(&f).await;
+            f.store.crash_at(Some(f.store.writes() + crash_at));
+            assert!(f.drive_through().await.is_err(), "crash at {crash_at}");
+            f.store.crash_at(None);
+
+            assert_eq!(
+                f.drive_through().await.unwrap(),
+                ImplementationState::Done(MergedOk {
+                    commit: commit("c1")
+                }),
+                "crash at {crash_at}"
+            );
+
+            let context = format!("crash at {crash_at}");
+            let implementation = f.prompts(Role::Implementation).await;
+            assert_eq!(
+                assignments(&implementation, "implementer").len(),
+                2,
+                "{context}"
+            );
+            let review = f.prompts(Role::Review).await;
+            assert_eq!(assignments(&review, "reviewer").len(), 3, "{context}");
+            let merge = f.prompts(Role::Merge).await;
+            assert_eq!(assignments(&merge, "merger").len(), 2, "{context}");
+            let history = f.store.load_history(&f.pipeline.run).await.unwrap();
+            assert_eq!(history.len(), 7, "{context}");
+            assert_eq!(holder(&f), None, "{context}");
+        }
     }
 
     #[test]

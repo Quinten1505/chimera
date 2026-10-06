@@ -14,6 +14,9 @@ mod policy;
 mod pr_review;
 mod ticket;
 
+#[cfg(test)]
+mod test_support;
+
 pub use agent_turn::{AgentTurns, CompletedTurn, TurnError, TurnRequest};
 pub use driver::{Pipeline, PipelineState, drive};
 pub use environment::{
