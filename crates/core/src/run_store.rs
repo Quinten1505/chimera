@@ -211,7 +211,7 @@ mod fake {
         use futures_executor::block_on;
 
         use super::*;
-        use crate::{AgentId, Outcome, Role};
+        use crate::{AgentId, Outcome, Role, TurnOutcome};
 
         fn run() -> RunId {
             RunId::new("run-1").unwrap()
@@ -221,7 +221,7 @@ mod fake {
             TurnResult {
                 agent: AgentId::new("a1").unwrap(),
                 role: Role::Review,
-                outcome: Outcome::ReviewApproved(explanation.into()),
+                outcome: TurnOutcome::Valid(Outcome::ReviewApproved(explanation.into())),
             }
         }
 

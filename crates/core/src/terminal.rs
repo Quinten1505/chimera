@@ -21,6 +21,13 @@ pub trait Terminal: Send + Sync {
     /// Creates a workspace rooted at `directory`, returning it with its first pane.
     async fn create_workspace(&self, directory: &Path) -> Result<(WorkspaceId, PaneId), PortError>;
 
+    /// The workspace rooted at `directory` with its panes in creation order, if there is one;
+    /// used to reconcile an uncertain creation or split.
+    async fn find_workspace(
+        &self,
+        directory: &Path,
+    ) -> Result<Option<(WorkspaceId, Vec<PaneId>)>, PortError>;
+
     /// Splits `pane` within `workspace`, returning the new pane.
     async fn split_pane(&self, workspace: &WorkspaceId, pane: &PaneId)
     -> Result<PaneId, PortError>;
@@ -30,10 +37,16 @@ pub trait Terminal: Send + Sync {
 
     async fn send_prompt(&self, pane: &PaneId, prompt: &str) -> Result<(), PortError>;
 
+    /// How many prompts `pane` has received since it was created: the receipt of a send. Read
+    /// before a send and again after an uncertain one, it tells whether that prompt arrived.
+    async fn prompts_received(&self, pane: &PaneId) -> Result<u64, PortError>;
+
     async fn read_status(&self, pane: &PaneId) -> Result<TurnStatus, PortError>;
 
     async fn read_output(&self, pane: &PaneId) -> Result<String, PortError>;
 
+    /// Closes `workspace` and its panes. Succeeds when it is already gone, so that any error
+    /// means the close did not happen (or is uncertain).
     async fn close_workspace(&self, workspace: &WorkspaceId) -> Result<(), PortError>;
 }
 
@@ -55,6 +68,8 @@ mod fake {
     #[derive(Default)]
     struct PaneState {
         workspace: Option<WorkspaceId>,
+        /// Creation order within the fake.
+        created: u64,
         statuses: VecDeque<TurnStatus>,
         output: String,
         launched: Option<String>,
@@ -136,6 +151,7 @@ mod fake {
                 pane.clone(),
                 PaneState {
                     workspace: Some(workspace.clone()),
+                    created: self.next_id,
                     ..PaneState::default()
                 },
             );
@@ -157,6 +173,32 @@ mod fake {
                 .insert(workspace.clone(), directory.to_path_buf());
             let pane = state.new_pane(&workspace);
             Ok((workspace, pane))
+        }
+
+        async fn find_workspace(
+            &self,
+            directory: &Path,
+        ) -> Result<Option<(WorkspaceId, Vec<PaneId>)>, PortError> {
+            let state = self.state.lock().unwrap();
+            let Some(workspace) = state
+                .workspaces
+                .iter()
+                .find(|(_, root)| root.as_path() == directory)
+                .map(|(workspace, _)| workspace.clone())
+            else {
+                return Ok(None);
+            };
+            let mut panes: Vec<(u64, PaneId)> = state
+                .panes
+                .iter()
+                .filter(|(_, p)| p.workspace.as_ref() == Some(&workspace))
+                .map(|(pane, p)| (p.created, pane.clone()))
+                .collect();
+            panes.sort_by_key(|(created, _)| *created);
+            Ok(Some((
+                workspace,
+                panes.into_iter().map(|(_, pane)| pane).collect(),
+            )))
         }
 
         async fn split_pane(
@@ -183,6 +225,10 @@ mod fake {
             self.with_pane(pane, |state| state.prompts.push(prompt.to_string()))
         }
 
+        async fn prompts_received(&self, pane: &PaneId) -> Result<u64, PortError> {
+            self.with_pane(pane, |state| state.prompts.len() as u64)
+        }
+
         async fn read_status(&self, pane: &PaneId) -> Result<TurnStatus, PortError> {
             self.with_pane(pane, |state| {
                 if state.statuses.len() > 1 {
@@ -203,9 +249,7 @@ mod fake {
 
         async fn close_workspace(&self, workspace: &WorkspaceId) -> Result<(), PortError> {
             let mut state = self.state.lock().unwrap();
-            if state.workspaces.remove(workspace).is_none() {
-                return Err(PortError::failed(format!("unknown workspace {workspace}")));
-            }
+            state.workspaces.remove(workspace);
             state
                 .panes
                 .retain(|_, p| p.workspace.as_ref() != Some(workspace));
@@ -250,10 +294,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_is_found_by_directory_with_panes_in_creation_order() {
+        let (terminal, workspace, pane) = started().await;
+        let second = terminal.split_pane(&workspace, &pane).await.unwrap();
+        let third = terminal.split_pane(&workspace, &second).await.unwrap();
+        assert_eq!(
+            terminal.find_workspace(Path::new("/work")).await.unwrap(),
+            Some((workspace.clone(), vec![pane, second, third]))
+        );
+        assert_eq!(
+            terminal.find_workspace(Path::new("/other")).await.unwrap(),
+            None
+        );
+        terminal.close_workspace(&workspace).await.unwrap();
+        assert_eq!(
+            terminal.find_workspace(Path::new("/work")).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn prompt_is_delivered() {
         let (terminal, _, pane) = started().await;
+        assert_eq!(terminal.prompts_received(&pane).await.unwrap(), 0);
         terminal.send_prompt(&pane, "do it").await.unwrap();
         assert_eq!(terminal.prompts(&pane), vec!["do it".to_string()]);
+        assert_eq!(terminal.prompts_received(&pane).await.unwrap(), 1);
     }
 
     #[tokio::test]

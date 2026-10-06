@@ -305,12 +305,23 @@ pub struct Assignment {
     pub previous_description: Option<String>,
 }
 
-/// The parsed result of one agent turn.
+/// What a completed turn produced: a valid outcome, or the output that could not be used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnOutcome {
+    Valid(Outcome),
+    /// The output was missing, malformed, or not valid for the role; `problem` says which.
+    Invalid {
+        output: String,
+        problem: String,
+    },
+}
+
+/// The result of one completed agent turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnResult {
     pub agent: AgentId,
     pub role: Role,
-    pub outcome: Outcome,
+    pub outcome: TurnOutcome,
 }
 
 #[cfg(test)]
@@ -476,9 +487,17 @@ mod tests {
             assert_round_trip(TurnResult {
                 agent: AgentId::new("a1").unwrap(),
                 role: Role::Review,
-                outcome,
+                outcome: TurnOutcome::Valid(outcome),
             });
         }
+        assert_round_trip(TurnResult {
+            agent: AgentId::new("a1").unwrap(),
+            role: Role::Review,
+            outcome: TurnOutcome::Invalid {
+                output: "garbage".into(),
+                problem: "no outcome found".into(),
+            },
+        });
         assert_round_trip(Assignment {
             role: Role::Merge,
             work_item: WorkItem::Ticket(ticket()),

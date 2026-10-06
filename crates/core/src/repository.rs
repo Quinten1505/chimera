@@ -27,15 +27,24 @@ pub trait Repository: Send + Sync {
         feature: &BranchName,
     ) -> Result<(), PortError>;
 
-    /// Removes the worktree at `path` and deletes `task_branch`.
+    /// Whether a worktree exists at `path`, used to reconcile an uncertain creation.
+    async fn worktree_exists(&self, path: &Path) -> Result<bool, PortError>;
+
+    /// Moves the task branch checked out in the worktree at `path` to `commit` on the remote,
+    /// fetching it if needed. Succeeds when the worktree is already there.
+    async fn update_worktree(&self, path: &Path, commit: &CommitId) -> Result<(), PortError>;
+
+    /// Removes the worktree at `path` and deletes `task_branch`. Succeeds when they are already
+    /// gone, so that any error means the removal did not happen (or is uncertain).
     async fn remove_worktree(&self, path: &Path, task_branch: &BranchName)
     -> Result<(), PortError>;
 
     /// Drops metadata of worktrees whose directories no longer exist.
     async fn prune_worktrees(&self) -> Result<(), PortError>;
 
-    /// The commit `branch` points to on the remote.
-    async fn remote_head(&self, branch: &BranchName) -> Result<CommitId, PortError>;
+    /// The commit `branch` points to on the remote, or `None` if the remote has no such branch.
+    /// A lookup that could not be completed is an error, never `None`.
+    async fn remote_head(&self, branch: &BranchName) -> Result<Option<CommitId>, PortError>;
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -102,6 +111,13 @@ mod fake {
         pub fn worktree_branch(&self, path: &Path) -> Option<BranchName> {
             self.state.lock().unwrap().worktrees.get(path).cloned()
         }
+
+        /// The commit checked out in the worktree at `path`.
+        pub fn worktree_head(&self, path: &Path) -> Option<CommitId> {
+            let state = self.state.lock().unwrap();
+            let branch = state.worktrees.get(path)?;
+            state.branches.get(branch).cloned()
+        }
     }
 
     impl State {
@@ -145,6 +161,7 @@ mod fake {
                 )));
             }
             let head = state.head(base)?;
+            state.remote_heads.insert(feature.clone(), head.clone());
             state.branches.insert(feature.clone(), head);
             Ok(())
         }
@@ -173,6 +190,22 @@ mod fake {
             Ok(())
         }
 
+        async fn worktree_exists(&self, path: &Path) -> Result<bool, PortError> {
+            let mut state = self.state.lock().unwrap();
+            state.begin()?;
+            Ok(state.worktrees.contains_key(path))
+        }
+
+        async fn update_worktree(&self, path: &Path, commit: &CommitId) -> Result<(), PortError> {
+            let mut state = self.state.lock().unwrap();
+            state.begin()?;
+            let branch = state.worktrees.get(path).cloned().ok_or_else(|| {
+                PortError::failed(format!("worktree {} does not exist", path.display()))
+            })?;
+            state.branches.insert(branch, commit.clone());
+            Ok(())
+        }
+
         async fn remove_worktree(
             &self,
             path: &Path,
@@ -180,12 +213,7 @@ mod fake {
         ) -> Result<(), PortError> {
             let mut state = self.state.lock().unwrap();
             state.begin()?;
-            if state.worktrees.remove(path).is_none() {
-                return Err(PortError::failed(format!(
-                    "worktree {} does not exist",
-                    path.display()
-                )));
-            }
+            state.worktrees.remove(path);
             state.branches.remove(task_branch);
             Ok(())
         }
@@ -194,14 +222,10 @@ mod fake {
             self.state.lock().unwrap().begin()
         }
 
-        async fn remote_head(&self, branch: &BranchName) -> Result<CommitId, PortError> {
+        async fn remote_head(&self, branch: &BranchName) -> Result<Option<CommitId>, PortError> {
             let mut state = self.state.lock().unwrap();
             state.begin()?;
-            state
-                .remote_heads
-                .get(branch)
-                .cloned()
-                .ok_or_else(|| PortError::failed(format!("no remote branch {branch}")))
+            Ok(state.remote_heads.get(branch).cloned())
         }
     }
 
@@ -244,6 +268,10 @@ mod fake {
             let fake = FakeRepository::new(branch("main"), commit("c0"));
             block_on(fake.create_feature_branch(&branch("feat"), &branch("main"))).unwrap();
             assert!(fake.has_branch(&branch("feat")));
+            assert_eq!(
+                block_on(fake.remote_head(&branch("feat"))).unwrap(),
+                Some(commit("c0"))
+            );
             assert!(
                 block_on(fake.create_feature_branch(&branch("feat"), &branch("main"))).is_err()
             );
@@ -254,13 +282,26 @@ mod fake {
             let fake = FakeRepository::new(branch("main"), commit("c0"));
             let path = Path::new("/wt/15");
             block_on(fake.create_feature_branch(&branch("feat"), &branch("main"))).unwrap();
+            assert!(!block_on(fake.worktree_exists(path)).unwrap());
             block_on(fake.create_worktree(path, &branch("task"), &branch("feat"))).unwrap();
             assert!(fake.has_branch(&branch("task")));
             assert_eq!(fake.worktree_branch(path), Some(branch("task")));
+            assert!(block_on(fake.worktree_exists(path)).unwrap());
 
             block_on(fake.remove_worktree(path, &branch("task"))).unwrap();
             assert!(!fake.has_branch(&branch("task")));
             assert_eq!(fake.worktree_branch(path), None);
+            assert!(!block_on(fake.worktree_exists(path)).unwrap());
+        }
+
+        #[test]
+        fn update_moves_the_worktree_to_the_commit() {
+            let fake = FakeRepository::new(branch("main"), commit("c0"));
+            let path = Path::new("/wt");
+            block_on(fake.create_worktree(path, &branch("task"), &branch("main"))).unwrap();
+            block_on(fake.update_worktree(path, &commit("c1"))).unwrap();
+            assert_eq!(fake.worktree_head(path), Some(commit("c1")));
+            assert!(block_on(fake.update_worktree(Path::new("/none"), &commit("c1"))).is_err());
         }
 
         #[test]
@@ -277,14 +318,16 @@ mod fake {
             let fake = FakeRepository::new(branch("main"), commit("c0"));
             assert_eq!(
                 block_on(fake.remote_head(&branch("main"))).unwrap(),
-                commit("c0")
+                Some(commit("c0"))
             );
             fake.set_remote_head(branch("main"), commit("c1"));
             assert_eq!(
                 block_on(fake.remote_head(&branch("main"))).unwrap(),
-                commit("c1")
+                Some(commit("c1"))
             );
-            assert!(block_on(fake.remote_head(&branch("nope"))).is_err());
+            assert_eq!(block_on(fake.remote_head(&branch("nope"))).unwrap(), None);
+            fake.fail_next(PortError::failed("down"));
+            assert!(block_on(fake.remote_head(&branch("main"))).is_err());
         }
 
         #[test]
