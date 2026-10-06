@@ -39,7 +39,22 @@ impl From<TurnError> for PipelineError {
     fn from(error: TurnError) -> Self {
         match error {
             TurnError::Port(error) => Self::Port(error),
+            other if other.is_uncertain() => Self::Port(PortError::uncertain(other.to_string())),
             other => Self::Port(PortError::failed(other.to_string())),
+        }
+    }
+}
+
+impl TurnError {
+    /// Some effect of the turn may have happened and must be reconciled before retrying.
+    fn is_uncertain(&self) -> bool {
+        match self {
+            Self::Port(error) => error.is_uncertain(),
+            Self::ReceiverFailedAfterResetFailure {
+                receiver,
+                sender_reset,
+            } => sender_reset.is_uncertain() || receiver.is_uncertain(),
+            _ => false,
         }
     }
 }
@@ -750,6 +765,41 @@ mod tests {
         ));
         assert_eq!(sender_reset, PortError::uncertain("lost"));
         assert_eq!(f.store.history(&f.run).len(), 1);
+    }
+
+    fn combined(receiver: PortError, sender_reset: PortError) -> TurnError {
+        TurnError::ReceiverFailedAfterResetFailure {
+            receiver: Box::new(TurnError::Port(receiver)),
+            sender_reset,
+        }
+    }
+
+    #[test]
+    fn uncertain_reset_with_exhausted_receiver_converts_to_uncertain() {
+        let error = TurnError::ReceiverFailedAfterResetFailure {
+            receiver: Box::new(TurnError::CorrectionsExhausted {
+                corrections: 0,
+                problem: "bad".into(),
+            }),
+            sender_reset: PortError::uncertain("lost"),
+        };
+        let error = PipelineError::from(error);
+        assert!(error.is_uncertain() && !error.is_failed());
+    }
+
+    #[test]
+    fn uncertain_receiver_with_failed_reset_converts_to_uncertain() {
+        let error = PipelineError::from(combined(
+            PortError::uncertain("lost"),
+            PortError::failed("refused"),
+        ));
+        assert!(error.is_uncertain() && !error.is_failed());
+    }
+
+    #[test]
+    fn failed_receiver_and_failed_reset_convert_to_failed() {
+        let error = PipelineError::from(combined(PortError::failed("a"), PortError::failed("b")));
+        assert!(error.is_failed() && !error.is_uncertain());
     }
 
     #[tokio::test(start_paused = true)]
