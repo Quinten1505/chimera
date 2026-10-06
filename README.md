@@ -11,7 +11,7 @@ modules in a Cargo workspace. All modules run in the same process.
 | `crates/core` | Shared application concepts. |
 | `crates/herdr` | Herdr client: connection, workspace, pane, session, and agent operations. |
 | `crates/pipelines` | The four orchestration pipelines and the shared services. |
-| `crates/github` | GitHub integration and translation between GitHub data and domain concepts. |
+| `crates/github` | `Forge` adapter: specification plans, issues, and pull requests through the GitHub API. |
 | `crates/git` | `Repository` adapter: branches, worktrees, and remote heads through the `git` CLI. |
 | `crates/configuration` | Loading and validating application settings. |
 
@@ -42,7 +42,7 @@ and passes configuration into the modules that need it. Introduce interfaces
 for cross-module behavior when concrete use cases require them, keeping this
 dependency direction and avoiding cycles.
 
-Pipelines and GitHub remain scaffolds. Configuration loads Codex settings from YAML. The `crates/herdr` crate provides the Herdr
+Pipelines remains a scaffold. Configuration loads Codex settings from YAML. The `crates/herdr` crate provides the Herdr
 client below. The executable retains its initial hello-world output.
 
 ## Development
@@ -204,3 +204,63 @@ directories and need only `git`:
 ```sh
 cargo test -p chimera-git
 ```
+
+## GitHub integration
+
+The `crates/github` crate (`chimera-github`) implements core's `Forge` port as
+`GitHubForge` over the GitHub REST and GraphQL APIs. Construct it with an API
+token and the repository in which it opens pull requests:
+
+```rust,no_run
+use chimera_core::IssueRef;
+use chimera_core::forge::Forge;
+use chimera_github::GitHubForge;
+
+async fn plan() -> Result<(), Box<dyn std::error::Error>> {
+    let forge = GitHubForge::new(std::env::var("GITHUB_TOKEN")?, "octo", "project");
+    let plan = forge.read_plan(&IssueRef::new("octo", "project", 5)?).await?;
+    println!("{} tickets", plan.tickets.len());
+    Ok(())
+}
+```
+
+The token is sent as a bearer token; the crate does not read it from the
+environment or configuration itself. Requests always go to
+`https://api.github.com`; a different base API URL (such as GitHub Enterprise
+Server) is not configurable. Opening and finding pull requests use the
+repository given to `new`; every other operation addresses the repository of
+its `IssueRef`.
+
+`read_plan` returns the specification issue's sub-issues with their open or
+closed status and blocked-by links, following every page. Blockers outside the
+specification, including those in other repositories, are returned as given.
+Draft pull requests are created through REST; creating one fails if a pull
+request already exists for the head branch. Closing an issue (as completed)
+and marking a pull request ready for review both succeed when already applied.
+
+Each request is sent once, without retries, with a 30-second timeout.
+Failures are reported as `PortError`s classified as failed (the effect did not
+happen) or uncertain (a mutation whose outcome is unknown, such as a timeout or
+an unconfirmed GraphQL result). Reads are never uncertain. Reconcile an
+uncertain result with `find_open_pull_request`, `issue_status`, or
+`pull_request_is_draft`.
+
+Unit tests use local fake HTTP servers and need no network:
+
+```sh
+cargo test -p chimera-github
+```
+
+Opt-in integration tests run against real GitHub. They create and close real
+issues, branches, and pull requests, so they are ignored by default. Use a
+scratch repository you do not mind cluttering with closed issues (GitHub cannot
+delete them) and a token with read and write access to its issues, pull
+requests, and contents:
+
+```sh
+CHIMERA_GITHUB_TOKEN=<token> CHIMERA_GITHUB_REPOSITORY=<owner>/<scratch-repo> \
+    cargo test -p chimera-github --test integration -- --ignored
+```
+
+Each test closes the issues and pull requests it created and deletes its branch,
+even when an assertion fails.
