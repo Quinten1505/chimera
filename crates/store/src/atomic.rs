@@ -5,14 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::StoreError;
 
 /// Writes `value` as JSON to `path`: serialize, write and flush a temporary file in the same
 /// directory, then rename it over the target. On any failure the previous content of `path`
 /// stays intact and the temporary file is removed.
-// Used by the operation tickets that build on this scaffold.
-#[allow(dead_code)]
 pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     write_json_atomic_with(
@@ -20,6 +19,21 @@ pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<
         value,
         &mut std::iter::repeat_with(|| COUNTER.fetch_add(1, Ordering::Relaxed)),
     )
+}
+
+/// Reads and deserializes the JSON file at `path`; `None` when the file does not exist.
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StoreError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(StoreError::io(path, e)),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|source| StoreError::Deserialize {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 /// `suffixes` supplies the candidate temporary-name suffixes, in order.

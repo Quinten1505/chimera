@@ -10,6 +10,8 @@ pub enum StoreError {
     StateRootUnresolved,
     #[error("invalid run id {id:?} for the run directory under {}: it must be a single plain path component", root.display())]
     InvalidRunId { root: PathBuf, id: String },
+    #[error("unknown run: no run data in the run directory {}", directory.display())]
+    RunNotFound { directory: PathBuf },
     #[error("file system error at {}: {source}", path.display())]
     Io {
         path: PathBuf,
