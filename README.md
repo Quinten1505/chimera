@@ -13,7 +13,7 @@ modules in a Cargo workspace. All modules run in the same process.
 | `crates/pipelines` | The four orchestration pipelines and the shared services. |
 | `crates/github` | `Forge` adapter: specification plans, issues, and pull requests through the GitHub API. |
 | `crates/git` | `Repository` adapter: branches, worktrees, and remote heads through the `git` CLI. |
-| `crates/configuration` | Loading and validating application settings. |
+| `crates/configuration` | Loading and validating the YAML configuration: ticket and final agent profiles, limits, and Codex launch arguments. |
 
 Package names use the `chimera-` prefix (for example, `chimera-core`) to
 avoid colliding with Rust's built-in `core` crate.
@@ -42,7 +42,7 @@ and passes configuration into the modules that need it. Introduce interfaces
 for cross-module behavior when concrete use cases require them, keeping this
 dependency direction and avoiding cycles.
 
-Pipelines remains a scaffold. Configuration loads and validates the YAML settings. The `crates/herdr` crate provides the Herdr
+Pipelines remains a scaffold. Configuration loads and validates the YAML settings (see below). The `crates/herdr` crate provides the Herdr
 client below. The executable retains its initial hello-world output.
 
 ## Development
@@ -263,3 +263,62 @@ CHIMERA_GITHUB_TOKEN=<token> CHIMERA_GITHUB_REPOSITORY=<owner>/<scratch-repo> \
 
 Each test closes the issues and pull requests it created and deletes its branch,
 even when an assertion fails.
+
+## Configuration
+
+The `crates/configuration` crate (`chimera-configuration`) turns a YAML file into
+validated agent configurations or an error that stops startup. It depends only on
+`chimera-core`. `chimera.example.yaml` is a complete, documented example; the
+`chimera` binary reads `chimera.yaml` by default (or the path given as its first
+argument).
+
+```rust,no_run
+use chimera_configuration::load;
+
+fn settings() -> Result<(), Box<dyn std::error::Error>> {
+    let configuration = load("chimera.yaml")?;
+    let review = &configuration.ticket.review;
+    println!("{} {}", review.provider, review.model);
+    println!("{} merge attempts", configuration.limits.merge_attempts);
+    Ok(())
+}
+```
+
+`load` returns a `Configuration` with two `AgentConfiguration`s, `ticket` (the
+per-ticket pipeline) and `final_review` (the `final:` key, the pipeline over the
+integrated feature branch), plus the `Limits`. Each set has `implementation`,
+`review`, and `merge` profiles with a required `provider`, `model`, and
+`prompt_template`, and optional provider-specific `settings`. Every role in both
+sets must be present. Test requirements, TDD, review scope, and commands belong
+in the prompt templates; the configuration encodes no test policy.
+
+Optional values default as follows:
+
+| Setting | Default |
+| --- | --- |
+| `providers.<name>.reset_command` (context reset command) | `/clear` |
+| `limits.implementation_review_cycles` | 100 |
+| `limits.merge_attempts` | 100 |
+| `limits.final_review_fix_cycles` | 100 |
+| `limits.agent_recovery` | 5 |
+| `limits.github_retries` | 5 |
+
+Limits must be positive integers. Only `codex` is a supported provider. Unknown
+keys, missing roles or prompt templates, unsupported providers, invalid limits,
+and strings that are empty or contain control characters (prompt templates may
+span lines) are rejected. Errors are `ConfigurationError`s that name the
+offending field path (for example `ticket.review.settings.typo`) and, for YAML
+syntax errors, the line and column.
+
+`codex_launch_args(&profile)` builds the Codex argv from a profile so the Herdr
+adapter stays provider-agnostic: `--model <model>`, plus `--config
+model_reasoning_effort="…"` for `reasoning_effort`, `--config service_tier="…"`
+for `service_tier`, and `--approve-for-me` when `approve_for_me` is true. These
+are the only Codex settings; others are rejected.
+
+The earlier Codex-only `codex.yaml` format has been removed; migrate to the
+format above.
+
+```sh
+cargo test -p chimera-configuration
+```
