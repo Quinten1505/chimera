@@ -2,3 +2,9 @@
 //! shared services they use, expressed in terms of the core domain.
 //!
 //! Expose the module interface here; keep implementation submodules private.
+
+mod driver;
+mod error;
+
+pub use driver::{Pipeline, PipelineState, drive};
+pub use error::{PauseReason, PipelineError};

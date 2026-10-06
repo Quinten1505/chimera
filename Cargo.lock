@@ -65,7 +65,12 @@ dependencies = [
 name = "chimera-pipelines"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chimera-core",
+ "futures-executor",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
