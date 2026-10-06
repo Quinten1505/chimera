@@ -193,31 +193,22 @@ impl EnvironmentService {
         Ok(())
     }
 
-    /// Closes the workspace, removes the worktree, and prunes worktree metadata. A resource whose
-    /// removal fails with a known-not-happened error is taken to be already gone and skipped;
-    /// uncertain errors are returned. History is not touched.
+    /// Closes the workspace, removes the worktree, and prunes worktree metadata. The ports succeed
+    /// for a resource that is already gone, so any error is returned and the resource stays
+    /// recorded for a retry. History is not touched.
     pub async fn cleanup(&self, environment: &mut Environment) -> Result<(), PipelineError> {
         if let Some(workspace) = &environment.workspace {
-            skip_failed(self.terminal.close_workspace(workspace).await)?;
+            self.terminal.close_workspace(workspace).await?;
             environment.workspace = None;
         }
         if environment.worktree_created {
-            skip_failed(
-                self.repository
-                    .remove_worktree(&environment.worktree, &environment.task_branch)
-                    .await,
-            )?;
+            self.repository
+                .remove_worktree(&environment.worktree, &environment.task_branch)
+                .await?;
             environment.worktree_created = false;
         }
         self.repository.prune_worktrees().await?;
         Ok(())
-    }
-}
-
-fn skip_failed(result: Result<(), PortError>) -> Result<(), PortError> {
-    match result {
-        Err(error) if error.is_failed() => Ok(()),
-        other => other,
     }
 }
 
@@ -244,6 +235,7 @@ mod tests {
     struct CountingTerminal {
         inner: FakeTerminal,
         calls: Mutex<Vec<&'static str>>,
+        close_failure: Mutex<Option<PortError>>,
     }
 
     impl CountingTerminal {
@@ -291,6 +283,9 @@ mod tests {
             self.inner.read_output(pane).await
         }
         async fn close_workspace(&self, workspace: &WorkspaceId) -> Result<(), PortError> {
+            if let Some(error) = self.close_failure.lock().unwrap().take() {
+                return Err(error);
+            }
             self.inner.close_workspace(workspace).await
         }
     }
@@ -311,6 +306,7 @@ mod tests {
         let terminal = Arc::new(CountingTerminal {
             inner: FakeTerminal::new(),
             calls: Mutex::new(Vec::new()),
+            close_failure: Mutex::new(None),
         });
         let policy = Arc::new(Policy::new(&Limits {
             agent_recovery,
@@ -519,6 +515,39 @@ mod tests {
         .unwrap();
         block_on(f.service.cleanup(&mut environment)).unwrap();
         block_on(f.service.cleanup(&mut environment)).unwrap();
+    }
+
+    #[test]
+    fn cleanup_keeps_a_workspace_whose_close_failed() {
+        let f = fixture(1);
+        let mut environment = provision(&f, &triplet()).unwrap();
+        let workspace = environment.workspace.clone().unwrap();
+        *f.terminal.close_failure.lock().unwrap() = Some(PortError::failed("permission denied"));
+        let error = block_on(f.service.cleanup(&mut environment)).unwrap_err();
+        assert!(error.is_failed());
+        assert_eq!(environment.workspace.as_ref(), Some(&workspace));
+        assert!(f.terminal.inner.workspace_directory(&workspace).is_some());
+        block_on(f.service.cleanup(&mut environment)).unwrap();
+        assert_eq!(f.terminal.inner.workspace_directory(&workspace), None);
+        assert!(environment.workspace.is_none());
+    }
+
+    #[test]
+    fn cleanup_keeps_a_worktree_whose_removal_failed() {
+        let f = fixture(1);
+        let spec = triplet();
+        let mut environment = provision(&f, &spec).unwrap();
+        f.repository
+            .fail_next(PortError::failed("permission denied"));
+        let error = block_on(f.service.cleanup(&mut environment)).unwrap_err();
+        assert!(error.is_failed());
+        assert!(environment.worktree_created);
+        assert!(f.repository.worktree_branch(&spec.worktree).is_some());
+        assert!(f.repository.has_branch(&spec.task_branch));
+        block_on(f.service.cleanup(&mut environment)).unwrap();
+        assert_eq!(f.repository.worktree_branch(&spec.worktree), None);
+        assert!(!f.repository.has_branch(&spec.task_branch));
+        assert!(!environment.worktree_created);
     }
 
     #[test]

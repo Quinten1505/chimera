@@ -34,6 +34,8 @@ pub trait Terminal: Send + Sync {
 
     async fn read_output(&self, pane: &PaneId) -> Result<String, PortError>;
 
+    /// Closes `workspace` and its panes. Succeeds when it is already gone, so that any error
+    /// means the close did not happen (or is uncertain).
     async fn close_workspace(&self, workspace: &WorkspaceId) -> Result<(), PortError>;
 }
 
@@ -203,9 +205,7 @@ mod fake {
 
         async fn close_workspace(&self, workspace: &WorkspaceId) -> Result<(), PortError> {
             let mut state = self.state.lock().unwrap();
-            if state.workspaces.remove(workspace).is_none() {
-                return Err(PortError::failed(format!("unknown workspace {workspace}")));
-            }
+            state.workspaces.remove(workspace);
             state
                 .panes
                 .retain(|_, p| p.workspace.as_ref() != Some(workspace));

@@ -27,7 +27,8 @@ pub trait Repository: Send + Sync {
         feature: &BranchName,
     ) -> Result<(), PortError>;
 
-    /// Removes the worktree at `path` and deletes `task_branch`.
+    /// Removes the worktree at `path` and deletes `task_branch`. Succeeds when they are already
+    /// gone, so that any error means the removal did not happen (or is uncertain).
     async fn remove_worktree(&self, path: &Path, task_branch: &BranchName)
     -> Result<(), PortError>;
 
@@ -180,12 +181,7 @@ mod fake {
         ) -> Result<(), PortError> {
             let mut state = self.state.lock().unwrap();
             state.begin()?;
-            if state.worktrees.remove(path).is_none() {
-                return Err(PortError::failed(format!(
-                    "worktree {} does not exist",
-                    path.display()
-                )));
-            }
+            state.worktrees.remove(path);
             state.branches.remove(task_branch);
             Ok(())
         }
