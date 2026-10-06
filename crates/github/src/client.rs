@@ -155,9 +155,13 @@ impl Client {
 }
 
 /// A client that never retries and bounds connection setup below the overall timeout.
+///
+/// Pooling is disabled because hyper-util transparently retries requests canceled before
+/// being written on a stale pooled connection, which `retry(never())` does not cover.
 fn http_client(timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .retry(reqwest::retry::never())
+        .pool_max_idle_per_host(0)
         .connect_timeout(CONNECT_TIMEOUT.min(timeout / 2))
         .build()
         .expect("reqwest client builds with static configuration")
@@ -413,46 +417,37 @@ mod tests {
         server.abort();
     }
 
-    /// Requests on a reused keep-alive connection are not replayed when the second is lost.
+    /// Connections are never reused, so hyper cannot replay a request canceled on a stale one.
     #[tokio::test]
-    async fn does_not_retry_on_reused_connection() {
+    async fn does_not_reuse_connections() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = [0; 4096];
-            let mut requests = 0;
-            assert!(stream.read(&mut buf).await.unwrap() > 0);
-            requests += 1;
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
-                .await
-                .unwrap();
-            assert!(stream.read(&mut buf).await.unwrap() > 0);
-            requests += 1;
-            drop(stream);
-            let mut connections = 1;
+            let mut connections = 0;
             while let Ok(Ok((mut s, _))) =
                 tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
             {
                 connections += 1;
-                while let Ok(n) = s.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                    requests += 1;
-                }
+                let mut buf = [0; 4096];
+                assert!(s.read(&mut buf).await.unwrap() > 0);
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                // Keep the connection open so a pooled client would reuse it.
+                tokio::spawn(async move {
+                    let _ = s.read(&mut buf).await;
+                });
             }
-            (connections, requests)
+            connections
         });
         let client = Client::with_base_url("tok", &url).with_timeout(Duration::from_secs(2));
-        client
-            .rest(Access::Mutate, Method::POST, "/x", None)
-            .await
-            .unwrap();
-        let second = client.rest(Access::Mutate, Method::POST, "/x", None).await;
-        assert!(uncertain(second));
-        assert_eq!(server.await.unwrap(), (1, 2));
+        for _ in 0..2 {
+            client
+                .rest(Access::Mutate, Method::POST, "/x", None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(server.await.unwrap(), 2);
     }
 
     #[tokio::test]
