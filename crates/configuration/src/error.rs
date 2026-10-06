@@ -10,8 +10,9 @@ pub(crate) fn is_plain_text(text: &str) -> bool {
 pub enum ConfigurationError {
     #[error("cannot read configuration file: {0}")]
     Io(#[from] io::Error),
-    #[error("invalid YAML at line {line}, column {column}")]
+    #[error("invalid YAML at {path} (line {line}, column {column}): {source}")]
     Yaml {
+        path: String,
         line: usize,
         column: usize,
         #[source]
@@ -38,12 +39,15 @@ pub enum ConfigurationError {
     UnknownProfile(String),
 }
 
-impl From<serde_yaml::Error> for ConfigurationError {
-    fn from(source: serde_yaml::Error) -> Self {
+impl From<serde_path_to_error::Error<serde_yaml::Error>> for ConfigurationError {
+    fn from(error: serde_path_to_error::Error<serde_yaml::Error>) -> Self {
+        let path = error.path().to_string();
+        let source = error.into_inner();
         let (line, column) = source
             .location()
             .map_or((0, 0), |location| (location.line(), location.column()));
         Self::Yaml {
+            path,
             line,
             column,
             source,

@@ -28,7 +28,8 @@ impl Configuration {
     }
 
     pub fn from_yaml(yaml: &str) -> Result<Self, ConfigurationError> {
-        let file: File = serde_yaml::from_str(yaml)?;
+        let file: File =
+            serde_path_to_error::deserialize(serde_yaml::Deserializer::from_str(yaml))?;
         let configuration = file.resolve()?;
         configuration.validate_codex_settings()?;
         Ok(configuration)
