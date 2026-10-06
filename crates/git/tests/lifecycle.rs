@@ -176,3 +176,71 @@ async fn failures_are_reported_as_port_errors() {
         .unwrap_err();
     assert!(error.is_failed(), "{error:?}");
 }
+
+#[tokio::test]
+async fn deleted_or_replaced_worktree_directory_does_not_exist() {
+    let (dir, work) = setup();
+    let repository = GitRepository::new(&work);
+    let feature = branch("feature/x");
+    let worktree = dir.path().join("wt-1");
+    repository
+        .create_feature_branch(&feature, &branch("main"))
+        .await
+        .unwrap();
+    repository
+        .create_worktree(&worktree, &branch("task/1"), &feature)
+        .await
+        .unwrap();
+
+    std::fs::remove_dir_all(&worktree).unwrap();
+    assert!(!repository.worktree_exists(&worktree).await.unwrap());
+    std::fs::create_dir(&worktree).unwrap();
+    assert!(!repository.worktree_exists(&worktree).await.unwrap());
+}
+
+#[tokio::test]
+async fn update_worktree_fetches_commit_outside_configured_refspec() {
+    let (dir, work) = setup();
+    let repository = GitRepository::new(&work);
+    let feature = branch("feature/x");
+    let worktree = dir.path().join("wt-1");
+    git(
+        &work,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+    repository
+        .create_feature_branch(&feature, &branch("main"))
+        .await
+        .unwrap();
+    repository
+        .create_worktree(&worktree, &branch("task/1"), &feature)
+        .await
+        .unwrap();
+
+    let other = dir.path().join("other");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            dir.path().join("origin.git").to_str().unwrap(),
+            "other",
+        ],
+    );
+    configure(&other);
+    git(&other, &["checkout", "feature/x"]);
+    std::fs::write(other.join("new.txt"), "new").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-m", "Move the feature"]);
+    git(&other, &["push", "origin", "feature/x"]);
+    let target = CommitId::new(git(&other, &["rev-parse", "HEAD"])).unwrap();
+
+    repository
+        .update_worktree(&worktree, &target)
+        .await
+        .unwrap();
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), target.as_str());
+}

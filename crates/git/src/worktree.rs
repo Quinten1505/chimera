@@ -96,16 +96,39 @@ pub(crate) fn prune(runner: &Runner, repo: &Path) -> Result<(), GitError> {
     Ok(())
 }
 
-/// Whether `path` is a registered worktree of `repo`.
+/// Whether `path` is a registered, usable worktree of `repo`: its directory must exist and
+/// belong to the same repository, so stale metadata and unrelated directories do not count.
 pub(crate) fn exists(runner: &Runner, repo: &Path, path: &Path) -> Result<bool, GitError> {
     let path = &repo.join(path);
-    Ok(registered(runner, repo)?
+    let is_registered = registered(runner, repo)?
         .iter()
-        .any(|worktree| same_path(&worktree.path, path)))
+        .any(|worktree| same_path(&worktree.path, path));
+    if !is_registered || !path.is_dir() {
+        return Ok(false);
+    }
+    let query = |dir: &Path, arg: &str| {
+        runner
+            .run(
+                dir,
+                &["rev-parse", "--path-format=absolute", arg],
+                Effect::Read,
+            )
+            .ok()
+            .map(|output| PathBuf::from(output.stdout.trim()))
+    };
+    let (Some(top), Some(common), Some(repo_common)) = (
+        query(path, "--show-toplevel"),
+        query(path, "--git-common-dir"),
+        query(repo, "--git-common-dir"),
+    ) else {
+        return Ok(false);
+    };
+    Ok(same_path(&top, path) && same_path(&common, &repo_common))
 }
 
 /// Moves the branch checked out in the worktree at `path` to `commit`, fetching `origin` first if
-/// the commit is not available locally. Already being at `commit` is not an error.
+/// the commit is not available locally (requested by id, independent of the configured fetch
+/// refspecs). Already being at `commit` is not an error.
 pub(crate) fn update(
     runner: &Runner,
     repo: &Path,
@@ -124,6 +147,9 @@ pub(crate) fn update(
     if runner
         .run(repo, &["cat-file", "-e", &object], Effect::Read)
         .is_err()
+        && runner
+            .run(repo, &["fetch", "origin", commit], Effect::Local)
+            .is_err()
     {
         runner.run(repo, &["fetch", "--prune", "origin"], Effect::Local)?;
     }
@@ -391,6 +417,53 @@ mod tests {
         assert_eq!(rev(&path, "HEAD"), target);
         assert_eq!(rev(repo.work(), "task/a"), target);
         update(&runner, repo.work(), &path, &target).unwrap();
+    }
+
+    #[test]
+    fn exists_is_false_after_directory_deleted_without_prune() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        assert!(!exists(&runner, repo.work(), &path).unwrap());
+    }
+
+    #[test]
+    fn exists_is_false_for_unrelated_replacement_directory() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(!exists(&runner, repo.work(), &path).unwrap());
+        runner.run(&path, &["init", "-q"], Effect::Local).unwrap();
+        assert!(!exists(&runner, repo.work(), &path).unwrap());
+    }
+
+    #[test]
+    fn update_fetches_commit_outside_configured_refspec() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        runner
+            .run(
+                repo.work(),
+                &[
+                    "config",
+                    "remote.origin.fetch",
+                    "+refs/heads/main:refs/remotes/origin/main",
+                ],
+                Effect::Local,
+            )
+            .unwrap();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        let other = repo.work().join("../other");
+        repo.commit_file(&other, "g.txt", "more");
+        runner
+            .run(&other, &["push", "origin", "feature"], Effect::Remote)
+            .unwrap();
+        let target = rev(&other, "HEAD");
+        update(&runner, repo.work(), &path, &target).unwrap();
+        assert_eq!(rev(&path, "HEAD"), target);
     }
 
     #[test]
