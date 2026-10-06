@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use chimera_core::{AgentConfiguration, Feature, IssueRef, RunId, TicketPlan};
 use serde::{Deserialize, Serialize};
 
+use crate::StoreError;
 use crate::atomic::{read_json, write_json_atomic};
-use crate::{StoreError, run_directory};
+use crate::paths::run_directory;
 
 const FILE_NAME: &str = "run.json";
 
@@ -28,7 +29,7 @@ pub struct RunData {
 }
 
 /// Writes `run.json` in the run's directory atomically, creating the directory if needed.
-pub fn save_run_data(root: &Path, run: &RunId, data: &RunData) -> Result<(), StoreError> {
+pub(crate) fn save_run_data(root: &Path, run: &RunId, data: &RunData) -> Result<(), StoreError> {
     let directory = run_directory(root, run)?;
     fs::create_dir_all(&directory).map_err(|e| StoreError::io(&directory, e))?;
     write_json_atomic(&directory.join(FILE_NAME), data)
@@ -36,7 +37,7 @@ pub fn save_run_data(root: &Path, run: &RunId, data: &RunData) -> Result<(), Sto
 
 /// Reads `run.json` of `run`. A run without it is unknown: [`StoreError::RunNotFound`] names the
 /// run directory that was looked up.
-pub fn load_run_data(root: &Path, run: &RunId) -> Result<RunData, StoreError> {
+pub(crate) fn load_run_data(root: &Path, run: &RunId) -> Result<RunData, StoreError> {
     let directory = run_directory(root, run)?;
     read_json(&directory.join(FILE_NAME))?.ok_or(StoreError::RunNotFound { directory })
 }

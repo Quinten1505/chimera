@@ -9,6 +9,7 @@ use chimera_core::{Outcome, TurnOutcome, TurnResult};
 use crate::StoreError;
 
 const HISTORY_FILE: &str = "history.md";
+const TURNS_FILE: &str = "turns.jsonl";
 
 /// Serializes appends within this process so entries from different pipeline instances never
 /// interleave; each entry is also written with a single `write_all` to a file opened for append.
@@ -16,16 +17,17 @@ static APPEND_LOCK: Mutex<()> = Mutex::new(());
 
 /// Why the turn took place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnKind {
+pub(crate) enum TurnKind {
     /// The first turn of an assignment.
     Initial,
     /// A turn asking the agent to correct invalid output.
+    #[allow(dead_code)]
     Correction,
 }
 
 /// One completed agent turn, as recorded in `history.md`.
 #[derive(Debug, Clone, Copy)]
-pub struct HistoryEntry<'a> {
+pub(crate) struct HistoryEntry<'a> {
     pub time: SystemTime,
     /// The pipeline instance that ran the turn.
     pub pipeline: &'a str,
@@ -35,7 +37,10 @@ pub struct HistoryEntry<'a> {
 
 /// Appends `entry` to `history.md` in `run_directory`, creating the file on first append. Existing
 /// content is never rewritten; the entry is flushed to disk before this returns.
-pub fn append_history(run_directory: &Path, entry: &HistoryEntry<'_>) -> Result<(), StoreError> {
+pub(crate) fn append_history(
+    run_directory: &Path,
+    entry: &HistoryEntry<'_>,
+) -> Result<(), StoreError> {
     let path: PathBuf = run_directory.join(HISTORY_FILE);
     let text = render(entry);
     let _guard = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -47,6 +52,47 @@ pub fn append_history(run_directory: &Path, entry: &HistoryEntry<'_>) -> Result<
     file.write_all(text.as_bytes())
         .map_err(|e| StoreError::io(&path, e))?;
     file.sync_all().map_err(|e| StoreError::io(&path, e))
+}
+
+/// Appends `turn` as one JSON line to `turns.jsonl`, the machine-readable counterpart of
+/// `history.md` that [`load_turns`] reads back.
+pub(crate) fn append_turn_record(
+    run_directory: &Path,
+    turn: &TurnResult,
+) -> Result<(), StoreError> {
+    let path = run_directory.join(TURNS_FILE);
+    let mut line = serde_json::to_vec(turn).map_err(|source| StoreError::Serialize {
+        path: path.clone(),
+        source,
+    })?;
+    line.push(b'\n');
+    let _guard = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .map_err(|e| StoreError::io(&path, e))?;
+    file.write_all(&line)
+        .map_err(|e| StoreError::io(&path, e))?;
+    file.sync_all().map_err(|e| StoreError::io(&path, e))
+}
+
+/// Reads the turns of `turns.jsonl` in append order; a run without turns has none.
+pub(crate) fn load_turns(run_directory: &Path) -> Result<Vec<TurnResult>, StoreError> {
+    let path = run_directory.join(TURNS_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(StoreError::io(&path, e)),
+    };
+    text.lines()
+        .map(|line| {
+            serde_json::from_str(line).map_err(|source| StoreError::Deserialize {
+                path: path.clone(),
+                source,
+            })
+        })
+        .collect()
 }
 
 fn render(entry: &HistoryEntry<'_>) -> String {

@@ -7,13 +7,13 @@ use crate::StoreError;
 
 /// The directory holding all runs: `$XDG_STATE_HOME/chimera/runs`, falling back to
 /// `~/.local/state/chimera/runs`.
-pub fn state_root() -> Result<PathBuf, StoreError> {
+pub(crate) fn state_root() -> Result<PathBuf, StoreError> {
     resolve_state_root(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
 
 /// The directory of one run: `<root>/<run-id>/`. Fails when the run ID is not a single plain
 /// path component, so it cannot escape or alias the root.
-pub fn run_directory(root: &Path, run: &RunId) -> Result<PathBuf, StoreError> {
+pub(crate) fn run_directory(root: &Path, run: &RunId) -> Result<PathBuf, StoreError> {
     let id = run.as_str();
     if is_plain_component(id) {
         Ok(root.join(id))

@@ -4,8 +4,9 @@ use std::path::Path;
 use chimera_core::RunId;
 use serde::{Deserialize, Serialize};
 
+use crate::StoreError;
 use crate::atomic::{read_json, write_json_atomic};
-use crate::{StoreError, run_directory};
+use crate::paths::run_directory;
 
 const FILE_NAME: &str = "merge-lock.json";
 
@@ -24,14 +25,20 @@ pub struct MergeLockState {
 }
 
 /// Writes `merge-lock.json` in the run's directory atomically, creating the directory if needed.
-pub fn save_merge_lock(root: &Path, run: &RunId, state: &MergeLockState) -> Result<(), StoreError> {
+#[allow(dead_code)]
+pub(crate) fn save_merge_lock(
+    root: &Path,
+    run: &RunId,
+    state: &MergeLockState,
+) -> Result<(), StoreError> {
     let directory = run_directory(root, run)?;
     fs::create_dir_all(&directory).map_err(|e| StoreError::io(&directory, e))?;
     write_json_atomic(&directory.join(FILE_NAME), state)
 }
 
 /// Reads `merge-lock.json` of `run`; a run without one has an empty lock.
-pub fn load_merge_lock(root: &Path, run: &RunId) -> Result<MergeLockState, StoreError> {
+#[allow(dead_code)]
+pub(crate) fn load_merge_lock(root: &Path, run: &RunId) -> Result<MergeLockState, StoreError> {
     let path = run_directory(root, run)?.join(FILE_NAME);
     Ok(read_json(&path)?.unwrap_or_default())
 }

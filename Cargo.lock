@@ -91,11 +91,13 @@ dependencies = [
 name = "chimera-store"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chimera-core",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
