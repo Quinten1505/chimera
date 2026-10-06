@@ -357,6 +357,11 @@ mod tests {
             self.repository.prune_worktrees().await
         }
 
+        async fn update_worktree(&self, path: &Path, commit: &CommitId) -> Result<(), PortError> {
+            self.record("update_worktree");
+            self.repository.update_worktree(path, commit).await
+        }
+
         async fn remote_head(&self, branch: &BranchName) -> Result<Option<CommitId>, PortError> {
             self.record("remote_head");
             self.repository.remote_head(branch).await
@@ -403,6 +408,14 @@ mod tests {
 
         async fn mark_pull_request_ready(&self, pull_request: &IssueRef) -> Result<(), PortError> {
             self.forge.mark_pull_request_ready(pull_request).await
+        }
+
+        async fn issue_status(&self, issue: &IssueRef) -> Result<IssueStatus, PortError> {
+            self.forge.issue_status(issue).await
+        }
+
+        async fn pull_request_is_draft(&self, pull_request: &IssueRef) -> Result<bool, PortError> {
+            self.forge.pull_request_is_draft(pull_request).await
         }
     }
 

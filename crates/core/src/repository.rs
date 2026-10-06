@@ -27,6 +27,10 @@ pub trait Repository: Send + Sync {
         feature: &BranchName,
     ) -> Result<(), PortError>;
 
+    /// Moves the task branch checked out in the worktree at `path` to `commit` on the remote,
+    /// fetching it if needed. Succeeds when the worktree is already there.
+    async fn update_worktree(&self, path: &Path, commit: &CommitId) -> Result<(), PortError>;
+
     /// Removes the worktree at `path` and deletes `task_branch`. Succeeds when they are already
     /// gone, so that any error means the removal did not happen (or is uncertain).
     async fn remove_worktree(&self, path: &Path, task_branch: &BranchName)
@@ -104,6 +108,13 @@ mod fake {
         pub fn worktree_branch(&self, path: &Path) -> Option<BranchName> {
             self.state.lock().unwrap().worktrees.get(path).cloned()
         }
+
+        /// The commit checked out in the worktree at `path`.
+        pub fn worktree_head(&self, path: &Path) -> Option<CommitId> {
+            let state = self.state.lock().unwrap();
+            let branch = state.worktrees.get(path)?;
+            state.branches.get(branch).cloned()
+        }
     }
 
     impl State {
@@ -173,6 +184,16 @@ mod fake {
             state
                 .worktrees
                 .insert(path.to_path_buf(), task_branch.clone());
+            Ok(())
+        }
+
+        async fn update_worktree(&self, path: &Path, commit: &CommitId) -> Result<(), PortError> {
+            let mut state = self.state.lock().unwrap();
+            state.begin()?;
+            let branch = state.worktrees.get(path).cloned().ok_or_else(|| {
+                PortError::failed(format!("worktree {} does not exist", path.display()))
+            })?;
+            state.branches.insert(branch, commit.clone());
             Ok(())
         }
 
@@ -259,6 +280,16 @@ mod fake {
             block_on(fake.remove_worktree(path, &branch("task"))).unwrap();
             assert!(!fake.has_branch(&branch("task")));
             assert_eq!(fake.worktree_branch(path), None);
+        }
+
+        #[test]
+        fn update_moves_the_worktree_to_the_commit() {
+            let fake = FakeRepository::new(branch("main"), commit("c0"));
+            let path = Path::new("/wt");
+            block_on(fake.create_worktree(path, &branch("task"), &branch("main"))).unwrap();
+            block_on(fake.update_worktree(path, &commit("c1"))).unwrap();
+            assert_eq!(fake.worktree_head(path), Some(commit("c1")));
+            assert!(block_on(fake.update_worktree(Path::new("/none"), &commit("c1"))).is_err());
         }
 
         #[test]

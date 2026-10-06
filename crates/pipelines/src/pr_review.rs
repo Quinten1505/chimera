@@ -6,7 +6,8 @@ use chimera_core::forge::Forge;
 use chimera_core::repository::Repository;
 use chimera_core::run_store::RunStore;
 use chimera_core::{
-    AgentConfiguration, AgentId, Feature, IssueRef, Outcome, Role, RunId, TurnOutcome, TurnResult,
+    AgentConfiguration, AgentId, Feature, IssueRef, IssueStatus, Outcome, Role, RunId, TurnOutcome,
+    TurnResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +92,10 @@ pub trait Implement: Sync {
 
 /// Drives the [`ImplementationPipeline`] that `build` makes for a review cycle and its findings.
 /// `build` must give the pipeline the findings as work item and the final configuration.
+///
+/// A fix that is saved as paused is continued from where it paused: the outer pipeline only
+/// asks for it again after it was resumed, while a plain restart of a paused review never
+/// reaches the fix.
 pub struct DriveImplementation<B> {
     pub store: Arc<dyn RunStore>,
     pub build: B,
@@ -106,6 +111,20 @@ where
         findings: &str,
     ) -> Result<ImplementationState, PipelineError> {
         let pipeline = (self.build)(cycle, findings);
+        if let Some(saved) = self
+            .store
+            .load_pipeline_state(&pipeline.run, &pipeline.instance)
+            .await?
+            && let ImplementationState::Paused { resume_at, .. } = serde_json::from_value(saved)?
+        {
+            self.store
+                .save_pipeline_state(
+                    &pipeline.run,
+                    &pipeline.instance,
+                    serde_json::to_value(&*resume_at)?,
+                )
+                .await?;
+        }
         drive(
             self.store.as_ref(),
             &pipeline.run,
@@ -228,8 +247,7 @@ impl<I: Implement> PrReviewPipeline<I> {
     }
 
     /// Makes sure the review starts from the latest verified feature head: the head Chimera last
-    /// verified must still be the remote one. The environment of each review is created from
-    /// the feature branch, so a fresh environment is on that head.
+    /// verified must still be the remote one, and the review worktree is moved onto it.
     async fn provision(&self, cycle: u32) -> Result<PrReviewState, PipelineError> {
         let expected = match self
             .store
@@ -251,8 +269,6 @@ impl<I: Implement> PrReviewPipeline<I> {
             }
         };
         if let Some(reason) = reason {
-            // The driver saves no policy, so the pause is saved here.
-            self.policy.save(self.store.as_ref(), &self.run).await?;
             return Ok(paused(reason, PrReviewState::Provisioning { cycle }));
         }
         self.environment
@@ -262,6 +278,11 @@ impl<I: Implement> PrReviewPipeline<I> {
                 &self.environment_key(cycle),
                 &self.spec,
             )
+            .await?;
+        // The worktree is created from the local feature branch, which may be behind the
+        // verified remote head; moving it is safe to repeat after a restart.
+        self.repository
+            .update_worktree(&self.spec.worktree, &expected)
             .await?;
         Ok(PrReviewState::Reviewing { cycle })
     }
@@ -296,7 +317,14 @@ impl<I: Implement> PrReviewPipeline<I> {
             // The next review would exceed the limit, so the fix is not started.
             Outcome::ChangesRequested(findings) => {
                 let fixing = PrReviewState::Fixing { cycle, findings };
-                if cycle >= self.review_limit {
+                // The turn may have saved corrections since `history` was read.
+                let corrections = self
+                    .history()
+                    .await?
+                    .iter()
+                    .filter(|turn| matches!(turn.outcome, TurnOutcome::Invalid { .. }))
+                    .count();
+                if cycle as usize + corrections >= self.review_limit as usize {
                     paused(PauseReason::LimitExhausted, fixing)
                 } else {
                     fixing
@@ -519,18 +547,26 @@ impl<I: Implement> PrReviewPipeline<I> {
     }
 
     /// Performs a forge effect once per run: an effect that is recorded as done is skipped. One
-    /// whose outcome was not recorded is repeated, which is harmless for closing an issue and
-    /// for marking a pull request ready.
+    /// whose outcome was not recorded may have been performed, so `reconcile` reads whether it
+    /// was before the effect is repeated.
     async fn once(
         &self,
         name: &str,
+        reconcile: impl Future<Output = Result<bool, PortError>>,
         effect: impl Future<Output = Result<(), PortError>>,
     ) -> Result<(), PortError> {
         let key = format!("{}/{name}", self.instance);
         let effects = self.store.load_effects(&self.run).await?;
         match effects.iter().find(|record| record.key == key) {
             Some(record) if record.outcome.is_some() => return Ok(()),
-            Some(_) => {}
+            Some(_) => {
+                if reconcile.await? {
+                    return self
+                        .store
+                        .record_effect_outcome(&self.run, &key, "done")
+                        .await;
+                }
+            }
             None => {
                 self.store
                     .record_effect_intent(&self.run, &key, name)
@@ -555,6 +591,10 @@ impl<I: Implement> PrReviewPipeline<I> {
             PrReviewState::ClosingSpecification { cycle } => {
                 self.once(
                     "close-specification",
+                    async {
+                        let status = self.forge.issue_status(&self.feature.specification).await?;
+                        Ok(status == IssueStatus::Closed)
+                    },
                     self.forge.close_issue(&self.feature.specification),
                 )
                 .await?;
@@ -563,6 +603,13 @@ impl<I: Implement> PrReviewPipeline<I> {
             PrReviewState::MarkingReady { cycle } => {
                 self.once(
                     "mark-ready",
+                    async {
+                        let draft = self
+                            .forge
+                            .pull_request_is_draft(&self.feature.draft_pull_request)
+                            .await?;
+                        Ok(!draft)
+                    },
                     self.forge
                         .mark_pull_request_ready(&self.feature.draft_pull_request),
                 )
@@ -587,10 +634,23 @@ impl<I: Implement> Pipeline for PrReviewPipeline<I> {
         PrReviewState::Provisioning { cycle: 1 }
     }
 
-    /// Pauses instead of acting while the run is paused. A failed forge effect is retried only
-    /// while the policy permits, otherwise the pipeline pauses; the effects are safe to repeat,
-    /// so an uncertain one counts as reconciled.
+    /// Runs the step and saves the policy if it changed: the driver saves no policy, and a
+    /// restart must not reset the run-wide budgets or lose a pause.
     async fn step(&self, state: PrReviewState) -> Result<PrReviewState, PipelineError> {
+        let before = self.policy.snapshot();
+        let result = self.step_effect(state).await;
+        if self.policy.snapshot() != before {
+            self.policy.save(self.store.as_ref(), &self.run).await?;
+        }
+        result
+    }
+}
+
+impl<I: Implement> PrReviewPipeline<I> {
+    /// Pauses instead of acting while the run is paused. A failed forge effect is retried only
+    /// while the policy permits, otherwise the pipeline pauses; the retry reconciles the effect
+    /// first, so an uncertain one counts as reconciled.
+    async fn step_effect(&self, state: PrReviewState) -> Result<PrReviewState, PipelineError> {
         if let Err(reason) = self.policy.check_start() {
             return Ok(paused(reason, state));
         }
@@ -616,7 +676,7 @@ impl<I: Implement> Pipeline for PrReviewPipeline<I> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -626,11 +686,14 @@ mod tests {
     use chimera_core::repository::FakeRepository;
     use chimera_core::run_store::FakeRunStore;
     use chimera_core::terminal::{FakeTerminal, Terminal, TurnStatus};
-    use chimera_core::{AgentProfile, BranchName, CommitId, Limits, MergedOk, PaneId, WorkspaceId};
+    use chimera_core::{
+        AgentProfile, BranchName, CommitId, Limits, MergedOk, PaneId, WorkItem, WorkspaceId,
+    };
     use futures_executor::block_on;
 
     use super::*;
     use crate::environment::AgentLaunch;
+    use crate::merge_lock::MergeLock;
 
     const APPROVED: &str = r#"{"ReviewApproved":"fine"}"#;
     const FINDINGS: &str = r#"{"ChangesRequested":"fix it"}"#;
@@ -640,7 +703,8 @@ mod tests {
         inner: FakeTerminal,
         replies: Mutex<VecDeque<String>>,
         launches: Mutex<usize>,
-        sent: Mutex<HashMap<PaneId, Vec<String>>>,
+        /// Every prompt in the order it was sent.
+        sent: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -667,12 +731,7 @@ mod tests {
                 self.inner.script_output(pane, reply);
                 self.inner.script_statuses(pane, [TurnStatus::Finished]);
             }
-            self.sent
-                .lock()
-                .unwrap()
-                .entry(pane.clone())
-                .or_default()
-                .push(prompt.to_string());
+            self.sent.lock().unwrap().push(prompt.to_string());
             self.inner.send_prompt(pane, prompt).await
         }
         async fn read_status(&self, pane: &PaneId) -> Result<TurnStatus, PortError> {
@@ -875,14 +934,7 @@ mod tests {
         }
 
         fn review_prompts(&self) -> Vec<String> {
-            self.terminal
-                .sent
-                .lock()
-                .unwrap()
-                .values()
-                .flatten()
-                .cloned()
-                .collect()
+            self.terminal.sent.lock().unwrap().clone()
         }
 
         fn forge_effects(&self) -> Vec<ForgeCall> {
@@ -1175,5 +1227,335 @@ mod tests {
         );
 
         assert_eq!(f.review_prompts().len(), prompts);
+    }
+
+    /// Provisions the review environment of cycle 1, as an earlier process did.
+    async fn provision_first_review(f: &Fixture) {
+        let pipeline = f.pipeline();
+        pipeline
+            .environment
+            .provision(
+                f.store.as_ref(),
+                &run(),
+                "review/environment/1",
+                &pipeline.spec,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn the_worktree_is_on_the_verified_remote_head() {
+        let f = fixture(5, &[APPROVED]);
+        // The fix moved the remote and the verified head; the local feature branch is behind.
+        f.repository
+            .set_remote_head(branch("feat"), CommitId::new("c1").unwrap());
+        block_on(f.store.save_pipeline_state(
+            &run(),
+            &expected_head_key(&branch("feat")),
+            serde_json::to_value(CommitId::new("c1").unwrap()).unwrap(),
+        ))
+        .unwrap();
+        let worktree = Path::new("/wt/review");
+        let c1 = Some(CommitId::new("c1").unwrap());
+
+        // A crash after the worktree was created and before it was moved.
+        block_on(provision_first_review(&f));
+        assert_eq!(
+            f.repository.worktree_head(worktree),
+            Some(CommitId::new("c0").unwrap())
+        );
+        let state = block_on(f.pipeline().step(PrReviewState::Provisioning { cycle: 1 })).unwrap();
+        assert_eq!(state, PrReviewState::Reviewing { cycle: 1 });
+        assert_eq!(f.repository.worktree_head(worktree), c1);
+
+        // Provisioning again after a restart leaves it there.
+        block_on(f.pipeline().step(PrReviewState::Provisioning { cycle: 1 })).unwrap();
+        assert_eq!(f.repository.worktree_head(worktree), c1);
+    }
+
+    #[test]
+    fn a_fix_moves_the_next_review_worktree_to_the_new_head() {
+        let f = fixture(5, &[FINDINGS, APPROVED]);
+        let pipeline = f.pipeline();
+        let step = |state: PrReviewState| block_on(pipeline.step(state)).unwrap();
+        let state = step(step(step(PrReviewState::Provisioning { cycle: 1 })));
+        let state = step(step(state));
+        assert_eq!(state, PrReviewState::Reviewing { cycle: 2 });
+
+        assert_eq!(
+            f.repository.worktree_head(Path::new("/wt/review")),
+            Some(CommitId::new("c1").unwrap())
+        );
+    }
+
+    #[test]
+    fn a_crash_after_closing_before_the_outcome_does_not_close_again() {
+        let f = fixture(5, &[APPROVED]);
+        block_on(async {
+            provision_first_review(&f).await;
+            f.forge.close_issue(&specification()).await.unwrap();
+            f.store
+                .record_effect_intent(&run(), "review/close-specification", "close-specification")
+                .await
+                .unwrap();
+        });
+
+        let state = PrReviewState::ClosingSpecification { cycle: 1 };
+        assert_eq!(block_on(f.drive_resumed(state)), ready());
+
+        assert_eq!(
+            f.forge_effects(),
+            vec![
+                ForgeCall::CloseIssue(specification()),
+                ForgeCall::MarkPullRequestReady(pull_request())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_crash_after_marking_ready_before_the_outcome_does_not_mark_again() {
+        let f = fixture(5, &[APPROVED]);
+        block_on(async {
+            provision_first_review(&f).await;
+            f.forge
+                .mark_pull_request_ready(&pull_request())
+                .await
+                .unwrap();
+            f.store
+                .record_effect_intent(&run(), "review/mark-ready", "mark-ready")
+                .await
+                .unwrap();
+        });
+
+        let state = PrReviewState::MarkingReady { cycle: 1 };
+        assert_eq!(block_on(f.drive_resumed(state)), ready());
+
+        assert_eq!(
+            f.forge_effects(),
+            vec![ForgeCall::MarkPullRequestReady(pull_request())]
+        );
+    }
+
+    #[test]
+    fn an_effect_with_an_intent_that_never_ran_is_performed() {
+        let f = fixture(5, &[APPROVED]);
+        block_on(async {
+            provision_first_review(&f).await;
+            f.store
+                .record_effect_intent(&run(), "review/close-specification", "close-specification")
+                .await
+                .unwrap();
+        });
+
+        let state = PrReviewState::ClosingSpecification { cycle: 1 };
+        assert_eq!(block_on(f.drive_resumed(state)), ready());
+
+        assert_eq!(f.forge_effects().len(), 2);
+        assert!(f.forge.is_closed(&specification()));
+    }
+
+    #[test]
+    fn corrections_count_before_a_fix_is_started() {
+        let f = fixture(2, &["no outcome", FINDINGS, APPROVED]);
+
+        assert_eq!(
+            block_on(f.drive()).unwrap(),
+            paused(
+                PauseReason::LimitExhausted,
+                PrReviewState::Fixing {
+                    cycle: 1,
+                    findings: "fix it".into()
+                }
+            )
+        );
+        assert!(f.implement.calls.lock().unwrap().is_empty());
+        assert_eq!(f.forge.is_draft(&pull_request()), Some(true));
+    }
+
+    async fn saved_policy(f: &Fixture) -> Policy {
+        Policy::load_or_new(f.store.as_ref(), &run(), &Limits::default())
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn a_github_retry_is_saved_with_the_policy() {
+        let f = fixture(5, &[APPROVED]);
+        block_on(provision_first_review(&f));
+        f.forge.fail_next(PortError::failed("rate limited"));
+        let state = PrReviewState::ClosingSpecification { cycle: 1 };
+
+        assert_eq!(block_on(f.pipeline().step(state.clone())).unwrap(), state);
+
+        // A restart restores the budget that the retry consumed.
+        assert_eq!(
+            block_on(saved_policy(&f))
+                .snapshot()
+                .github_retries_remaining,
+            Limits::default().github_retries - 1
+        );
+    }
+
+    #[test]
+    fn an_exhausted_github_budget_pauses_across_a_restart() {
+        let mut f = fixture(5, &[APPROVED]);
+        f.policy = Arc::new(Policy::new(&Limits {
+            github_retries: 0,
+            ..Limits::default()
+        }));
+        block_on(provision_first_review(&f));
+        f.forge.fail_next(PortError::failed("rate limited"));
+        let state = PrReviewState::ClosingSpecification { cycle: 1 };
+
+        assert_eq!(
+            block_on(f.pipeline().step(state.clone())).unwrap(),
+            paused(PauseReason::GithubRetriesExhausted, state)
+        );
+
+        assert_eq!(
+            block_on(saved_policy(&f)).check_start(),
+            Err(PauseReason::GithubRetriesExhausted)
+        );
+    }
+
+    /// An outer pipeline whose fix is the real Implementation pipeline, saved as paused in the
+    /// step that merges the fix: only the cleanup is left.
+    fn drive_implementation_fixture(
+        f: &Fixture,
+    ) -> PrReviewPipeline<DriveImplementation<impl Fn(u32, &str) -> ImplementationPipeline + Sync>>
+    {
+        let pipeline = f.pipeline();
+        let (store, repository) = (f.store.clone(), f.repository.clone());
+        let (policy, environment, turns) = (
+            f.policy.clone(),
+            pipeline.environment.clone(),
+            pipeline.turns.clone(),
+        );
+        let configuration = pipeline.configuration.clone();
+        let lock = block_on(MergeLock::open(f.store.clone(), run(), &branch("feat"))).unwrap();
+        let build = move |_cycle: u32, findings: &str| ImplementationPipeline {
+            run: run(),
+            instance: "fix".into(),
+            work_item: WorkItem::Findings(findings.to_string()),
+            issue: specification(),
+            configuration: configuration.clone(),
+            cycle_limit: 5,
+            merge_limit: 5,
+            spec: ProvisionSpec {
+                worktree: "/wt/fix".into(),
+                task_branch: branch("fix-task"),
+                feature: branch("feat"),
+                agents: vec![AgentLaunch {
+                    role: Role::Implementation,
+                    command_line: "agent Implementation".into(),
+                }],
+            },
+            initial_remote_head: CommitId::new("c0").unwrap(),
+            store: store.clone(),
+            repository: repository.clone(),
+            policy: policy.clone(),
+            lock: lock.clone(),
+            environment: environment.clone(),
+            turns: turns.clone(),
+        };
+        PrReviewPipeline {
+            run: pipeline.run,
+            instance: pipeline.instance,
+            feature: pipeline.feature,
+            configuration: pipeline.configuration,
+            review_limit: pipeline.review_limit,
+            spec: pipeline.spec,
+            store: pipeline.store.clone(),
+            repository: pipeline.repository,
+            forge: pipeline.forge,
+            policy: pipeline.policy,
+            environment: pipeline.environment,
+            turns: pipeline.turns,
+            implementation: DriveImplementation {
+                store: pipeline.store,
+                build,
+            },
+        }
+    }
+
+    #[test]
+    fn a_resumed_review_resumes_its_paused_fix_and_a_restart_does_not() {
+        let f = fixture(5, &[APPROVED]);
+        let outer = drive_implementation_fixture(&f);
+        let fix = (outer.implementation.build)(1, "fix it");
+        let merged = CommitId::new("c0").unwrap();
+        let fix_paused = ImplementationState::Paused {
+            reason: PauseReason::LimitExhausted,
+            resume_at: Box::new(ImplementationState::CleaningUp {
+                merged: merged.clone(),
+            }),
+        };
+        let fixing = PrReviewState::Fixing {
+            cycle: 1,
+            findings: "fix it".into(),
+        };
+        let outer_paused = paused(PauseReason::LimitExhausted, fixing);
+        block_on(async {
+            provision_first_review(&f).await;
+            // The review that asked for the fix.
+            f.store
+                .append_turn(
+                    &run(),
+                    TurnResult {
+                        agent: outer.agent(),
+                        role: Role::Review,
+                        outcome: TurnOutcome::Valid(Outcome::ChangesRequested("fix it".into())),
+                    },
+                )
+                .await
+                .unwrap();
+            fix.environment
+                .provision(f.store.as_ref(), &run(), "fix/environment", &fix.spec)
+                .await
+                .unwrap();
+            f.store
+                .save_pipeline_state(&run(), "fix", serde_json::to_value(&fix_paused).unwrap())
+                .await
+                .unwrap();
+            f.store
+                .save_pipeline_state(
+                    &run(),
+                    "review",
+                    serde_json::to_value(&outer_paused).unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+        let load = |instance: &str| {
+            block_on(f.store.load_pipeline_state(&run(), instance))
+                .unwrap()
+                .unwrap()
+        };
+
+        // A plain restart of the paused run stays paused, child included.
+        let restarted = drive_implementation_fixture(&f);
+        let state = block_on(drive(f.store.as_ref(), &run(), "review", &restarted)).unwrap();
+        assert_eq!(state, outer_paused);
+        assert_eq!(load("fix"), serde_json::to_value(&fix_paused).unwrap());
+
+        // Resuming the outer pipeline resumes the child from where it paused.
+        block_on(f.store.save_pipeline_state(
+            &run(),
+            "review",
+            serde_json::to_value(outer_paused.resume()).unwrap(),
+        ))
+        .unwrap();
+        let resumed = drive_implementation_fixture(&f);
+        let state = block_on(drive(f.store.as_ref(), &run(), "review", &resumed)).unwrap();
+
+        assert_eq!(state, ready());
+        assert_eq!(
+            load("fix"),
+            serde_json::to_value(ImplementationState::Done(MergedOk { commit: merged })).unwrap()
+        );
+        // The fix repeated no work: nothing but the review after it was asked of an agent.
+        assert_eq!(f.review_prompts().len(), 1);
+        assert_eq!(f.repository.worktree_branch(Path::new("/wt/fix")), None);
     }
 }

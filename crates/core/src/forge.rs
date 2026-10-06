@@ -31,6 +31,9 @@ pub trait Forge: Send + Sync {
     async fn issue_status(&self, issue: &IssueRef) -> Result<IssueStatus, PortError>;
 
     async fn mark_pull_request_ready(&self, pull_request: &IssueRef) -> Result<(), PortError>;
+
+    /// Whether `pull_request` is still a draft, used to reconcile an uncertain mark-ready.
+    async fn pull_request_is_draft(&self, pull_request: &IssueRef) -> Result<bool, PortError>;
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -61,6 +64,7 @@ mod fake {
         CloseIssue(IssueRef),
         IssueStatus(IssueRef),
         MarkPullRequestReady(IssueRef),
+        IsDraft(IssueRef),
     }
 
     struct PullRequest {
@@ -250,6 +254,12 @@ mod fake {
             state.begin(ForgeCall::MarkPullRequestReady(pull_request.clone()))?;
             state.pull_request_mut(pull_request)?.draft = false;
             Ok(())
+        }
+
+        async fn pull_request_is_draft(&self, pull_request: &IssueRef) -> Result<bool, PortError> {
+            let mut state = self.state.lock().unwrap();
+            state.begin(ForgeCall::IsDraft(pull_request.clone()))?;
+            Ok(state.pull_request_mut(pull_request)?.draft)
         }
     }
 
