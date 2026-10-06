@@ -35,8 +35,9 @@ pub trait Repository: Send + Sync {
     /// Drops metadata of worktrees whose directories no longer exist.
     async fn prune_worktrees(&self) -> Result<(), PortError>;
 
-    /// The commit `branch` points to on the remote.
-    async fn remote_head(&self, branch: &BranchName) -> Result<CommitId, PortError>;
+    /// The commit `branch` points to on the remote, or `None` if the remote has no such branch.
+    /// A lookup that could not be completed is an error, never `None`.
+    async fn remote_head(&self, branch: &BranchName) -> Result<Option<CommitId>, PortError>;
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -191,14 +192,10 @@ mod fake {
             self.state.lock().unwrap().begin()
         }
 
-        async fn remote_head(&self, branch: &BranchName) -> Result<CommitId, PortError> {
+        async fn remote_head(&self, branch: &BranchName) -> Result<Option<CommitId>, PortError> {
             let mut state = self.state.lock().unwrap();
             state.begin()?;
-            state
-                .remote_heads
-                .get(branch)
-                .cloned()
-                .ok_or_else(|| PortError::failed(format!("no remote branch {branch}")))
+            Ok(state.remote_heads.get(branch).cloned())
         }
     }
 
@@ -243,7 +240,7 @@ mod fake {
             assert!(fake.has_branch(&branch("feat")));
             assert_eq!(
                 block_on(fake.remote_head(&branch("feat"))).unwrap(),
-                commit("c0")
+                Some(commit("c0"))
             );
             assert!(
                 block_on(fake.create_feature_branch(&branch("feat"), &branch("main"))).is_err()
@@ -278,14 +275,16 @@ mod fake {
             let fake = FakeRepository::new(branch("main"), commit("c0"));
             assert_eq!(
                 block_on(fake.remote_head(&branch("main"))).unwrap(),
-                commit("c0")
+                Some(commit("c0"))
             );
             fake.set_remote_head(branch("main"), commit("c1"));
             assert_eq!(
                 block_on(fake.remote_head(&branch("main"))).unwrap(),
-                commit("c1")
+                Some(commit("c1"))
             );
-            assert!(block_on(fake.remote_head(&branch("nope"))).is_err());
+            assert_eq!(block_on(fake.remote_head(&branch("nope"))).unwrap(), None);
+            fake.fail_next(PortError::failed("down"));
+            assert!(block_on(fake.remote_head(&branch("main"))).is_err());
         }
 
         #[test]
