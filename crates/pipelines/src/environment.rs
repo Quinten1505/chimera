@@ -63,6 +63,10 @@ pub struct Environment {
     /// response was lost. It is reconciled through the ports before anything else.
     #[serde(default)]
     pub started: Option<EnvironmentEffect>,
+    /// The role whose launch is known not to have started an agent: launching it again needs
+    /// an agent recovery from the policy.
+    #[serde(default)]
+    pub failed_launch: Option<Role>,
 }
 
 impl Environment {
@@ -75,6 +79,7 @@ impl Environment {
             workspace: None,
             agents: Vec::new(),
             started: None,
+            failed_launch: None,
         }
     }
 
@@ -150,7 +155,9 @@ impl EnvironmentService {
     /// Advances the environment saved under `instance` by one external effect and saves it;
     /// call again until it [`Environment::is_provisioned`]. The order is: worktree, moving it
     /// onto the verified feature head `base`, workspace, one split pane per further role, then
-    /// each agent launch, with the policy checked before a launch.
+    /// each agent launch, with the policy checked before a launch. A launch that is known not to
+    /// have started its agent, because it failed or was reconciled as not having happened, is
+    /// retried only with an agent recovery from the policy.
     ///
     /// An effect is recorded as started before it runs. One still recorded when this is called
     /// again (the process stopped, or the response was lost) is reconciled instead: the worktree
@@ -186,16 +193,24 @@ impl EnvironmentService {
             }
             Next::Effect(effect) => effect,
         };
-        if matches!(effect, EnvironmentEffect::Launch(_)) {
+        if let EnvironmentEffect::Launch(role) = effect {
             self.policy.check_start().map_err(PipelineError::Paused)?;
+            if environment.failed_launch == Some(role) {
+                self.permit_recovery(store, run).await?;
+            }
         }
         environment.started = Some(effect);
+        environment.failed_launch = None;
         Self::save(store, run, instance, &environment).await?;
         match self.perform(spec, &mut environment, effect).await {
             Ok(()) => {}
-            // Known not to have happened: nothing to reconcile.
+            // Known not to have happened: nothing to reconcile, but a launch is retried only
+            // with the policy's permission.
             Err(error) if error.is_failed() => {
                 environment.started = None;
+                if let EnvironmentEffect::Launch(role) = effect {
+                    environment.failed_launch = Some(role);
+                }
                 Self::save(store, run, instance, &environment).await?;
                 return Err(error.into());
             }
@@ -351,6 +366,9 @@ impl EnvironmentService {
                     .expect("the agent's pane was created");
                 // A pane whose agent never started has no agent to report on.
                 agent.launched = self.terminal.read_status(&agent.pane).await? != TurnStatus::Gone;
+                if !agent.launched {
+                    environment.failed_launch = Some(role);
+                }
             }
         }
         Ok(())
@@ -375,19 +393,30 @@ impl EnvironmentService {
         if self.terminal.read_status(pane).await? != TurnStatus::Gone {
             return Ok(());
         }
+        self.permit_recovery(store, run).await?;
+        self.terminal.launch_agent(pane, command_line).await?;
+        Ok(())
+    }
+
+    /// Consumes one agent recovery from the policy and saves the result under `run` before the
+    /// launch it permits, so a restart cannot launch again on a restored budget. An exhausted
+    /// budget pauses the run, and that pause is saved too.
+    async fn permit_recovery(
+        &self,
+        store: &dyn RunStore,
+        run: &RunId,
+    ) -> Result<(), PipelineError> {
         let permit = self.policy.permit_retry(
             Budget::AgentRecovery,
-            &PortError::failed("agent is gone"),
+            &PortError::failed("no agent was started"),
             false,
         );
         self.policy.save(store, run).await?;
         match permit {
-            Ok(()) => {}
-            Err(RetryRefused::Paused(reason)) => return Err(PipelineError::Paused(reason)),
+            Ok(()) => Ok(()),
+            Err(RetryRefused::Paused(reason)) => Err(PipelineError::Paused(reason)),
             Err(RetryRefused::NeedsReconciliation) => unreachable!("the error is not uncertain"),
         }
-        self.terminal.launch_agent(pane, command_line).await?;
-        Ok(())
     }
 
     /// Performs the next cleanup effect on the environment saved under `instance` and saves
@@ -806,6 +835,77 @@ mod tests {
         let resumed = provision(&f, &spec).unwrap();
         assert!(resumed.is_provisioned(&spec));
         assert_eq!(f.terminal.count("workspace"), 1);
+    }
+
+    fn saved_policy(f: &Fixture) -> Policy {
+        block_on(Policy::load_or_new(&f.store, &run(), &Limits::default())).unwrap()
+    }
+
+    #[test]
+    fn a_launch_that_did_not_start_is_retried_only_with_an_agent_recovery() {
+        for lost in [None, Some(Lost::Request)] {
+            let f = fixture(2);
+            let spec = triplet();
+            match lost {
+                None => *f.terminal.launch_failure.lock().unwrap() = Some(PortError::failed("no")),
+                Some(lost) => *f.terminal.lose.lock().unwrap() = Some(("launch", lost)),
+            }
+            assert!(provision(&f, &spec).is_err());
+            if lost.is_some() {
+                // The lost launch is reconciled as not having happened.
+                let step = block_on(f.service.provision_step(
+                    &f.store,
+                    &run(),
+                    "env",
+                    &spec,
+                    &commit("c0"),
+                ));
+                assert!(!step.unwrap().is_provisioned(&spec));
+            }
+            assert_eq!(saved(&f).failed_launch, Some(Role::Implementation));
+            assert_eq!(saved(&f).started, None);
+            assert_eq!(f.policy.snapshot().agent_recovery_remaining, 2);
+
+            let resumed = provision(&f, &spec).unwrap();
+
+            assert!(resumed.is_provisioned(&spec));
+            assert_eq!(resumed.failed_launch, None);
+            assert_eq!(saved_policy(&f).snapshot().agent_recovery_remaining, 1);
+        }
+    }
+
+    #[test]
+    fn repeated_launch_failures_pause_once_the_recovery_budget_is_used_up_across_a_restart() {
+        let f = fixture(1);
+        let spec = triplet();
+        let fail = || *f.terminal.launch_failure.lock().unwrap() = Some(PortError::failed("no"));
+
+        // The first launch, then its retry on the only recovery.
+        for _ in 0..2 {
+            fail();
+            assert!(provision(&f, &spec).unwrap_err().is_failed());
+        }
+        assert_eq!(f.terminal.count("launch"), 2);
+        let error = provision(&f, &spec).unwrap_err();
+        assert!(matches!(
+            error,
+            PipelineError::Paused(PauseReason::AgentRecoveryExhausted)
+        ));
+        assert_eq!(f.terminal.count("launch"), 2);
+
+        // A restart restores the exhausted budget and the pause: nothing is launched.
+        let restored = Arc::new(saved_policy(&f));
+        assert_eq!(restored.snapshot().agent_recovery_remaining, 0);
+        let service =
+            EnvironmentService::new(f.repository.clone(), f.terminal.clone(), restored.clone());
+        let error =
+            block_on(service.provision(&f.store, &run(), "env", &spec, &commit("c0"))).unwrap_err();
+        assert!(matches!(
+            error,
+            PipelineError::Paused(PauseReason::AgentRecoveryExhausted)
+        ));
+        assert_eq!(f.terminal.count("launch"), 2);
+        assert_eq!(saved(&f).failed_launch, Some(Role::Implementation));
     }
 
     #[test]
