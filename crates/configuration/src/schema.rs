@@ -6,7 +6,7 @@ use std::{fs, path::Path};
 use chimera_core::{AgentConfiguration, AgentProfile, Limits};
 use serde::Deserialize;
 
-use crate::{ConfigurationError, codex_args::validate_settings};
+use crate::{ConfigurationError, codex_args::{CODEX_PROVIDER, validate_settings}};
 
 const DEFAULT_RESET_COMMAND: &str = "/clear";
 
@@ -25,7 +25,7 @@ impl Configuration {
 
     pub fn from_yaml(yaml: &str) -> Result<Self, ConfigurationError> {
         let file: File = serde_yaml::from_str(yaml)?;
-        let configuration = file.resolve();
+        let configuration = file.resolve()?;
         configuration.validate_codex_settings()?;
         Ok(configuration)
     }
@@ -54,9 +54,9 @@ struct File {
     providers: BTreeMap<String, ProviderSection>,
     #[serde(default)]
     limits: LimitsSection,
-    ticket: AgentsSection,
+    ticket: Option<AgentsSection>,
     #[serde(rename = "final")]
-    final_review: AgentsSection,
+    final_review: Option<AgentsSection>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -68,87 +68,197 @@ struct ProviderSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LimitsSection {
-    implementation_review_cycles: Option<u32>,
-    merge_attempts: Option<u32>,
-    final_review_fix_cycles: Option<u32>,
-    agent_recovery: Option<u32>,
-    github_retries: Option<u32>,
+    #[serde(default, deserialize_with = "present")]
+    implementation_review_cycles: Option<serde_yaml::Value>,
+    #[serde(default, deserialize_with = "present")]
+    merge_attempts: Option<serde_yaml::Value>,
+    #[serde(default, deserialize_with = "present")]
+    final_review_fix_cycles: Option<serde_yaml::Value>,
+    #[serde(default, deserialize_with = "present")]
+    agent_recovery: Option<serde_yaml::Value>,
+    #[serde(default, deserialize_with = "present")]
+    github_retries: Option<serde_yaml::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentsSection {
-    implementation: ProfileSection,
-    review: ProfileSection,
-    merge: ProfileSection,
+    implementation: Option<ProfileSection>,
+    review: Option<ProfileSection>,
+    merge: Option<ProfileSection>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileSection {
-    provider: String,
-    model: String,
+    provider: Option<String>,
+    model: Option<String>,
     #[serde(default)]
     settings: BTreeMap<String, serde_json::Value>,
-    prompt_template: String,
+    prompt_template: Option<String>,
+}
+
+/// Keeps an explicit `null` distinct from an absent key, so `null` is rejected as an invalid limit.
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_yaml::Value>, D::Error> {
+    serde_yaml::Value::deserialize(deserializer).map(Some)
+}
+
+fn invalid(field: &str) -> ConfigurationError {
+    ConfigurationError::Invalid {
+        field: field.to_string(),
+    }
+}
+
+fn missing(field: &str) -> ConfigurationError {
+    ConfigurationError::Missing {
+        field: field.to_string(),
+    }
+}
+
+/// A required single-line string: nonempty and free of control characters.
+fn plain_string(value: Option<String>, field: &str) -> Result<String, ConfigurationError> {
+    let value = value.ok_or_else(|| missing(field))?;
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(invalid(field));
+    }
+    Ok(value)
+}
+
+/// Prompt templates are multi-line, so newlines and tabs are allowed.
+fn template_string(value: Option<String>, field: &str) -> Result<String, ConfigurationError> {
+    let value = value.ok_or_else(|| missing(field))?;
+    if value.trim().is_empty()
+        || value
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err(invalid(field));
+    }
+    Ok(value)
 }
 
 impl File {
-    fn resolve(self) -> Configuration {
+    fn resolve(self) -> Result<Configuration, ConfigurationError> {
         let Self {
             providers,
             limits,
             ticket,
             final_review,
         } = self;
-        Configuration {
-            ticket: ticket.resolve(&providers),
-            final_review: final_review.resolve(&providers),
-            limits: limits.resolve(),
+        let mut reset_commands = BTreeMap::new();
+        for (name, section) in providers {
+            if name != CODEX_PROVIDER {
+                return Err(ConfigurationError::UnsupportedProvider {
+                    field: format!("providers.{name}"),
+                    provider: name,
+                });
+            }
+            if let Some(command) = section.reset_command {
+                let field = format!("providers.{name}.reset_command");
+                reset_commands.insert(name, plain_string(Some(command), &field)?);
+            }
         }
+        Ok(Configuration {
+            ticket: ticket
+                .unwrap_or_default()
+                .resolve("ticket", &reset_commands)?,
+            final_review: final_review
+                .unwrap_or_default()
+                .resolve("final", &reset_commands)?,
+            limits: limits.resolve()?,
+        })
     }
 }
 
 impl AgentsSection {
-    fn resolve(self, providers: &BTreeMap<String, ProviderSection>) -> AgentConfiguration {
-        AgentConfiguration {
-            implementation: self.implementation.resolve(providers),
-            review: self.review.resolve(providers),
-            merge: self.merge.resolve(providers),
-        }
+    fn resolve(
+        self,
+        prefix: &str,
+        reset_commands: &BTreeMap<String, String>,
+    ) -> Result<AgentConfiguration, ConfigurationError> {
+        let role = |profile: Option<ProfileSection>, name: &str| {
+            let field = format!("{prefix}.{name}");
+            profile
+                .ok_or_else(|| missing(&field))?
+                .resolve(&field, reset_commands)
+        };
+        Ok(AgentConfiguration {
+            implementation: role(self.implementation, "implementation")?,
+            review: role(self.review, "review")?,
+            merge: role(self.merge, "merge")?,
+        })
     }
 }
 
 impl ProfileSection {
-    fn resolve(self, providers: &BTreeMap<String, ProviderSection>) -> AgentProfile {
-        let reset_command = providers
-            .get(&self.provider)
-            .and_then(|section| section.reset_command.clone())
-            .unwrap_or_else(|| DEFAULT_RESET_COMMAND.to_string());
-        AgentProfile {
-            provider: self.provider,
-            model: self.model,
-            settings: self.settings,
-            prompt_template: self.prompt_template,
-            reset_command,
+    fn resolve(
+        self,
+        field: &str,
+        reset_commands: &BTreeMap<String, String>,
+    ) -> Result<AgentProfile, ConfigurationError> {
+        let provider = self
+            .provider
+            .ok_or_else(|| missing(&format!("{field}.provider")))?;
+        if provider != CODEX_PROVIDER {
+            return Err(ConfigurationError::UnsupportedProvider {
+                field: format!("{field}.provider"),
+                provider,
+            });
         }
+        let reset_command = reset_commands
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_RESET_COMMAND.to_string());
+        Ok(AgentProfile {
+            model: plain_string(self.model, &format!("{field}.model"))?,
+            settings: self.settings,
+            prompt_template: template_string(
+                self.prompt_template,
+                &format!("{field}.prompt_template"),
+            )?,
+            provider,
+            reset_command,
+        })
     }
 }
 
+fn limit(
+    value: Option<serde_yaml::Value>,
+    name: &str,
+    default: u32,
+) -> Result<u32, ConfigurationError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n > 0)
+        .ok_or_else(|| ConfigurationError::InvalidLimit {
+            field: format!("limits.{name}"),
+        })
+}
+
 impl LimitsSection {
-    fn resolve(self) -> Limits {
-        let defaults = Limits::default();
-        Limits {
-            implementation_review_cycles: self
-                .implementation_review_cycles
-                .unwrap_or(defaults.implementation_review_cycles),
-            merge_attempts: self.merge_attempts.unwrap_or(defaults.merge_attempts),
-            final_review_fix_cycles: self
-                .final_review_fix_cycles
-                .unwrap_or(defaults.final_review_fix_cycles),
-            agent_recovery: self.agent_recovery.unwrap_or(defaults.agent_recovery),
-            github_retries: self.github_retries.unwrap_or(defaults.github_retries),
-        }
+    fn resolve(self) -> Result<Limits, ConfigurationError> {
+        let d = Limits::default();
+        Ok(Limits {
+            implementation_review_cycles: limit(
+                self.implementation_review_cycles,
+                "implementation_review_cycles",
+                d.implementation_review_cycles,
+            )?,
+            merge_attempts: limit(self.merge_attempts, "merge_attempts", d.merge_attempts)?,
+            final_review_fix_cycles: limit(
+                self.final_review_fix_cycles,
+                "final_review_fix_cycles",
+                d.final_review_fix_cycles,
+            )?,
+            agent_recovery: limit(self.agent_recovery, "agent_recovery", d.agent_recovery)?,
+            github_retries: limit(self.github_retries, "github_retries", d.github_retries)?,
+        })
     }
 }
 
@@ -162,18 +272,18 @@ mod tests {
 ticket:
   implementation: { provider: codex, model: m1, prompt_template: implement }
   review: { provider: codex, model: m2, prompt_template: review }
-  merge: { provider: claude, model: m3, prompt_template: merge }
+  merge: { provider: codex, model: m3, prompt_template: merge }
 final:
   implementation: { provider: codex, model: m1, prompt_template: implement }
   review: { provider: codex, model: m2, prompt_template: review }
-  merge: { provider: claude, model: m3, prompt_template: merge }
+  merge: { provider: codex, model: m3, prompt_template: merge }
 ";
 
     #[test]
     fn parses_example_file() {
         let configuration = Configuration::from_yaml(EXAMPLE).unwrap();
         assert_eq!(configuration.ticket.implementation.provider, "codex");
-        assert_eq!(configuration.ticket.merge.provider, "claude");
+        assert_eq!(configuration.ticket.merge.provider, "codex");
         assert_eq!(configuration.final_review.review.provider, "codex");
         assert_eq!(configuration.ticket.implementation.reset_command, "/clear");
         assert_eq!(configuration.ticket.merge.reset_command, "/clear");
@@ -192,7 +302,6 @@ final:
         let yaml = format!(
             "providers:
   codex: {{ reset_command: /new }}
-  claude: {{}}
 limits:
   implementation_review_cycles: 1
   merge_attempts: 2
@@ -201,14 +310,14 @@ limits:
   github_retries: 6
 {MINIMAL}"
         )
-        .replace("model: m3,", "model: m3, settings: {effort: high, n: 2},");
+        .replace("model: m3,", "model: m3, settings: {reasoning_effort: high, approve_for_me: true},");
         let configuration = Configuration::from_yaml(&yaml).unwrap();
         let profile = &configuration.final_review.merge;
-        assert_eq!(profile.reset_command, "/clear");
+        assert_eq!(profile.reset_command, "/new");
         assert_eq!(configuration.ticket.implementation.reset_command, "/new");
-        assert_eq!(profile.settings["effort"], "high");
-        assert_eq!(profile.settings["n"], 2);
-        assert_eq!(configuration.ticket.merge.reset_command, "/clear");
+        assert_eq!(profile.settings["reasoning_effort"], "high");
+        assert_eq!(profile.settings["approve_for_me"], true);
+        assert_eq!(configuration.ticket.merge.reset_command, "/new");
         assert_eq!(
             configuration.limits,
             Limits {
@@ -262,7 +371,7 @@ limits:
         assert!(Configuration::from_yaml("limits: {}").is_err());
         assert!(
             Configuration::from_yaml(&MINIMAL.replace(
-                "  merge: { provider: claude, model: m3, prompt_template: merge }\n",
+                "  merge: { provider: codex, model: m3, prompt_template: merge }\n",
                 ""
             ))
             .is_err()
@@ -287,5 +396,78 @@ limits:
             let message = Configuration::from_yaml(&yaml).unwrap_err().to_string();
             assert!(message.contains(path), "{message}");
         }
+    }
+
+    fn err(yaml: &str) -> String {
+        Configuration::from_yaml(yaml).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn rejects_missing_role_naming_it() {
+        let yaml = MINIMAL.replacen(
+            "  merge: { provider: codex, model: m3, prompt_template: merge }\n",
+            "",
+            2,
+        );
+        assert!(err(&yaml).contains("ticket.merge"), "{}", err(&yaml));
+        let last = MINIMAL.rsplit_once("  merge:").unwrap().0;
+        assert!(err(last).contains("final.merge"), "{}", err(last));
+        assert!(err("limits: {}").contains("ticket.implementation"));
+    }
+
+    #[test]
+    fn rejects_missing_or_empty_prompt_template() {
+        let missing = MINIMAL.replacen(", prompt_template: review", "", 1);
+        assert!(err(&missing).contains("ticket.review.prompt_template"));
+        let empty = MINIMAL.replacen("prompt_template: merge", "prompt_template: '  '", 1);
+        assert!(err(&empty).contains("ticket.merge.prompt_template"));
+    }
+
+    #[test]
+    fn rejects_unsupported_provider() {
+        let yaml = MINIMAL.replacen("provider: codex", "provider: gemini", 1);
+        let message = err(&yaml);
+        assert!(
+            message.contains("ticket.implementation.provider"),
+            "{message}"
+        );
+        assert!(message.contains("gemini"));
+        assert!(
+            err(&format!("providers:\n  gemini: {{}}\n{MINIMAL}")).contains("providers.gemini")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_limits() {
+        for value in ["0", "-1", "1.5", "many", "null", "[]", "4294967296"] {
+            let yaml = format!("limits:\n  agent_recovery: {value}\n{MINIMAL}");
+            assert!(err(&yaml).contains("limits.agent_recovery"), "{value}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_string_fields() {
+        let model = MINIMAL.replacen("model: m2", "model: ''", 1);
+        assert!(err(&model).contains("ticket.review.model"));
+        let control = MINIMAL.replacen("model: m1", "model: \"m\\x07\"", 1);
+        assert!(err(&control).contains("ticket.implementation.model"));
+        let reset = format!("providers:\n  codex: {{ reset_command: \"\" }}\n{MINIMAL}");
+        assert!(err(&reset).contains("providers.codex.reset_command"));
+        let template = MINIMAL.replacen(
+            "prompt_template: implement",
+            "prompt_template: \"a\\x00b\"",
+            1,
+        );
+        assert!(err(&template).contains("ticket.implementation.prompt_template"));
+    }
+
+    #[test]
+    fn multiline_prompt_templates_are_valid() {
+        let yaml = MINIMAL.replacen(
+            "prompt_template: implement",
+            "prompt_template: \"a\\nb\\tc\"",
+            1,
+        );
+        assert!(Configuration::from_yaml(&yaml).is_ok());
     }
 }

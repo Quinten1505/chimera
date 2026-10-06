@@ -30,7 +30,7 @@ ticket:
     prompt_template: |
       Review the implementation against the ticket.
   merge:
-    provider: claude
+    provider: codex
     model: claude-sonnet-5-5
     prompt_template: |
       Merge the approved change and resolve conflicts.
@@ -52,7 +52,7 @@ final:
     prompt_template: |
       Review the whole feature branch against the specification.
   merge:
-    provider: claude
+    provider: codex
     model: claude-sonnet-5-5
     prompt_template: |
       Merge the feature branch.

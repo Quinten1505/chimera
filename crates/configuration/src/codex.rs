@@ -118,6 +118,12 @@ pub enum ConfigurationError {
     },
     #[error("cannot build Codex arguments for provider {0}")]
     NotCodex(String),
+    #[error("{field} is required")]
+    Missing { field: String },
+    #[error("{field} must be a positive integer")]
+    InvalidLimit { field: String },
+    #[error("{field}: unsupported provider {provider:?} (supported: codex)")]
+    UnsupportedProvider { field: String, provider: String },
     #[error("unknown agent profile: {0}")]
     UnknownProfile(String),
 }
