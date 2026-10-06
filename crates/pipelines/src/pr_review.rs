@@ -652,12 +652,38 @@ impl<I: Implement> Pipeline for PrReviewPipeline<I> {
 }
 
 impl<I: Implement> PrReviewPipeline<I> {
+    /// While the run is paused, a review turn that already started still finishes and its result
+    /// is saved; the pipeline then pauses at the state the result leads to, so no fix or new
+    /// review starts. Any other state pauses as it is.
+    async fn finish_started_review(
+        &self,
+        reason: PauseReason,
+        state: PrReviewState,
+    ) -> Result<PrReviewState, PipelineError> {
+        let PrReviewState::Reviewing { cycle } = state else {
+            return Ok(paused(reason, state));
+        };
+        if self
+            .load_pending()
+            .await?
+            .is_none_or(|pending| pending.cycle != cycle)
+        {
+            return Ok(paused(reason, state));
+        }
+        Ok(match self.review(state.clone(), cycle).await {
+            Ok(next) if next.is_paused() => next,
+            Ok(next) => paused(reason, next),
+            Err(PipelineError::Paused(_)) => paused(reason, state),
+            Err(error) => return Err(error),
+        })
+    }
+
     /// Pauses instead of acting while the run is paused. A failed forge effect is retried only
     /// while the policy permits, otherwise the pipeline pauses; the retry reconciles the effect
     /// first, so an uncertain one counts as reconciled.
     async fn step_effect(&self, state: PrReviewState) -> Result<PrReviewState, PipelineError> {
         if let Err(reason) = self.policy.check_start() {
-            return Ok(paused(reason, state));
+            return self.finish_started_review(reason, state).await;
         }
         match self.advance(&state).await {
             Ok(next) => Ok(next),
@@ -1242,6 +1268,75 @@ mod tests {
             ready()
         );
 
+        assert!(f.review_prompts().is_empty());
+    }
+
+    #[test]
+    fn a_started_review_is_collected_while_paused_and_nothing_new_starts() {
+        for (reply, after) in [
+            (APPROVED, PrReviewState::ClosingSpecification { cycle: 1 }),
+            (
+                FINDINGS,
+                PrReviewState::Fixing {
+                    cycle: 1,
+                    findings: "fix it".into(),
+                },
+            ),
+        ] {
+            let f = fixture(5, &[]);
+            let pipeline = f.pipeline();
+            block_on(async {
+                next_state(&pipeline, PrReviewState::Provisioning { cycle: 1 }).await;
+                let environment = pipeline.load_environment(1).await.unwrap();
+                let pane = environment.pane(Role::Review).unwrap().clone();
+                // The review was assigned before the restart; the agent answered meanwhile.
+                f.terminal.inner.script_output(&pane, reply);
+                f.terminal
+                    .inner
+                    .script_statuses(&pane, [TurnStatus::Finished]);
+                pipeline
+                    .save_pending(Some(&PendingTurn {
+                        cycle: 1,
+                        output_before: String::new(),
+                        invalid_before: 0,
+                        corrections: 0,
+                        phase: TurnPhase::Awaiting,
+                    }))
+                    .await
+                    .unwrap();
+            });
+            f.policy.pause(PauseReason::GlobalPause);
+
+            let state = block_on(f.drive_resumed(PrReviewState::Reviewing { cycle: 1 }));
+
+            assert_eq!(state, paused(PauseReason::GlobalPause, after), "{reply}");
+            let history = f.store.history(&run());
+            assert_eq!(history.len(), 1, "{reply}");
+            assert!(f.review_prompts().is_empty(), "{reply}");
+            assert!(f.implement.calls.lock().unwrap().is_empty(), "{reply}");
+            assert!(f.forge_effects().is_empty(), "{reply}");
+        }
+    }
+
+    #[test]
+    fn a_review_that_has_not_started_stays_unsent_while_paused() {
+        let f = fixture(5, &[APPROVED]);
+        let pipeline = f.pipeline();
+        block_on(next_state(
+            &pipeline,
+            PrReviewState::Provisioning { cycle: 1 },
+        ));
+        f.policy.pause(PauseReason::GlobalPause);
+
+        let state = block_on(f.drive_resumed(PrReviewState::Reviewing { cycle: 1 }));
+
+        assert_eq!(
+            state,
+            paused(
+                PauseReason::GlobalPause,
+                PrReviewState::Reviewing { cycle: 1 }
+            )
+        );
         assert!(f.review_prompts().is_empty());
     }
 
