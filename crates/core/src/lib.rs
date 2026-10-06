@@ -283,6 +283,34 @@ pub struct MergedOk {
     pub commit: CommitId,
 }
 
+/// What an agent reports at the end of a turn; each variant carries its explanation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    ImplementationReady(String),
+    ReviewApproved(String),
+    ChangesRequested(String),
+    MergeReadyForConflictReview(String),
+    MergeSuccessful(String),
+    MergeBlocked(String),
+}
+
+/// What an agent receives for a turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assignment {
+    pub role: Role,
+    pub work_item: WorkItem,
+    /// The latest relevant description from the previous agent, if there was one.
+    pub previous_description: Option<String>,
+}
+
+/// The parsed result of one agent turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnResult {
+    pub agent: AgentId,
+    pub role: Role,
+    pub outcome: Outcome,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +456,36 @@ mod tests {
         assert_round_trip(WorkItem::Findings("fix the thing".into()));
         assert_round_trip(MergedOk {
             commit: CommitId::new("def456").unwrap(),
+        });
+    }
+
+    #[test]
+    fn agent_turn_types_round_trip() {
+        let outcomes = [
+            Outcome::ImplementationReady("done".into()),
+            Outcome::ReviewApproved("good".into()),
+            Outcome::ChangesRequested("fix".into()),
+            Outcome::MergeReadyForConflictReview("conflicts".into()),
+            Outcome::MergeSuccessful("merged".into()),
+            Outcome::MergeBlocked("stuck".into()),
+        ];
+        for outcome in outcomes {
+            assert_round_trip(outcome.clone());
+            assert_round_trip(TurnResult {
+                agent: AgentId::new("a1").unwrap(),
+                role: Role::Review,
+                outcome,
+            });
+        }
+        assert_round_trip(Assignment {
+            role: Role::Merge,
+            work_item: WorkItem::Ticket(ticket()),
+            previous_description: Some("prior".into()),
+        });
+        assert_round_trip(Assignment {
+            role: Role::Implementation,
+            work_item: WorkItem::Findings("f".into()),
+            previous_description: None,
         });
     }
 }
