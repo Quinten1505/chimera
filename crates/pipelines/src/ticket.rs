@@ -291,8 +291,12 @@ where
         match record {
             Some(record) if record.outcome.is_some() => return Ok(()),
             Some(_) if self.is_closed(issue).await? => {}
-            Some(_) => self.close_with_retries(issue).await?,
+            Some(_) => {
+                self.permit_close()?;
+                self.close_with_retries(issue).await?;
+            }
             None => {
+                self.permit_close()?;
                 self.store
                     .record_effect_intent(&self.run, &key, "close ticket issue")
                     .await?;
@@ -303,6 +307,12 @@ where
             .record_effect_outcome(&self.run, &key, "closed")
             .await?;
         Ok(())
+    }
+
+    /// A restored pause forbids another close; only reconciliation against the issue's status
+    /// is allowed while paused.
+    fn permit_close(&self) -> Result<(), PipelineError> {
+        self.policy.check_start().map_err(PipelineError::Paused)
     }
 
     async fn close_with_retries(&self, issue: &IssueRef) -> Result<(), PipelineError> {
@@ -835,8 +845,23 @@ mod tests {
             result,
             Err(PipelineError::Paused(PauseReason::GithubRetriesExhausted))
         ));
-        let restored = f.saved_policy(&Limits::default()).await.snapshot();
-        assert_eq!(restored.github_retries_remaining, 0);
-        assert_eq!(restored.paused, Some(PauseReason::GithubRetriesExhausted));
+        let restored = f.saved_policy(&Limits::default()).await;
+        let snapshot = restored.snapshot();
+        assert_eq!(snapshot.github_retries_remaining, 0);
+        assert_eq!(snapshot.paused, Some(PauseReason::GithubRetriesExhausted));
+        assert_eq!(f.closes(), [1, 1]);
+
+        // Rerunning with the restored policy reconciles but does not close again.
+        f.policy = Arc::new(restored);
+        let result = f.run(Script::default()).await;
+        assert!(matches!(
+            result,
+            Err(PipelineError::Paused(PauseReason::GithubRetriesExhausted))
+        ));
+        assert_eq!(f.closes(), [1, 1]);
+        assert_eq!(
+            f.saved_progress().await,
+            [(1, TicketProgress::Merged(merged()))]
+        );
     }
 }
