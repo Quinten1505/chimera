@@ -29,4 +29,6 @@ pub use implementation::{ImplementationPipeline, ImplementationState};
 pub use merge_lock::{MergeLock, Sequence};
 pub use policy::{Budget, Policy, PolicyState, RetryRefused};
 pub use pr_review::{DriveImplementation, Implement, PrReady, PrReviewPipeline, PrReviewState};
-pub use ticket::{TicketEntry, TicketPause, TicketPipeline, TicketProgress, TicketState};
+pub use ticket::{
+    TicketBoard, TicketEntry, TicketPause, TicketPipeline, TicketProgress, TicketState,
+};
