@@ -269,7 +269,6 @@ async fn update_worktree_to_ancestor_commit_when_server_refuses_unadvertised_ids
         .create_worktree(&worktree, &task, &feature)
         .await
         .unwrap();
-    let before = git(&worktree, &["rev-parse", "HEAD"]);
 
     let other = dir.path().join("other");
     git(
@@ -293,15 +292,76 @@ async fn update_worktree_to_ancestor_commit_when_server_refuses_unadvertised_ids
     // The origin now advertises only B for feature/x; A is merely reachable.
     let a = CommitId::new(commits[0].clone()).unwrap();
 
-    // A failed fetch or an unknown commit leaves the task branch where it was.
+    // The refusal is real, and A is not available locally beforehand.
+    let direct = Command::new("git")
+        .args(["fetch", "origin", a.as_str()])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    assert!(!direct.status.success(), "direct fetch by id was allowed");
+    let absent = Command::new("git")
+        .args(["cat-file", "-e", &format!("{}^{{commit}}", a.as_str())])
+        .current_dir(&work)
+        .status()
+        .unwrap();
+    assert!(!absent.success(), "A is already present locally");
+
+    repository.update_worktree(&worktree, &a).await.unwrap();
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), a.as_str());
+    assert_eq!(git(&work, &["rev-parse", "task/1"]), a.as_str());
+
+    // An unknown commit fails and leaves the task branch where it was.
     let error = repository
         .update_worktree(&worktree, &CommitId::new("1".repeat(40)).unwrap())
         .await
         .unwrap_err();
     assert!(error.is_failed(), "{error:?}");
-    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), before);
-
-    repository.update_worktree(&worktree, &a).await.unwrap();
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), a.as_str());
     assert_eq!(git(&work, &["rev-parse", "task/1"]), a.as_str());
+}
+
+#[tokio::test]
+async fn update_worktree_fails_when_fetch_fails_for_an_absent_commit() {
+    let (dir, work) = setup();
+    let repository: Arc<dyn Repository> = Arc::new(GitRepository::new(&work));
+    let feature = branch("feature/x");
+    let task = branch("task/1");
+    let worktree = dir.path().join("wt-1");
+    repository
+        .create_feature_branch(&feature, &branch("main"))
+        .await
+        .unwrap();
+    repository
+        .create_worktree(&worktree, &task, &feature)
+        .await
+        .unwrap();
+    let before = git(&worktree, &["rev-parse", "HEAD"]);
+
+    let other = dir.path().join("other");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            dir.path().join("origin.git").to_str().unwrap(),
+            "other",
+        ],
+    );
+    configure(&other);
+    git(&other, &["checkout", "feature/x"]);
+    std::fs::write(other.join("new.txt"), "new").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-m", "Move the feature"]);
+    git(&other, &["push", "origin", "feature/x"]);
+    let target = CommitId::new(git(&other, &["rev-parse", "HEAD"])).unwrap();
+
+    // Make the origin unavailable.
+    std::fs::rename(dir.path().join("origin.git"), dir.path().join("gone.git")).unwrap();
+
+    let error = repository
+        .update_worktree(&worktree, &target)
+        .await
+        .unwrap_err();
+    assert!(error.is_failed(), "{error:?}");
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), before);
+    assert_eq!(git(&work, &["rev-parse", "task/1"]), before);
 }
