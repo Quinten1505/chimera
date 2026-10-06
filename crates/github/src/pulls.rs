@@ -79,9 +79,19 @@ impl Client {
         if !is_draft {
             return Ok(());
         }
-        self.graphql(Access::Mutate, MARK_READY_MUTATION, json!({ "id": id }))
-            .await
-            .map(|_| ())
+        let data = self
+            .graphql(Access::Mutate, MARK_READY_MUTATION, json!({ "id": id }))
+            .await?;
+        match data["markPullRequestReadyForReview"]["pullRequest"]["isDraft"].as_bool() {
+            Some(false) => Ok(()),
+            Some(true) => Err(GitHubError::Failed(format!(
+                "pull request {pull_request} is still a draft after marking it ready"
+            ))),
+            // The mutation was sent, so a missing confirmation leaves the outcome unknown.
+            None => Err(GitHubError::Uncertain(format!(
+                "GitHub did not confirm pull request {pull_request} is ready for review"
+            ))),
+        }
     }
 
     /// Whether `pull_request` is still a draft.
@@ -351,6 +361,47 @@ mod tests {
         let body = r#"{"data":{"repository":{"pullRequest":null}}}"#;
         let (url, _) = serve(vec![("200 OK", body)]).await;
         let result = client(&url).mark_pull_request_ready(&pr(5)).await;
+        assert!(matches!(result, Err(GitHubError::Failed(_))));
+    }
+
+    async fn mark_ready_with(body: &'static str) -> Result<(), GitHubError> {
+        let (url, _) = serve(vec![("200 OK", DRAFT), ("200 OK", body)]).await;
+        client(&url).mark_pull_request_ready(&pr(5)).await
+    }
+
+    #[tokio::test]
+    async fn mark_ready_without_confirmation_is_uncertain() {
+        for body in [
+            r#"{"data":{}}"#,
+            r#"{"data":{"markPullRequestReadyForReview":null}}"#,
+            r#"{"data":{"markPullRequestReadyForReview":{"pullRequest":null}}}"#,
+            r#"{"data":{"markPullRequestReadyForReview":{"pullRequest":{}}}}"#,
+            r#"{"data":{"markPullRequestReadyForReview":{"pullRequest":{"isDraft":"no"}}}}"#,
+        ] {
+            let result = mark_ready_with(body).await;
+            assert!(matches!(result, Err(GitHubError::Uncertain(_))), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_ready_still_draft_is_failed() {
+        let body = r#"{"data":{"markPullRequestReadyForReview":{"pullRequest":{"isDraft":true}}}}"#;
+        let error = mark_ready_with(body).await.unwrap_err();
+        assert!(matches!(error, GitHubError::Failed(_)), "{error}");
+        assert!(error.to_string().contains("still a draft"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn mark_ready_internal_error_is_uncertain() {
+        let body = r#"{"data":{"markPullRequestReadyForReview":null},"errors":[{"message":"Something went wrong","path":["markPullRequestReadyForReview"]}]}"#;
+        let result = mark_ready_with(body).await;
+        assert!(matches!(result, Err(GitHubError::Uncertain(_))));
+    }
+
+    #[tokio::test]
+    async fn mark_ready_rejection_is_failed() {
+        let body = r#"{"data":{"markPullRequestReadyForReview":null},"errors":[{"type":"FORBIDDEN","message":"Resource not accessible by integration","path":["markPullRequestReadyForReview"]}]}"#;
+        let result = mark_ready_with(body).await;
         assert!(matches!(result, Err(GitHubError::Failed(_))));
     }
 
