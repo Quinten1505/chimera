@@ -76,6 +76,8 @@ pub(crate) fn create_feature_branch(
         }
     }
 
+    // Before pushing, so the push also records the tracking ref.
+    ensure_fetch_mapping(runner, dir, name)?;
     if remote.is_some() {
         if local.is_none() {
             runner.run(dir, &["branch", name, &base_tip], Effect::Local)?;
@@ -104,6 +106,49 @@ pub(crate) fn create_feature_branch(
         )?;
     }
     Ok(())
+}
+
+/// Adds `+refs/heads/<name>:refs/remotes/origin/<name>` to `remote.origin.fetch` unless a configured
+/// refspec already maps the branch there, so `<name>@{upstream}` resolves and an ordinary
+/// `git fetch` keeps the tracking ref current in narrow-refspec (e.g. single-branch) clones.
+fn ensure_fetch_mapping(runner: &Runner, dir: &Path, name: &str) -> Result<(), GitError> {
+    // Unlike `--get-all`, `--list` succeeds when the key is unset.
+    let output = runner.run(dir, &["config", "-z", "--list"], Effect::Read)?;
+    let source = format!("refs/heads/{name}");
+    let tracking = format!("refs/remotes/origin/{name}");
+    let mapped = output
+        .stdout
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("remote.origin.fetch\n"))
+        .any(|refspec| maps_to(refspec, &source).as_deref() == Some(tracking.as_str()));
+    if !mapped {
+        runner.run(
+            dir,
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                &format!("+{source}:{tracking}"),
+            ],
+            Effect::Local,
+        )?;
+    }
+    Ok(())
+}
+
+/// The destination a fetch refspec maps `source` to, if it covers it. Negative refspecs map
+/// nothing.
+fn maps_to(refspec: &str, source: &str) -> Option<String> {
+    let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
+    let (src, dst) = refspec.split_once(':')?;
+    match (src.split_once('*'), dst.split_once('*')) {
+        (None, None) => (src == source).then(|| dst.to_owned()),
+        (Some((prefix, suffix)), Some((dst_prefix, dst_suffix))) => {
+            let matched = source.strip_prefix(prefix)?.strip_suffix(suffix)?;
+            Some(format!("{dst_prefix}{matched}{dst_suffix}"))
+        }
+        _ => None,
+    }
 }
 
 /// Fetches every branch of `origin` into its tracking ref, independent of the configured fetch
@@ -422,8 +467,68 @@ mod tests {
         create_feature_branch(&runner, &clone, &name("f"), &name("main")).unwrap();
         create_feature_branch(&runner, &clone, &name("f"), &name("main")).unwrap();
         assert_eq!(remote_head(&repo, "f"), remote_head(&repo, "main"));
-        assert_eq!(git(&clone, &["config", "branch.f.remote"]), "origin");
-        assert_eq!(git(&clone, &["config", "branch.f.merge"]), "refs/heads/f");
+        assert_eq!(
+            git(&clone, &["rev-parse", "--abbrev-ref", "f@{upstream}"]),
+            "origin/f"
+        );
+        // Added once, alongside the clone's own mapping.
+        assert_eq!(
+            git(&clone, &["config", "--get-all", "remote.origin.fetch"]),
+            "+refs/heads/main:refs/remotes/origin/main\n+refs/heads/f:refs/remotes/origin/f"
+        );
+
+        // An ordinary fetch refreshes the tracking ref after the remote branch advances.
+        let other = repo.clone_origin("other");
+        git(&other, &["checkout", "f"]);
+        repo.commit_file(&other, "advance.txt", "advance");
+        git(&other, &["push", "origin", "f"]);
+        git(&clone, &["fetch", "origin"]);
+        assert_eq!(
+            git(&clone, &["rev-parse", "f@{upstream}"]),
+            remote_head(&repo, "f")
+        );
+    }
+
+    #[test]
+    fn adopting_in_single_branch_clone_tracks_upstream() {
+        let repo = TestRepo::new();
+        create_feature_branch(&Runner::new(), repo.work(), &name("f"), &name("main")).unwrap();
+        let clone = repo.work().join("../single");
+        git(
+            repo.work(),
+            &[
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                repo.origin().to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        create_feature_branch(&Runner::new(), &clone, &name("f"), &name("main")).unwrap();
+        assert_eq!(
+            git(&clone, &["rev-parse", "--abbrev-ref", "f@{upstream}"]),
+            "origin/f"
+        );
+        let other = repo.clone_origin("other");
+        git(&other, &["checkout", "f"]);
+        repo.commit_file(&other, "advance.txt", "advance");
+        git(&other, &["push", "origin", "f"]);
+        git(&clone, &["fetch", "origin"]);
+        assert_eq!(
+            git(&clone, &["rev-parse", "f@{upstream}"]),
+            remote_head(&repo, "f")
+        );
+    }
+
+    #[test]
+    fn full_clone_fetch_refspecs_are_unchanged() {
+        let repo = TestRepo::new();
+        create_feature_branch(&Runner::new(), repo.work(), &name("f"), &name("main")).unwrap();
+        assert_eq!(
+            git(repo.work(), &["config", "--get-all", "remote.origin.fetch"]),
+            "+refs/heads/*:refs/remotes/origin/*"
+        );
     }
 
     #[test]
