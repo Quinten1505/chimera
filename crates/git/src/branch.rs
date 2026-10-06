@@ -80,10 +80,16 @@ pub(crate) fn create_feature_branch(
         if local.is_none() {
             runner.run(dir, &["branch", name, &base_tip], Effect::Local)?;
         }
-        let upstream = format!("origin/{name}");
+        // What `push --set-upstream` records; `branch --set-upstream-to` instead needs a
+        // tracking ref covered by the configured fetch refspecs.
         runner.run(
             dir,
-            &["branch", "--set-upstream-to", &upstream, name],
+            &["config", &format!("branch.{name}.remote"), "origin"],
+            Effect::Local,
+        )?;
+        runner.run(
+            dir,
+            &["config", &format!("branch.{name}.merge"), &local_ref_name],
             Effect::Local,
         )?;
     } else {
@@ -100,9 +106,19 @@ pub(crate) fn create_feature_branch(
     Ok(())
 }
 
-/// Fetches `origin`, pruning tracking refs for branches deleted on the remote.
+/// Fetches every branch of `origin` into its tracking ref, independent of the configured fetch
+/// refspecs, pruning tracking refs for branches deleted on the remote.
 fn fetch(runner: &Runner, dir: &Path) -> Result<(), GitError> {
-    runner.run(dir, &["fetch", "--prune", "origin"], Effect::Read)?;
+    runner.run(
+        dir,
+        &[
+            "fetch",
+            "--prune",
+            "origin",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+        Effect::Read,
+    )?;
     Ok(())
 }
 
@@ -367,6 +383,47 @@ mod tests {
             .unwrap_err();
         assert!(!error.is_uncertain());
         assert!(error.to_string().contains("expected"));
+    }
+
+    #[test]
+    fn base_is_develop_outside_configured_refspec() {
+        let repo = TestRepo::new();
+        git(
+            repo.work(),
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+        );
+        git(repo.work(), &["push", "origin", "main:develop"]);
+        let base = resolve_base_branch(&Runner::new(), repo.work()).unwrap();
+        assert_eq!(base, name("develop"));
+        create_feature_branch(&Runner::new(), repo.work(), &name("f"), &base).unwrap();
+        assert_eq!(remote_head(&repo, "f"), remote_head(&repo, "develop"));
+    }
+
+    #[test]
+    fn creating_twice_in_single_branch_clone_succeeds() {
+        let repo = TestRepo::new();
+        let clone = repo.work().join("../single");
+        git(
+            repo.work(),
+            &[
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                repo.origin().to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        let runner = Runner::new();
+        create_feature_branch(&runner, &clone, &name("f"), &name("main")).unwrap();
+        create_feature_branch(&runner, &clone, &name("f"), &name("main")).unwrap();
+        assert_eq!(remote_head(&repo, "f"), remote_head(&repo, "main"));
+        assert_eq!(git(&clone, &["config", "branch.f.remote"]), "origin");
+        assert_eq!(git(&clone, &["config", "branch.f.merge"]), "refs/heads/f");
     }
 
     #[test]
