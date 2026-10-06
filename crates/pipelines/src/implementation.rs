@@ -4,8 +4,8 @@ use chimera_core::error::PortError;
 use chimera_core::repository::Repository;
 use chimera_core::run_store::RunStore;
 use chimera_core::{
-    AgentConfiguration, AgentId, CommitId, IssueRef, MergedOk, Outcome, Role, RunId, TurnOutcome,
-    TurnResult, WorkItem,
+    AgentConfiguration, AgentId, BranchName, CommitId, IssueRef, MergedOk, Outcome, Role, RunId,
+    TurnOutcome, TurnResult, WorkItem,
 };
 use serde::{Deserialize, Serialize};
 
@@ -553,7 +553,7 @@ impl ImplementationPipeline {
     }
 
     fn expected_head_key(&self) -> String {
-        format!("remote_head:{}", self.spec.feature)
+        expected_head_key(&self.spec.feature)
     }
 
     /// The remote head of the feature branch as Chimera last knew it, shared by all instances.
@@ -654,6 +654,11 @@ impl ImplementationPipeline {
         cleaned?;
         Ok(ImplementationState::Done(MergedOk { commit: merged }))
     }
+}
+
+/// Where the verified remote head of `feature` is saved, shared by every pipeline that works on it.
+pub(crate) fn expected_head_key(feature: &BranchName) -> String {
+    format!("remote_head:{feature}")
 }
 
 /// The valid results of a history with the role that produced each, oldest first.
