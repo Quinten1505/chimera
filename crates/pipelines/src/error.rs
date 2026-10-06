@@ -11,6 +11,12 @@ pub enum PipelineError {
     /// A pipeline state could not be converted to or from its stored form.
     #[error("pipeline state could not be (de)serialized: {0}")]
     State(#[from] serde_json::Error),
+    /// The run is paused, so no agent may be started.
+    #[error("the run is paused: {0:?}")]
+    Paused(PauseReason),
+    /// An environment operation does not apply to the environment as it is.
+    #[error("environment: {0}")]
+    Environment(String),
 }
 
 impl PipelineError {
