@@ -1,0 +1,288 @@
+//! Per-task worktrees: create, remove and prune.
+
+use std::path::{Path, PathBuf};
+
+use crate::error::GitError;
+use crate::runner::{Effect, Runner};
+
+/// Creates the worktree for `task_branch` at `path` and returns the path.
+///
+/// A missing `task_branch` is created from the latest `origin/<feature>` after a fetch; an
+/// existing one is reused as is. A worktree already at `path` on `task_branch` is left alone.
+pub(crate) fn create(
+    runner: &Runner,
+    repo: &Path,
+    path: &Path,
+    task_branch: &str,
+    feature: &str,
+) -> Result<PathBuf, GitError> {
+    let branch_ref = format!("refs/heads/{task_branch}");
+    if let Some(existing) = registered(runner, repo)?
+        .into_iter()
+        .find(|worktree| same_path(&worktree.path, path))
+        && existing.branch.as_deref() == Some(branch_ref.as_str())
+        && path.exists()
+    {
+        return Ok(path.to_path_buf());
+    }
+    let path_arg = path.to_string_lossy();
+    if branch_exists(runner, repo, &branch_ref)? {
+        runner.run(
+            repo,
+            &["worktree", "add", &path_arg, task_branch],
+            Effect::Local,
+        )?;
+    } else {
+        let refspec = format!("+refs/heads/{feature}:refs/remotes/origin/{feature}");
+        runner.run(repo, &["fetch", "origin", &refspec], Effect::Local)?;
+        let start = format!("origin/{feature}");
+        runner.run(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--no-track",
+                "-b",
+                task_branch,
+                &path_arg,
+                &start,
+            ],
+            Effect::Local,
+        )?;
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Removes the worktree at `path`, then force-deletes `task_branch`. Either already being gone
+/// is not an error.
+pub(crate) fn remove(
+    runner: &Runner,
+    repo: &Path,
+    path: &Path,
+    task_branch: &str,
+) -> Result<(), GitError> {
+    if registered(runner, repo)?
+        .iter()
+        .any(|worktree| same_path(&worktree.path, path))
+    {
+        if path.exists() {
+            runner.run(
+                repo,
+                &["worktree", "remove", "--force", &path.to_string_lossy()],
+                Effect::Local,
+            )?;
+        } else {
+            prune(runner, repo)?;
+        }
+    }
+    let branch_ref = format!("refs/heads/{task_branch}");
+    if branch_exists(runner, repo, &branch_ref)? {
+        runner.run(repo, &["branch", "-D", task_branch], Effect::Local)?;
+    }
+    Ok(())
+}
+
+/// Removes metadata of worktrees whose directories no longer exist.
+pub(crate) fn prune(runner: &Runner, repo: &Path) -> Result<(), GitError> {
+    runner.run(repo, &["worktree", "prune"], Effect::Local)?;
+    Ok(())
+}
+
+struct Worktree {
+    path: PathBuf,
+    /// Full ref name, `None` when detached.
+    branch: Option<String>,
+}
+
+fn registered(runner: &Runner, repo: &Path) -> Result<Vec<Worktree>, GitError> {
+    let output = runner.run(repo, &["worktree", "list", "--porcelain"], Effect::Read)?;
+    let mut worktrees: Vec<Worktree> = Vec::new();
+    for line in output.stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            worktrees.push(Worktree {
+                path: PathBuf::from(path),
+                branch: None,
+            });
+        } else if let Some(branch) = line.strip_prefix("branch ")
+            && let Some(last) = worktrees.last_mut()
+        {
+            last.branch = Some(branch.to_owned());
+        }
+    }
+    Ok(worktrees)
+}
+
+fn branch_exists(runner: &Runner, repo: &Path, branch_ref: &str) -> Result<bool, GitError> {
+    let output = runner.run(
+        repo,
+        &["for-each-ref", "--format=%(refname)", branch_ref],
+        Effect::Read,
+    )?;
+    Ok(!output.stdout.trim().is_empty())
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    resolve(a) == resolve(b)
+}
+
+/// Canonicalizes `path`, or just its parent when `path` itself no longer exists.
+fn resolve(path: &Path) -> PathBuf {
+    if let Ok(resolved) = path.canonicalize() {
+        return resolved;
+    }
+    match (
+        path.parent().and_then(|p| p.canonicalize().ok()),
+        path.file_name(),
+    ) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::TestRepo;
+
+    fn rev(dir: &Path, rev: &str) -> String {
+        Runner::new()
+            .run(dir, &["rev-parse", rev], Effect::Read)
+            .unwrap()
+            .stdout
+            .trim()
+            .to_owned()
+    }
+
+    fn branch_exists_in(repo: &TestRepo, name: &str) -> bool {
+        branch_exists(&Runner::new(), repo.work(), &format!("refs/heads/{name}")).unwrap()
+    }
+
+    /// A repository whose remote has a `feature` branch ahead of the local one.
+    fn repo_with_feature() -> (TestRepo, PathBuf) {
+        let repo = TestRepo::new();
+        let other = repo.clone_origin("other");
+        let git = |args: &[&str]| {
+            Runner::new().run(&other, args, Effect::Local).unwrap();
+        };
+        git(&["checkout", "-b", "feature"]);
+        repo.commit_file(&other, "f.txt", "feature");
+        git(&["push", "origin", "feature"]);
+        let path = repo.work().join("../wt-task");
+        (repo, path)
+    }
+
+    #[test]
+    fn create_branches_from_remote_feature_head() {
+        let (repo, path) = repo_with_feature();
+        let created = create(&Runner::new(), repo.work(), &path, "task/a", "feature").unwrap();
+        assert_eq!(created, path);
+        assert!(path.join("f.txt").exists());
+        assert_eq!(rev(&path, "HEAD"), rev(&repo.origin(), "feature"));
+        assert_eq!(rev(repo.work(), "task/a"), rev(&repo.origin(), "feature"));
+    }
+
+    #[test]
+    fn create_twice_succeeds() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        let head = rev(&path, "HEAD");
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        assert_eq!(rev(&path, "HEAD"), head);
+    }
+
+    #[test]
+    fn create_reuses_existing_task_branch() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        runner
+            .run(repo.work(), &["branch", "task/a", "main"], Effect::Local)
+            .unwrap();
+        let main = rev(repo.work(), "main");
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        assert_eq!(rev(&path, "HEAD"), main);
+        assert!(!path.join("f.txt").exists());
+    }
+
+    #[test]
+    fn create_at_path_occupied_by_other_branch_fails() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        let error = create(&runner, repo.work(), &path, "task/b", "feature").unwrap_err();
+        assert!(matches!(error, GitError::Failed { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn create_at_non_empty_directory_fails() {
+        let (repo, path) = repo_with_feature();
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("x"), "x").unwrap();
+        let error = create(&Runner::new(), repo.work(), &path, "task/a", "feature").unwrap_err();
+        assert!(matches!(error, GitError::Failed { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn create_with_branch_checked_out_elsewhere_fails() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        let second = repo.work().join("../wt-second");
+        let error = create(&runner, repo.work(), &second, "task/a", "feature").unwrap_err();
+        assert!(matches!(error, GitError::Failed { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn remove_deletes_directory_and_task_branch() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        // Unmerged and uncommitted work does not block removal.
+        repo.commit_file(&path, "t.txt", "task");
+        std::fs::write(path.join("dirty.txt"), "dirty").unwrap();
+        remove(&runner, repo.work(), &path, "task/a").unwrap();
+        assert!(!path.exists());
+        assert!(!branch_exists_in(&repo, "task/a"));
+        assert!(registered(&runner, repo.work()).unwrap().len() == 1);
+    }
+
+    #[test]
+    fn remove_missing_worktree_succeeds() {
+        let (repo, path) = repo_with_feature();
+        remove(&Runner::new(), repo.work(), &path, "task/a").unwrap();
+    }
+
+    #[test]
+    fn remove_after_directory_deleted_manually_succeeds() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        remove(&runner, repo.work(), &path, "task/a").unwrap();
+        assert!(!branch_exists_in(&repo, "task/a"));
+    }
+
+    #[test]
+    fn prune_drops_metadata_of_deleted_worktree() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        assert_eq!(registered(&runner, repo.work()).unwrap().len(), 2);
+        prune(&runner, repo.work()).unwrap();
+        assert_eq!(registered(&runner, repo.work()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_with_nothing_to_prune_succeeds() {
+        let repo = TestRepo::new();
+        prune(&Runner::new(), repo.work()).unwrap();
+    }
+
+    #[test]
+    fn task_branch_is_never_pushed() {
+        let (repo, path) = repo_with_feature();
+        create(&Runner::new(), repo.work(), &path, "task/a", "feature").unwrap();
+        assert!(!branch_exists(&Runner::new(), &repo.origin(), "refs/heads/task/a").unwrap());
+    }
+}

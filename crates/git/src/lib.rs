@@ -10,5 +10,8 @@ mod remote_head;
 mod runner;
 #[cfg(test)]
 mod testing;
+// Unused until the adapter wires the operations into `Repository`.
+#[allow(dead_code)]
+mod worktree;
 
 pub use error::GitError;
