@@ -10,7 +10,7 @@ modules in a Cargo workspace. All modules run in the same process.
 | `src/main.rs` | Composition root: load configuration, construct modules, and start the application. |
 | `crates/core` | Shared application concepts. |
 | `crates/herdr` | Herdr client: connection, workspace, pane, session, and agent operations. |
-| `crates/workflow` | Workflow use cases and orchestration. |
+| `crates/pipelines` | The four orchestration pipelines and the shared services. |
 | `crates/github` | GitHub integration and translation between GitHub data and domain concepts. |
 | `crates/configuration` | Loading and validating application settings. |
 
@@ -29,18 +29,18 @@ The initial dependency graph is:
 ```text
 chimera (executable)
   -> core
-  -> workflow -> core
+  -> pipelines -> core
   -> github -> core
   -> configuration
 ```
 
-Core and configuration have no internal dependencies. Workflow and GitHub may
+Core and configuration have no internal dependencies. Pipelines and GitHub may
 use core, but do not depend on each other. The executable owns module assembly
 and passes configuration into the modules that need it. Introduce interfaces
 for cross-module behavior when concrete use cases require them, keeping this
 dependency direction and avoiding cycles.
 
-Workflow and GitHub remain scaffolds. Configuration loads Codex settings from YAML. The `crates/herdr` crate provides the Herdr
+Pipelines and GitHub remain scaffolds. Configuration loads Codex settings from YAML. The `crates/herdr` crate provides the Herdr
 client below. The executable retains its initial hello-world output.
 
 ## Development
@@ -58,7 +58,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 All five packages are default workspace members, so plain `cargo build` and
 `cargo test` also include every module. Run a focused module check with, for
-example, `cargo test -p chimera-workflow`. The deployable binary is
+example, `cargo test -p chimera-pipelines`. The deployable binary is
 `target/release/chimera` after `cargo build --release -p chimera`.
 
 ## Herdr integration
