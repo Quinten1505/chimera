@@ -359,6 +359,8 @@ impl EnvironmentService {
     /// Launches `role`'s agent again in its pane after it is `Gone`, consuming one agent
     /// recovery from the policy. The consumed budget, or the pause its exhaustion caused, is
     /// saved under `run` before the launch, so a restart cannot relaunch on a restored budget.
+    /// An agent that is not gone was already launched again, by a launch whose response or
+    /// saved progress was lost, so nothing is launched.
     pub async fn relaunch(
         &self,
         store: &dyn RunStore,
@@ -371,9 +373,7 @@ impl EnvironmentService {
             PipelineError::Environment(format!("no agent for role {role:?} in this environment"))
         })?;
         if self.terminal.read_status(pane).await? != TurnStatus::Gone {
-            return Err(PipelineError::Environment(format!(
-                "the {role:?} agent is not gone"
-            )));
+            return Ok(());
         }
         let permit = self.policy.permit_retry(
             Budget::AgentRecovery,
@@ -829,13 +829,13 @@ mod tests {
         let pane = environment.pane(Role::Review).unwrap().clone();
         let store = FakeRunStore::new();
 
-        let error =
-            block_on(
-                f.service
-                    .relaunch(&store, &run(), &environment, Role::Review, "again"),
-            )
-            .unwrap_err();
-        assert!(matches!(error, PipelineError::Environment(_)));
+        // An agent that is not gone is not launched again.
+        block_on(
+            f.service
+                .relaunch(&store, &run(), &environment, Role::Review, "again"),
+        )
+        .unwrap();
+        assert_eq!(f.terminal.count("launch"), 3);
         assert_eq!(f.policy.snapshot().agent_recovery_remaining, 1);
 
         f.terminal.inner.script_statuses(&pane, [TurnStatus::Gone]);

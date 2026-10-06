@@ -273,6 +273,30 @@ impl ImplementationPipeline {
         Ok(Ok(Progress::Continue))
     }
 
+    /// Launches the gone agent of `role` again, unless the agent shows that an earlier launch
+    /// happened, then drops the turn it lost: the new agent gets a fresh assignment.
+    async fn relaunch(&self, pending: &mut Pending, role: Role) -> Result<(), PipelineError> {
+        let environment = self.load_environment().await?;
+        let command_line = &self
+            .spec
+            .agents
+            .iter()
+            .find(|launch| launch.role == role)
+            .ok_or_else(|| PipelineError::Environment(format!("no {role:?} launch in spec")))?
+            .command_line;
+        self.environment
+            .relaunch(
+                self.store.as_ref(),
+                &self.run,
+                &environment,
+                role,
+                command_line,
+            )
+            .await?;
+        pending.turn = None;
+        self.save_pending(pending).await
+    }
+
     /// Performs the sender reset that is owed, if any, as a step of its own: a turn moves on
     /// only once the agent that handed it over has been cleared.
     async fn owed_reset_step(&self, pending: &mut Pending) -> Result<bool, PipelineError> {
@@ -367,6 +391,13 @@ impl ImplementationPipeline {
             previous,
             remember,
         } = plan;
+        let relaunching = pending.turn.as_ref().is_some_and(|turn| {
+            turn.role == role && turn.cycle == cycle && turn.phase == TurnPhase::Relaunching
+        });
+        if relaunching {
+            self.relaunch(pending, role).await?;
+            return Ok(Err(state));
+        }
         if used > limit as usize {
             return Ok(Err(paused(PauseReason::LimitExhausted, state)));
         }
@@ -435,26 +466,13 @@ impl ImplementationPipeline {
                 Ok(Ok(outcome))
             }
             Err(TurnError::AgentLost) => {
-                let command_line = &self
-                    .spec
-                    .agents
-                    .iter()
-                    .find(|launch| launch.role == role)
-                    .ok_or_else(|| {
-                        PipelineError::Environment(format!("no {role:?} launch in spec"))
-                    })?
-                    .command_line;
-                self.environment
-                    .relaunch(
-                        self.store.as_ref(),
-                        &self.run,
-                        &environment,
-                        role,
-                        command_line,
-                    )
-                    .await?;
-                pending.turn = None;
+                // Saved before the launch, so that a restart reconciles the launch instead of
+                // collecting the lost turn from whatever agent the pane holds.
+                if let Some(turn) = pending.turn.as_mut() {
+                    turn.phase = TurnPhase::Relaunching;
+                }
                 self.save_pending(pending).await?;
+                self.relaunch(pending, role).await?;
                 Ok(Err(state))
             }
             Err(TurnError::CorrectionsExhausted { .. }) => {
@@ -789,6 +807,9 @@ enum TurnPhase {
     /// A correction is being sent: it may or may not have been delivered, which the pane's
     /// receipt tells.
     Correcting,
+    /// The agent was found gone and is being launched again: whether the launch happened is
+    /// read from the agent's status. The turn starts over with the new agent.
+    Relaunching,
 }
 
 fn paused(reason: PauseReason, resume_at: ImplementationState) -> ImplementationState {
@@ -906,6 +927,8 @@ mod tests {
         sent: Mutex<HashMap<PaneId, Vec<String>>>,
         /// Fails the next launch, as a lost connection would.
         fail_launch: Mutex<Option<PortError>>,
+        /// Fails the next launch after it started the agent, as a lost response would.
+        fail_after_launch: Mutex<Option<PortError>>,
         /// Moves the remote feature branch when the merge agent next reports a push.
         push: Mutex<Option<(Arc<FakeRepository>, CommitId)>>,
     }
@@ -937,7 +960,11 @@ mod tests {
                 return Err(error);
             }
             self.gone.lock().unwrap().remove(pane);
-            self.inner.launch_agent(pane, command_line).await
+            self.inner.launch_agent(pane, command_line).await?;
+            match self.fail_after_launch.lock().unwrap().take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
         async fn send_prompt(&self, pane: &PaneId, prompt: &str) -> Result<(), PortError> {
             if prompt == "/clear"
@@ -1057,6 +1084,7 @@ mod tests {
             fail_correction_after_send: Mutex::default(),
             sent: Mutex::default(),
             fail_launch: Mutex::default(),
+            fail_after_launch: Mutex::default(),
             push: Mutex::default(),
         });
         let store = other.map_or_else(|| Arc::new(CrashingStore::default()), |f| f.store.clone());
@@ -1537,6 +1565,88 @@ mod tests {
             Err(PauseReason::AgentRecoveryExhausted)
         );
         assert_eq!(restored.snapshot().agent_recovery_remaining, 0);
+    }
+
+    /// The implementer is found gone after its assignment and the step that relaunches it is
+    /// interrupted after the launch: its response is lost, or the process stops before the
+    /// lost turn is dropped. The idle new agent's pane still shows the old result.
+    async fn interrupted_relaunch(lose_response: bool) -> Fixture {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        f.script(Role::Implementation, &[READY, READY]).await;
+        f.script(Role::Review, &[APPROVED]).await;
+        let pane = f.pane(Role::Implementation).await;
+        let implementing = ImplementationState::Implementing { cycle: 1 };
+        f.pipeline.step(implementing.clone()).await.unwrap();
+        f.terminal.gone.lock().unwrap().insert(pane);
+        if lose_response {
+            *f.terminal.fail_after_launch.lock().unwrap() = Some(PortError::uncertain("lost"));
+        } else {
+            // The phase, the consumed recovery, then the dropped turn.
+            f.store.crash_at(Some(f.store.writes() + 3));
+        }
+
+        assert!(f.pipeline.step(implementing).await.is_err());
+        f.store.crash_at(None);
+        assert_eq!(*f.terminal.launches.lock().unwrap(), 4);
+        let turn = f.pipeline.load_pending().await.unwrap().turn.unwrap();
+        assert_eq!(turn.phase, TurnPhase::Relaunching);
+        f
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_relaunch_is_reconciled_and_the_new_agent_is_assigned_afresh() {
+        for lose_response in [true, false] {
+            let f = interrupted_relaunch(lose_response).await;
+
+            assert_eq!(
+                f.drive().await.unwrap(),
+                ImplementationState::WaitingForMerge,
+                "{lose_response}"
+            );
+
+            // Not launched again, and the old result was not taken for the new agent's.
+            assert_eq!(*f.terminal.launches.lock().unwrap(), 4, "{lose_response}");
+            let sent = f.prompts(Role::Implementation).await;
+            assert_eq!(
+                assignments(&sent, "implementer").len(),
+                2,
+                "{lose_response}"
+            );
+            let restored =
+                Policy::load_or_new(f.store.as_ref(), &f.pipeline.run, &Limits::default())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                restored.snapshot().agent_recovery_remaining,
+                Limits::default().agent_recovery - 1,
+                "{lose_response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relaunch_that_did_not_happen_is_retried_with_another_recovery() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        f.script(Role::Implementation, &[READY, READY]).await;
+        f.script(Role::Review, &[APPROVED]).await;
+        let pane = f.pane(Role::Implementation).await;
+        let implementing = ImplementationState::Implementing { cycle: 1 };
+        f.pipeline.step(implementing.clone()).await.unwrap();
+        f.terminal.gone.lock().unwrap().insert(pane);
+        *f.terminal.fail_launch.lock().unwrap() = Some(PortError::uncertain("lost"));
+        assert!(f.pipeline.step(implementing).await.is_err());
+
+        assert_eq!(
+            f.drive().await.unwrap(),
+            ImplementationState::WaitingForMerge
+        );
+        assert_eq!(*f.terminal.launches.lock().unwrap(), 5);
+        assert_eq!(
+            f.policy.snapshot().agent_recovery_remaining,
+            Limits::default().agent_recovery - 2
+        );
+        let sent = f.prompts(Role::Implementation).await;
+        assert_eq!(assignments(&sent, "implementer").len(), 2);
     }
 
     fn assignments(prompts: &[String], who: &str) -> Vec<String> {

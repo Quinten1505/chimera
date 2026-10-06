@@ -187,6 +187,9 @@ enum TurnPhase {
     /// A correction is being sent: it may or may not have been delivered, which the pane's
     /// receipt tells.
     Correcting,
+    /// The agent was found gone and is being launched again: whether the launch happened is
+    /// read from the agent's status. The turn starts over with the new agent.
+    Relaunching,
 }
 
 fn paused(reason: PauseReason, resume_at: PrReviewState) -> PrReviewState {
@@ -360,6 +363,13 @@ impl<I: Implement> PrReviewPipeline<I> {
             .load_pending()
             .await?
             .filter(|pending| pending.cycle == cycle);
+        if existing
+            .as_ref()
+            .is_some_and(|turn| turn.phase == TurnPhase::Relaunching)
+        {
+            self.relaunch(cycle).await?;
+            return Ok(Err(state.clone()));
+        }
         let invalid = |history: &[TurnResult]| {
             history
                 .iter()
@@ -419,7 +429,7 @@ impl<I: Implement> PrReviewPipeline<I> {
             } else {
                 match self.turns.delivered(pane, turn.received_before).await {
                     Ok(delivered) => delivered,
-                    Err(error) => return self.turn_failed(error, state, &environment).await,
+                    Err(error) => return self.turn_failed(error, state, cycle).await,
                 }
             };
             if !delivered && let Err(error) = self.turns.send_assignment(&request).await {
@@ -427,7 +437,7 @@ impl<I: Implement> PrReviewPipeline<I> {
                 if !matches!(&error, TurnError::Port(port) if port.is_uncertain()) {
                     self.save_pending(None).await?;
                 }
-                return self.turn_failed(error, state, &environment).await;
+                return self.turn_failed(error, state, cycle).await;
             }
             turn.phase = TurnPhase::Awaiting;
             self.save_pending(Some(&turn)).await?;
@@ -441,14 +451,14 @@ impl<I: Implement> PrReviewPipeline<I> {
                 Ok(true) => turn.corrections += 1,
                 // Never arrived: the result it corrects is collected again and corrected below.
                 Ok(false) => {}
-                Err(error) => return self.turn_failed(error, state, &environment).await,
+                Err(error) => return self.turn_failed(error, state, cycle).await,
             }
             turn.phase = TurnPhase::Awaiting;
             self.save_pending(Some(&turn)).await?;
         }
         let collected = match self.turns.collect(&request).await {
             Ok(collected) => collected,
-            Err(error) => return self.turn_failed(error, state, &environment).await,
+            Err(error) => return self.turn_failed(error, state, cycle).await,
         };
         // A crash after the result was saved but before the phase moved on leaves the result in
         // the history: saving it again would count it twice.
@@ -484,32 +494,45 @@ impl<I: Implement> PrReviewPipeline<I> {
         Ok(Err(state.clone()))
     }
 
+    /// Launches the gone review agent of `cycle` again, unless the agent shows that an earlier
+    /// launch happened, then drops the turn it lost: the new agent gets a fresh assignment.
+    async fn relaunch(&self, cycle: u32) -> Result<(), PipelineError> {
+        let environment = self.load_environment(cycle).await?;
+        let command_line = &self
+            .spec
+            .agents
+            .iter()
+            .find(|launch| launch.role == Role::Review)
+            .ok_or_else(|| PipelineError::Environment("no review launch in spec".into()))?
+            .command_line;
+        self.environment
+            .relaunch(
+                self.store.as_ref(),
+                &self.run,
+                &environment,
+                Role::Review,
+                command_line,
+            )
+            .await?;
+        self.save_pending(None).await
+    }
+
     /// Recovers a lost agent, or reports why the turn cannot go on.
     async fn turn_failed(
         &self,
         error: TurnError,
         state: &PrReviewState,
-        environment: &Environment,
+        cycle: u32,
     ) -> Result<Result<Outcome, PrReviewState>, PipelineError> {
         match error {
             TurnError::AgentLost => {
-                let command_line = &self
-                    .spec
-                    .agents
-                    .iter()
-                    .find(|launch| launch.role == Role::Review)
-                    .ok_or_else(|| PipelineError::Environment("no review launch in spec".into()))?
-                    .command_line;
-                self.environment
-                    .relaunch(
-                        self.store.as_ref(),
-                        &self.run,
-                        environment,
-                        Role::Review,
-                        command_line,
-                    )
-                    .await?;
-                self.save_pending(None).await?;
+                // Saved before the launch, so that a restart reconciles the launch instead of
+                // collecting the lost turn from whatever agent the pane holds.
+                if let Some(mut turn) = self.load_pending().await? {
+                    turn.phase = TurnPhase::Relaunching;
+                    self.save_pending(Some(&turn)).await?;
+                }
+                self.relaunch(cycle).await?;
                 Ok(Err(state.clone()))
             }
             TurnError::CorrectionsExhausted { .. } => {
@@ -709,7 +732,7 @@ impl<I: Implement> PrReviewPipeline<I> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
     use std::path::Path;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -741,6 +764,10 @@ mod tests {
         sent: Mutex<Vec<String>>,
         /// Fails the next launch, as a lost connection would.
         fail_launch: Mutex<Option<PortError>>,
+        /// Fails the next launch after it started the agent, as a lost response would.
+        fail_after_launch: Mutex<Option<PortError>>,
+        /// Panes whose agent is gone until it is launched again.
+        gone: Mutex<HashSet<PaneId>>,
     }
 
     #[async_trait]
@@ -769,7 +796,12 @@ mod tests {
             if let Some(error) = self.fail_launch.lock().unwrap().take() {
                 return Err(error);
             }
-            self.inner.launch_agent(pane, command_line).await
+            self.gone.lock().unwrap().remove(pane);
+            self.inner.launch_agent(pane, command_line).await?;
+            match self.fail_after_launch.lock().unwrap().take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
         async fn send_prompt(&self, pane: &PaneId, prompt: &str) -> Result<(), PortError> {
             if let Some(reply) = self.replies.lock().unwrap().pop_front() {
@@ -783,6 +815,9 @@ mod tests {
             self.inner.prompts_received(pane).await
         }
         async fn read_status(&self, pane: &PaneId) -> Result<TurnStatus, PortError> {
+            if self.gone.lock().unwrap().contains(pane) {
+                return Ok(TurnStatus::Gone);
+            }
             self.inner.read_status(pane).await
         }
         async fn read_output(&self, pane: &PaneId) -> Result<String, PortError> {
@@ -875,6 +910,8 @@ mod tests {
                 launches: Mutex::new(0),
                 sent: Mutex::default(),
                 fail_launch: Mutex::default(),
+                fail_after_launch: Mutex::default(),
+                gone: Mutex::default(),
             }),
             implement: Arc::new(FakeImplement {
                 store: store.clone(),
@@ -1034,6 +1071,94 @@ mod tests {
         assert_eq!(
             restored.snapshot().agent_recovery_remaining,
             Limits::default().agent_recovery - 1
+        );
+    }
+
+    /// Starts the first review, then finds its agent gone; the step that relaunches it is
+    /// interrupted after the launch, its response lost. The idle new agent's pane still shows
+    /// the old result.
+    fn interrupted_relaunch(f: &Fixture) {
+        let pipeline = f.pipeline();
+        let reviewing = block_on(next_state(&pipeline, pipeline.initial_state()));
+        assert_eq!(
+            block_on(pipeline.step(reviewing.clone())).unwrap(),
+            reviewing
+        );
+        let environment = block_on(pipeline.load_environment(1)).unwrap();
+        let pane = environment.pane(Role::Review).unwrap().clone();
+        f.terminal.gone.lock().unwrap().insert(pane);
+        *f.terminal.fail_after_launch.lock().unwrap() = Some(PortError::uncertain("lost"));
+
+        assert!(
+            block_on(pipeline.step(reviewing))
+                .unwrap_err()
+                .is_uncertain()
+        );
+        let turn = block_on(pipeline.load_pending()).unwrap().unwrap();
+        assert_eq!(turn.phase, TurnPhase::Relaunching);
+    }
+
+    #[test]
+    fn a_relaunch_whose_response_was_lost_is_reconciled_and_assigned_afresh() {
+        let f = fixture(5, &[FINDINGS, APPROVED]);
+        interrupted_relaunch(&f);
+
+        assert_eq!(
+            block_on(f.drive_resumed(PrReviewState::Reviewing { cycle: 1 })),
+            ready()
+        );
+
+        // Launched once to provision and once to recover; the stale findings were not taken
+        // for the new agent's review.
+        assert_eq!(*f.terminal.launches.lock().unwrap(), 2);
+        assert_eq!(f.review_prompts().len(), 2);
+        assert!(f.implement.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            block_on(saved_policy(&f))
+                .snapshot()
+                .agent_recovery_remaining,
+            Limits::default().agent_recovery - 1
+        );
+    }
+
+    #[test]
+    fn a_crash_after_the_relaunch_before_the_turn_is_dropped_assigns_afresh() {
+        let f = fixture(5, &[APPROVED]);
+        let pipeline = f.pipeline();
+        block_on(async {
+            next_state(&pipeline, PrReviewState::Provisioning { cycle: 1 }).await;
+            let environment = pipeline.load_environment(1).await.unwrap();
+            let pane = environment.pane(Role::Review).unwrap().clone();
+            // The relaunched agent is idle; the pane shows the lost turn's findings.
+            f.terminal.inner.script_output(&pane, FINDINGS);
+            f.terminal
+                .inner
+                .script_statuses(&pane, [TurnStatus::Finished]);
+            pipeline
+                .save_pending(Some(&PendingTurn {
+                    cycle: 1,
+                    received_before: 0,
+                    invalid_before: 0,
+                    corrections: 0,
+                    phase: TurnPhase::Relaunching,
+                }))
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(
+            block_on(f.drive_resumed(PrReviewState::Reviewing { cycle: 1 })),
+            ready()
+        );
+
+        assert_eq!(*f.terminal.launches.lock().unwrap(), 1);
+        assert_eq!(f.review_prompts().len(), 1);
+        assert!(f.implement.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            block_on(saved_policy(&f))
+                .snapshot()
+                .agent_recovery_remaining,
+            Limits::default().agent_recovery
         );
     }
 
