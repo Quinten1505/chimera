@@ -366,11 +366,22 @@ impl ImplementationPipeline {
         if used > limit as usize {
             return Ok(Err(paused(PauseReason::LimitExhausted, state)));
         }
-        let sender = previous
-            .as_ref()
-            .map(|(sender, _)| *sender)
-            .filter(|sender| *sender != role);
+        let previous_role = previous.as_ref().map(|(sender, _)| *sender);
+        let sender = previous_role.filter(|sender| *sender != role);
         let previous = previous.map(|(_, text)| text);
+        let started = pending
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.role == role && turn.cycle == cycle);
+        if !started && previous_role == Some(role) {
+            // A new assignment to the agent that reported the previous result, such as the next
+            // merge attempt: its context is cleared before the prompt, as a handoff would.
+            // Corrections within a turn keep it. Resetting again after a restart is harmless.
+            self.policy.check_start().map_err(PipelineError::Paused)?;
+            pending.reset = Some(role);
+            self.save_pending(pending).await?;
+            self.reset_owed(pending).await?;
+        }
         // Every assignment keeps the findings next to the latest description.
         let description = match (&self.work_item, previous) {
             (WorkItem::Findings(findings), Some(previous)) => Some(format!(
@@ -2197,6 +2208,91 @@ mod tests {
         );
         assert_eq!(holder(&f), Some("t31".into()));
         assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c0"));
+    }
+
+    /// The merge agent's prompts, with assignments shortened to their attempt number.
+    async fn merge_log(f: &Fixture) -> Vec<String> {
+        let mut attempt = 0;
+        f.prompts(Role::Merge)
+            .await
+            .into_iter()
+            .map(|prompt| {
+                if prompt.contains("You are merger.") {
+                    attempt += 1;
+                    format!("assignment {attempt}")
+                } else if prompt.contains("was rejected") {
+                    "correction".to_string()
+                } else {
+                    prompt
+                }
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_new_merge_attempt_starts_with_a_fresh_context() {
+        for first in [BLOCKED, MERGED] {
+            let f = fixture(WorkItem::Ticket(ticket()), 5);
+            ready_to_merge(&f, &[first, MERGED], &[]).await;
+            if first == BLOCKED {
+                f.push_on_merge(commit("c1"));
+            }
+            let mut state = f
+                .pipeline
+                .step(ImplementationState::WaitingForMerge)
+                .await
+                .unwrap();
+            // A blocked merge, or a reported push that did not happen.
+            while state != (ImplementationState::Merging { attempt: 2 }) {
+                state = f.pipeline.step(state).await.unwrap();
+            }
+            f.push_on_merge(commit("c1"));
+            save_state(&f, state).await;
+
+            f.drive_through().await.unwrap();
+
+            assert_eq!(
+                merge_log(&f).await,
+                ["assignment 1", "/clear", "assignment 2"],
+                "{first}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_reset_before_a_new_attempt_precedes_its_assignment_across_a_restart() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[BLOCKED, MERGED], &[]).await;
+        f.push_on_merge(commit("c1"));
+        let mut state = f
+            .pipeline
+            .step(ImplementationState::WaitingForMerge)
+            .await
+            .unwrap();
+        state = f.pipeline.step(state).await.unwrap();
+        assert_eq!(state, ImplementationState::Merging { attempt: 2 });
+        save_state(&f, state.clone()).await;
+        // The reset went out; the process stopped before the assignment was delivered.
+        *f.terminal.fail_send.lock().unwrap() = Some(PortError::failed("stopped"));
+        assert!(f.pipeline.step(state).await.unwrap_err().is_failed());
+
+        f.drive_through().await.unwrap();
+
+        assert_eq!(
+            merge_log(&f).await,
+            ["assignment 1", "/clear", "/clear", "assignment 2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_correction_keeps_the_merge_agent_context() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &["nonsense", MERGED], &[]).await;
+        f.push_on_merge(commit("c1"));
+
+        f.drive_through().await.unwrap();
+
+        assert_eq!(merge_log(&f).await, ["assignment 1", "correction"]);
     }
 
     #[tokio::test]
