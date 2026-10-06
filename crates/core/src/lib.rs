@@ -88,18 +88,11 @@ impl Default for Limits {
 }
 
 /// Error returned when an identifier is constructed from an empty or whitespace-only value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{kind} must not be empty or whitespace-only")]
 pub struct EmptyIdentifier {
     kind: &'static str,
 }
-
-impl fmt::Display for EmptyIdentifier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} must not be empty or whitespace-only", self.kind)
-    }
-}
-
-impl std::error::Error for EmptyIdentifier {}
 
 fn non_blank(kind: &'static str, value: String) -> Result<String, EmptyIdentifier> {
     if value.trim().is_empty() {
