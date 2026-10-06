@@ -5,6 +5,8 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use crate::error::GitError;
 
+const SSH_COMMAND: &str = "ssh -o BatchMode=yes";
+
 /// What an invocation does, which decides whether a failure can be uncertain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Effect {
@@ -49,6 +51,9 @@ impl Runner {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "true")
             .env("SSH_ASKPASS", "true")
+            // OpenSSH can prompt through /dev/tty regardless of stdin; batch mode forbids every
+            // password, passphrase and host-key prompt.
+            .env("GIT_SSH_COMMAND", SSH_COMMAND)
             .env("GIT_PAGER", "cat")
             .env("GIT_EDITOR", "true")
             .env("GIT_SEQUENCE_EDITOR", "true")
@@ -86,12 +91,18 @@ fn describe(status: ExitStatus) -> String {
     status.to_string()
 }
 
-/// The server answered and refused, so nothing was pushed.
-const REJECTED: &[&str] = &[
-    "[rejected]",
-    "[remote rejected]",
-    "failed to push some refs",
-    "declined",
+/// The server answered a specific ref with a refusal. Generic summaries such as "failed to push
+/// some refs" are deliberately absent: git prints them for dropped connections too.
+const REJECTED: &[&str] = &["[rejected]", "[remote rejected]"];
+
+/// The connection broke after it was established, so the push may have been applied.
+const DROPPED: &[&str] = &[
+    "unexpected disconnect",
+    "hung up unexpectedly",
+    "RPC failed",
+    "Connection reset",
+    "Broken pipe",
+    "early EOF",
 ];
 
 /// The connection was never established, so nothing was sent.
@@ -120,14 +131,21 @@ fn classify_uncertain(effect: Effect, status: ExitStatus, stderr: &str) -> bool 
         return true;
     }
     let mentions = |markers: &[&str]| markers.iter().any(|marker| stderr.contains(marker));
-    // Rejection and a refused connection are definitive; anything else (a dropped connection,
-    // an unrecognised error) is treated as unknown, which is the safe side for a push.
+    // Evidence of a dropped connection outranks everything else: the remote may have applied
+    // the update before the connection broke.
+    if mentions(DROPPED) {
+        return true;
+    }
+    // Rejection and a refused connection are definitive; anything else (an unrecognised error)
+    // is treated as unknown, which is the safe side for a push.
     !(mentions(REJECTED) || mentions(NEVER_CONNECTED))
 }
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::ExitStatusExt;
+
+    use chimera_core::error::PortError;
 
     use super::*;
     use crate::testing::TestRepo;
@@ -302,5 +320,77 @@ mod tests {
             .run(repo.work(), &["push"], Effect::Remote)
             .unwrap_err();
         assert!(error.is_uncertain(), "{error:?}");
+    }
+
+    #[test]
+    fn generic_push_summary_does_not_override_dropped_connection() {
+        let stderr = "send-pack: unexpected disconnect while reading sideband packet\n\
+                      error: failed to push some refs to 'origin'";
+        assert!(classify_uncertain(Effect::Remote, exit(1), stderr));
+        assert!(classify_uncertain(
+            Effect::Remote,
+            exit(1),
+            "remote: push declined\nfatal: the remote end hung up unexpectedly"
+        ));
+    }
+
+    #[test]
+    fn bare_push_summary_is_not_proof_of_rejection() {
+        assert!(classify_uncertain(
+            Effect::Remote,
+            exit(1),
+            "error: failed to push some refs to 'origin'"
+        ));
+    }
+
+    #[test]
+    fn real_push_with_killed_receiver_is_uncertain_and_remote_updated() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = TestRepo::new();
+        let hook = repo.origin().join("hooks/post-receive");
+        std::fs::write(&hook, "#!/bin/sh\nkill -9 \"$PPID\"\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        repo.commit_file(repo.work(), "b.txt", "mine");
+        let error = Runner::new()
+            .run(repo.work(), &["push", "origin", "main"], Effect::Remote)
+            .unwrap_err();
+        let rev = |dir: &Path, rev: &str| {
+            Runner::new()
+                .run(dir, &["rev-parse", rev], Effect::Read)
+                .unwrap()
+                .stdout
+        };
+        assert_eq!(rev(&repo.origin(), "main"), rev(repo.work(), "HEAD"));
+        assert!(error.is_uncertain(), "{error:?}");
+        assert!(PortError::from(error).is_uncertain());
+    }
+
+    #[test]
+    fn environment_is_non_interactive() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = TestRepo::new();
+        let script = repo.work().join("../env-git.sh");
+        let dump = repo.work().join("../env.txt");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nenv > '{}'\ncat > /dev/null\n", dump.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Runner::with_program(&script)
+            .run(repo.work(), &["push"], Effect::Remote)
+            .unwrap();
+        let env = std::fs::read_to_string(&dump).unwrap();
+        for expected in [
+            "GIT_TERMINAL_PROMPT=0",
+            "GIT_ASKPASS=true",
+            "SSH_ASKPASS=true",
+            "GIT_SSH_COMMAND=ssh -o BatchMode=yes",
+            "GIT_PAGER=cat",
+            "GIT_EDITOR=true",
+            "GIT_SEQUENCE_EDITOR=true",
+        ] {
+            assert!(env.lines().any(|line| line == expected), "{expected}");
+        }
     }
 }
