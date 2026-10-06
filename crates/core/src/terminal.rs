@@ -37,6 +37,10 @@ pub trait Terminal: Send + Sync {
 
     async fn send_prompt(&self, pane: &PaneId, prompt: &str) -> Result<(), PortError>;
 
+    /// How many prompts `pane` has received since it was created: the receipt of a send. Read
+    /// before a send and again after an uncertain one, it tells whether that prompt arrived.
+    async fn prompts_received(&self, pane: &PaneId) -> Result<u64, PortError>;
+
     async fn read_status(&self, pane: &PaneId) -> Result<TurnStatus, PortError>;
 
     async fn read_output(&self, pane: &PaneId) -> Result<String, PortError>;
@@ -221,6 +225,10 @@ mod fake {
             self.with_pane(pane, |state| state.prompts.push(prompt.to_string()))
         }
 
+        async fn prompts_received(&self, pane: &PaneId) -> Result<u64, PortError> {
+            self.with_pane(pane, |state| state.prompts.len() as u64)
+        }
+
         async fn read_status(&self, pane: &PaneId) -> Result<TurnStatus, PortError> {
             self.with_pane(pane, |state| {
                 if state.statuses.len() > 1 {
@@ -308,8 +316,10 @@ mod tests {
     #[tokio::test]
     async fn prompt_is_delivered() {
         let (terminal, _, pane) = started().await;
+        assert_eq!(terminal.prompts_received(&pane).await.unwrap(), 0);
         terminal.send_prompt(&pane, "do it").await.unwrap();
         assert_eq!(terminal.prompts(&pane), vec!["do it".to_string()]);
+        assert_eq!(terminal.prompts_received(&pane).await.unwrap(), 1);
     }
 
     #[tokio::test]

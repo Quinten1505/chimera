@@ -166,9 +166,9 @@ impl AgentTurns {
             .await
     }
 
-    /// The output currently shown by `pane`.
-    pub async fn read_output(&self, pane: &PaneId) -> Result<String, PortError> {
-        self.terminal.read_output(pane).await
+    /// How many prompts `pane` has received: read before a send, it is the send's receipt.
+    pub async fn prompts_received(&self, pane: &PaneId) -> Result<u64, PortError> {
+        self.terminal.prompts_received(pane).await
     }
 
     /// Sends the prompt of a turn without waiting for its result, unless the run is paused.
@@ -180,16 +180,14 @@ impl AgentTurns {
         Ok(())
     }
 
-    /// Whether the agent in `pane` shows evidence of having received a prompt sent while it
-    /// showed `output_before`: it is working, or its output changed. An idle agent still showing
-    /// `output_before` proves nothing either way, as a delivered turn can end with identical
-    /// output, so the caller must not treat that as "never arrived".
-    pub async fn delivered(&self, pane: &PaneId, output_before: &str) -> Result<bool, TurnError> {
-        Ok(match self.terminal.read_status(pane).await? {
-            TurnStatus::Gone => return Err(TurnError::AgentLost),
-            TurnStatus::Running => true,
-            TurnStatus::Finished => self.terminal.read_output(pane).await? != output_before,
-        })
+    /// Whether the prompt sent to `pane` when it had received `received_before` prompts arrived:
+    /// the pane has received more since. Unlike the agent's output, which a delivered turn can
+    /// leave unchanged, the receipt tells either way.
+    pub async fn delivered(&self, pane: &PaneId, received_before: u64) -> Result<bool, TurnError> {
+        if self.terminal.read_status(pane).await? == TurnStatus::Gone {
+            return Err(TurnError::AgentLost);
+        }
+        Ok(self.terminal.prompts_received(pane).await? > received_before)
     }
 
     /// Waits for the agent's turn to end and parses what it reported, without saving it.
@@ -443,6 +441,10 @@ mod tests {
             self.inner.send_prompt(pane, prompt).await
         }
 
+        async fn prompts_received(&self, pane: &PaneId) -> Result<u64, PortError> {
+            self.inner.prompts_received(pane).await
+        }
+
         async fn read_status(&self, pane: &PaneId) -> Result<TurnStatus, PortError> {
             self.inner.read_status(pane).await
         }
@@ -528,6 +530,21 @@ mod tests {
     }
 
     const APPROVED: &str = "thinking...\n{\"ReviewApproved\":\"good\"}\n";
+
+    #[tokio::test]
+    async fn delivery_is_told_by_the_receipt_even_when_the_output_is_unchanged() {
+        let f = fixture().await;
+        let pane = &f.panes[0];
+        f.all_finished();
+        f.terminal.inner.script_output(pane, "same");
+        let before = f.turns.prompts_received(pane).await.unwrap();
+        assert!(!f.turns.delivered(pane, before).await.unwrap());
+
+        f.terminal.send_prompt(pane, "do it").await.unwrap();
+
+        assert_eq!(f.terminal.inner.read_output(pane).await.unwrap(), "same");
+        assert!(f.turns.delivered(pane, before).await.unwrap());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn valid_outcome_after_polling() {

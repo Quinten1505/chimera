@@ -167,8 +167,9 @@ pub struct PrReviewPipeline<I> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingTurn {
     cycle: u32,
-    /// What the review agent's pane showed before the prompt was sent.
-    output_before: String,
+    /// The prompts the review agent's pane had received before the prompt being sent: the
+    /// receipt that tells whether it arrived.
+    received_before: u64,
     /// Invalid results in the history when the turn started; later ones are its corrections.
     invalid_before: usize,
     /// Corrections known to be delivered.
@@ -178,11 +179,13 @@ struct PendingTurn {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum TurnPhase {
-    /// The assignment is being sent: it may or may not have been delivered.
+    /// The assignment is being sent: it may or may not have been delivered, which the pane's
+    /// receipt tells.
     Sending,
     /// The assignment or a correction was delivered; the result is awaited.
     Awaiting,
-    /// A correction is being sent: it may or may not have been delivered.
+    /// A correction is being sent: it may or may not have been delivered, which the pane's
+    /// receipt tells.
     Correcting,
 }
 
@@ -399,7 +402,7 @@ impl<I: Implement> PrReviewPipeline<I> {
             Some(turn) => turn,
             None => PendingTurn {
                 cycle,
-                output_before: self.turns.read_output(pane).await?,
+                received_before: self.turns.prompts_received(pane).await?,
                 invalid_before,
                 corrections: 0,
                 phase: TurnPhase::Sending,
@@ -409,29 +412,37 @@ impl<I: Implement> PrReviewPipeline<I> {
             self.save_pending(Some(&turn)).await?;
         }
         if turn.phase == TurnPhase::Sending {
-            if created {
-                if let Err(error) = self.turns.send_assignment(&request).await {
-                    // A definite failure means nothing was delivered.
-                    if !matches!(&error, TurnError::Port(port) if port.is_uncertain()) {
-                        self.save_pending(None).await?;
-                    }
-                    return self.turn_failed(error, state, &environment).await;
+            // An assignment that was being sent arrived if the pane's receipt moved on since;
+            // otherwise it is sent now, whether the earlier send never ran or failed.
+            let delivered = if created {
+                false
+            } else {
+                match self.turns.delivered(pane, turn.received_before).await {
+                    Ok(delivered) => delivered,
+                    Err(error) => return self.turn_failed(error, state, &environment).await,
                 }
-            } else if let Err(error) = self.confirm_delivery(&request, &turn, "assignment").await {
+            };
+            if !delivered && let Err(error) = self.turns.send_assignment(&request).await {
+                // A definite failure means nothing was delivered.
+                if !matches!(&error, TurnError::Port(port) if port.is_uncertain()) {
+                    self.save_pending(None).await?;
+                }
                 return self.turn_failed(error, state, &environment).await;
             }
             turn.phase = TurnPhase::Awaiting;
             self.save_pending(Some(&turn)).await?;
-            if created {
+            if !delivered {
                 // The prompt was this step's effect; the next step collects the result.
                 return Ok(Err(state.clone()));
             }
         }
         if turn.phase == TurnPhase::Correcting {
-            if let Err(error) = self.confirm_delivery(&request, &turn, "correction").await {
-                return self.turn_failed(error, state, &environment).await;
+            match self.turns.delivered(pane, turn.received_before).await {
+                Ok(true) => turn.corrections += 1,
+                // Never arrived: the result it corrects is collected again and corrected below.
+                Ok(false) => {}
+                Err(error) => return self.turn_failed(error, state, &environment).await,
             }
-            turn.corrections += 1;
             turn.phase = TurnPhase::Awaiting;
             self.save_pending(Some(&turn)).await?;
         }
@@ -457,7 +468,7 @@ impl<I: Implement> PrReviewPipeline<I> {
             return Ok(Err(paused(PauseReason::LimitExhausted, state.clone())));
         }
         turn.phase = TurnPhase::Correcting;
-        turn.output_before = collected.output;
+        turn.received_before = self.turns.prompts_received(pane).await?;
         self.save_pending(Some(&turn)).await?;
         if let Err(error) = self.turns.send_correction(&request, &problem).await {
             if !error.is_uncertain() {
@@ -471,26 +482,6 @@ impl<I: Implement> PrReviewPipeline<I> {
         turn.phase = TurnPhase::Awaiting;
         self.save_pending(Some(&turn)).await?;
         Ok(Err(state.clone()))
-    }
-
-    /// A prompt sent before a restart is known to have arrived only if the agent is working or
-    /// its output changed.
-    async fn confirm_delivery(
-        &self,
-        request: &TurnRequest<'_>,
-        turn: &PendingTurn,
-        what: &str,
-    ) -> Result<(), TurnError> {
-        if self
-            .turns
-            .delivered(request.pane, &turn.output_before)
-            .await?
-        {
-            Ok(())
-        } else {
-            let unknown = format!("the {what} may or may not have been delivered");
-            Err(PortError::uncertain(unknown).into())
-        }
     }
 
     /// Recovers a lost agent, or reports why the turn cannot go on.
@@ -787,6 +778,9 @@ mod tests {
             }
             self.sent.lock().unwrap().push(prompt.to_string());
             self.inner.send_prompt(pane, prompt).await
+        }
+        async fn prompts_received(&self, pane: &PaneId) -> Result<u64, PortError> {
+            self.inner.prompts_received(pane).await
         }
         async fn read_status(&self, pane: &PaneId) -> Result<TurnStatus, PortError> {
             self.inner.read_status(pane).await
@@ -1271,7 +1265,7 @@ mod tests {
             pipeline
                 .save_pending(Some(&PendingTurn {
                     cycle: 1,
-                    output_before: String::new(),
+                    received_before: 0,
                     invalid_before: 0,
                     corrections: 0,
                     phase: TurnPhase::Awaiting,
@@ -1286,6 +1280,100 @@ mod tests {
         );
 
         assert!(f.review_prompts().is_empty());
+    }
+
+    /// Provisions the first review and saves its turn as being sent; the idle pane already shows
+    /// the approval the turn will end with. Returns the pane.
+    async fn review_saved_as_sending(f: &Fixture) -> PaneId {
+        let pipeline = f.pipeline();
+        next_state(&pipeline, PrReviewState::Provisioning { cycle: 1 }).await;
+        let environment = pipeline.load_environment(1).await.unwrap();
+        let pane = environment.pane(Role::Review).unwrap().clone();
+        f.terminal.inner.script_output(&pane, APPROVED);
+        f.terminal
+            .inner
+            .script_statuses(&pane, [TurnStatus::Finished]);
+        pipeline
+            .save_pending(Some(&PendingTurn {
+                cycle: 1,
+                received_before: 0,
+                invalid_before: 0,
+                corrections: 0,
+                phase: TurnPhase::Sending,
+            }))
+            .await
+            .unwrap();
+        pane
+    }
+
+    #[test]
+    fn a_review_saved_as_sending_but_never_sent_is_sent_once_after_a_restart() {
+        let f = fixture(5, &[APPROVED]);
+        block_on(review_saved_as_sending(&f));
+
+        assert_eq!(
+            block_on(f.drive_resumed(PrReviewState::Reviewing { cycle: 1 })),
+            ready()
+        );
+        assert_eq!(f.review_prompts().len(), 1);
+    }
+
+    #[test]
+    fn a_delivered_review_with_identical_output_is_not_resent_after_a_restart() {
+        let f = fixture(5, &[]);
+        let pane = block_on(review_saved_as_sending(&f));
+        // The assignment arrived and the agent answered with what the pane showed before.
+        block_on(f.terminal.inner.send_prompt(&pane, "You are reviewer.")).unwrap();
+
+        assert_eq!(
+            block_on(f.drive_resumed(PrReviewState::Reviewing { cycle: 1 })),
+            ready()
+        );
+        assert!(f.review_prompts().is_empty());
+        assert_eq!(f.store.history(&run()).len(), 1);
+    }
+
+    #[test]
+    fn a_correction_that_never_arrived_is_sent_once_after_a_restart() {
+        let f = fixture(5, &[APPROVED]);
+        let pane = block_on(review_saved_as_sending(&f));
+        block_on(async {
+            // The invalid result was saved; its correction was being sent when the process died.
+            f.terminal.inner.script_output(&pane, "no outcome");
+            f.store
+                .append_turn(
+                    &run(),
+                    TurnResult {
+                        agent: f.pipeline().agent(),
+                        role: Role::Review,
+                        outcome: TurnOutcome::Invalid {
+                            output: "no outcome".into(),
+                            problem: "no outcome found".into(),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            f.pipeline()
+                .save_pending(Some(&PendingTurn {
+                    cycle: 1,
+                    received_before: 0,
+                    invalid_before: 0,
+                    corrections: 0,
+                    phase: TurnPhase::Correcting,
+                }))
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(
+            block_on(f.drive_resumed(PrReviewState::Reviewing { cycle: 1 })),
+            ready()
+        );
+        let prompts = f.review_prompts();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("was rejected"));
+        assert_eq!(f.store.history(&run()).len(), 2);
     }
 
     #[test]
@@ -1314,7 +1402,7 @@ mod tests {
                 pipeline
                     .save_pending(Some(&PendingTurn {
                         cycle: 1,
-                        output_before: String::new(),
+                        received_before: 0,
                         invalid_before: 0,
                         corrections: 0,
                         phase: TurnPhase::Awaiting,

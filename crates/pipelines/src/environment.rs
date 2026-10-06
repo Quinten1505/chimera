@@ -536,6 +536,9 @@ mod tests {
         async fn send_prompt(&self, pane: &PaneId, prompt: &str) -> Result<(), PortError> {
             self.inner.send_prompt(pane, prompt).await
         }
+        async fn prompts_received(&self, pane: &PaneId) -> Result<u64, PortError> {
+            self.inner.prompts_received(pane).await
+        }
         async fn read_status(&self, pane: &PaneId) -> Result<TurnStatus, PortError> {
             let status = self.inner.read_status(pane).await?;
             Ok(match self.inner.launched_command(pane) {

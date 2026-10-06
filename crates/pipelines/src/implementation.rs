@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use chimera_core::error::PortError;
 use chimera_core::repository::Repository;
 use chimera_core::run_store::RunStore;
 use chimera_core::{
@@ -184,28 +183,27 @@ impl ImplementationPipeline {
             self.save_pending(pending).await?;
         }
         if turn.phase == TurnPhase::Sending {
-            if created {
-                if let Err(error) = self.turns.send_assignment(request).await {
-                    // A definite failure means nothing was delivered.
-                    if !matches!(&error, TurnError::Port(port) if port.is_uncertain()) {
-                        pending.turn = None;
-                        self.save_pending(pending).await?;
-                    }
-                    return Ok(Err(error));
-                }
+            // An assignment that was being sent arrived if the pane's receipt moved on since;
+            // otherwise it is sent now, whether the earlier send never ran or failed.
+            let delivered = if created {
+                false
             } else {
                 match self
                     .turns
-                    .delivered(request.pane, &turn.output_before)
+                    .delivered(request.pane, turn.received_before)
                     .await
                 {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let unknown = "the assignment may or may not have been delivered";
-                        return Ok(Err(PortError::uncertain(unknown).into()));
-                    }
+                    Ok(delivered) => delivered,
                     Err(error) => return Ok(Err(error)),
                 }
+            };
+            if !delivered && let Err(error) = self.turns.send_assignment(request).await {
+                // A definite failure means nothing was delivered.
+                if !matches!(&error, TurnError::Port(port) if port.is_uncertain()) {
+                    pending.turn = None;
+                    self.save_pending(pending).await?;
+                }
+                return Ok(Err(error));
             }
             turn.phase = TurnPhase::Awaiting;
             pending.turn = Some(turn.clone());
@@ -214,20 +212,16 @@ impl ImplementationPipeline {
             return Ok(Ok(Progress::Continue));
         }
         if turn.phase == TurnPhase::Correcting {
-            // The correction was being sent: the pane shows what it showed before it.
             match self
                 .turns
-                .delivered(request.pane, &turn.output_before)
+                .delivered(request.pane, turn.received_before)
                 .await
             {
-                Ok(true) => {}
-                Ok(false) => {
-                    let unknown = "the correction may or may not have been delivered";
-                    return Ok(Err(PortError::uncertain(unknown).into()));
-                }
+                Ok(true) => turn.corrections += 1,
+                // Never arrived: the result it corrects is collected again and corrected below.
+                Ok(false) => {}
                 Err(error) => return Ok(Err(error)),
             }
-            turn.corrections += 1;
             turn.phase = TurnPhase::Awaiting;
             pending.turn = Some(turn.clone());
             self.save_pending(pending).await?;
@@ -259,7 +253,7 @@ impl ImplementationPipeline {
             }));
         }
         turn.phase = TurnPhase::Correcting;
-        turn.output_before = collected.output;
+        turn.received_before = self.turns.prompts_received(request.pane).await?;
         pending.turn = Some(turn.clone());
         self.save_pending(pending).await?;
         if let Err(error) = self.turns.send_correction(request, &problem).await {
@@ -420,7 +414,7 @@ impl ImplementationPipeline {
         let fresh = PendingTurn {
             role,
             cycle,
-            output_before: self.turns.read_output(pane).await?,
+            received_before: self.turns.prompts_received(pane).await?,
             invalid_before,
             valid_before: valid_count(&self.history().await?),
             corrections: 0,
@@ -769,9 +763,9 @@ struct Finished {
 struct PendingTurn {
     role: Role,
     cycle: u32,
-    /// What the agent's pane showed before the prompt was sent, to tell a new result from a
-    /// stale one.
-    output_before: String,
+    /// The prompts the agent's pane had received before the prompt being sent: the receipt
+    /// that tells whether it arrived.
+    received_before: u64,
     /// Invalid results in the history when the turn started; later ones are its corrections.
     invalid_before: usize,
     /// Valid results in the history when the turn started; a later one is its result.
@@ -785,13 +779,15 @@ struct PendingTurn {
 /// How far the turn got, saved before each effect that cannot be taken back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum TurnPhase {
-    /// The assignment is being sent: it may or may not have been delivered.
+    /// The assignment is being sent: it may or may not have been delivered, which the pane's
+    /// receipt tells.
     Sending,
     /// The assignment or a correction was delivered; the agent's result is awaited. If the
     /// history already holds an invalid result beyond the delivered corrections, it still has
     /// to be corrected.
     Awaiting,
-    /// A correction is being sent: it may or may not have been delivered.
+    /// A correction is being sent: it may or may not have been delivered, which the pane's
+    /// receipt tells.
     Correcting,
 }
 
@@ -988,6 +984,9 @@ mod tests {
                 Some(error) if prompt != "/clear" => Err(error),
                 _ => Ok(()),
             }
+        }
+        async fn prompts_received(&self, pane: &PaneId) -> Result<u64, PortError> {
+            self.inner.prompts_received(pane).await
         }
         async fn read_status(&self, pane: &PaneId) -> Result<TurnStatus, PortError> {
             if self.gone.lock().unwrap().contains(pane) {
@@ -1352,7 +1351,7 @@ mod tests {
             .unwrap();
         // The correction was confirmed and saved; the agent finished with the same output.
         show(&f, Role::Implementation, READY).await;
-        save_pending_turn(&f, Role::Implementation, TurnPhase::Awaiting, "nonsense", 1).await;
+        save_pending_turn(&f, Role::Implementation, TurnPhase::Awaiting, 0, 1).await;
 
         assert_eq!(
             f.drive().await.unwrap(),
@@ -1553,14 +1552,14 @@ mod tests {
         f: &Fixture,
         role: Role,
         phase: TurnPhase,
-        output_before: &str,
+        received_before: u64,
         corrections: u32,
     ) {
         let pending = Pending {
             turn: Some(PendingTurn {
                 role,
                 cycle: 1,
-                output_before: output_before.into(),
+                received_before,
                 invalid_before: 0,
                 valid_before: 0,
                 corrections,
@@ -1596,7 +1595,7 @@ mod tests {
         f.script(Role::Implementation, &[READY]).await;
         f.script(Role::Review, &[APPROVED]).await;
         // The prompt was delivered and the agent is working when the process dies.
-        save_pending_turn(&f, Role::Implementation, TurnPhase::Sending, "", 0).await;
+        save_pending_turn(&f, Role::Implementation, TurnPhase::Sending, 0, 0).await;
         let pane = f.pane(Role::Implementation).await;
         f.terminal
             .send_prompt(&pane, "You are implementer.")
@@ -1619,7 +1618,7 @@ mod tests {
         f.script(Role::Review, &[APPROVED]).await;
         // The delivery was saved; the agent finished with exactly what the pane showed before.
         show(&f, Role::Implementation, READY).await;
-        save_pending_turn(&f, Role::Implementation, TurnPhase::Awaiting, READY, 0).await;
+        save_pending_turn(&f, Role::Implementation, TurnPhase::Awaiting, 0, 0).await;
 
         assert_eq!(
             f.drive().await.unwrap(),
@@ -1631,42 +1630,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unsaved_delivery_with_identical_output_stays_uncertain() {
+    async fn a_delivered_assignment_with_identical_output_is_not_resent_after_a_restart() {
         let f = fixture(WorkItem::Ticket(ticket()), 5);
         f.script(Role::Implementation, &[]).await;
+        f.script(Role::Review, &[APPROVED]).await;
+        // Sending was saved; the assignment arrived and the agent finished with exactly what
+        // the pane showed before, then the process died.
         show(&f, Role::Implementation, READY).await;
-        save_pending_turn(&f, Role::Implementation, TurnPhase::Sending, READY, 0).await;
+        save_pending_turn(&f, Role::Implementation, TurnPhase::Sending, 0, 0).await;
+        let pane = f.pane(Role::Implementation).await;
+        f.terminal
+            .send_prompt(&pane, "You are implementer.")
+            .await
+            .unwrap();
 
-        let error = f.drive().await.unwrap_err();
-
-        assert!(error.is_uncertain());
+        assert_eq!(
+            f.drive().await.unwrap(),
+            ImplementationState::WaitingForMerge
+        );
         let sent = f.prompts(Role::Implementation).await;
-        assert!(assignments(&sent, "implementer").is_empty());
+        assert_eq!(assignments(&sent, "implementer").len(), 1);
     }
 
     #[tokio::test]
-    async fn restart_before_the_handoff_send_does_not_reset_the_sender() {
+    async fn an_assignment_saved_as_sending_but_never_sent_is_sent_once_after_a_restart() {
         let f = fixture(WorkItem::Ticket(ticket()), 5);
         f.script(Role::Implementation, &[READY]).await;
-        f.script(Role::Review, &[]).await;
-        f.pipeline
-            .step(ImplementationState::Implementing { cycle: 1 })
+        f.script(Role::Review, &[APPROVED]).await;
+        // The idle pane already shows the output the new turn will end with.
+        show(&f, Role::Implementation, READY).await;
+        save_pending_turn(&f, Role::Implementation, TurnPhase::Sending, 0, 0).await;
+
+        assert_eq!(
+            f.drive().await.unwrap(),
+            ImplementationState::WaitingForMerge
+        );
+        let sent = f.prompts(Role::Implementation).await;
+        assert_eq!(assignments(&sent, "implementer").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_before_the_handoff_send_sends_it_before_resetting_the_sender() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        f.script(Role::Implementation, &[READY]).await;
+        f.script(Role::Review, &[APPROVED]).await;
+        let reviewing = f
+            .advance(ImplementationState::Implementing { cycle: 1 })
             .await
             .unwrap();
-        // The intent was saved but the process died before, or during, the send.
-        save_pending_turn(&f, Role::Review, TurnPhase::Sending, "", 0).await;
-        show(&f, Role::Review, "").await;
-        save_state(&f, ImplementationState::Reviewing { cycle: 1 }).await;
+        // The intent was saved but the process died before the send.
+        save_pending_turn(&f, Role::Review, TurnPhase::Sending, 0, 0).await;
 
-        let error = f.drive().await.unwrap_err();
-
-        assert!(error.is_uncertain());
+        assert_eq!(f.pipeline.step(reviewing.clone()).await.unwrap(), reviewing);
+        assert_eq!(
+            assignments(&f.prompts(Role::Review).await, "reviewer").len(),
+            1
+        );
         assert!(
             !f.prompts(Role::Implementation)
                 .await
                 .contains(&"/clear".to_string())
         );
-        assert!(f.prompts(Role::Review).await.is_empty());
+
+        assert_eq!(
+            f.advance(reviewing).await.unwrap(),
+            ImplementationState::WaitingForMerge
+        );
+        let implementation = f.prompts(Role::Implementation).await;
+        assert_eq!(implementation.iter().filter(|p| *p == "/clear").count(), 1);
+        assert_eq!(
+            assignments(&f.prompts(Role::Review).await, "reviewer").len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1723,7 +1758,7 @@ mod tests {
             .await
             .unwrap();
         show(&f, Role::Implementation, "nonsense").await;
-        save_pending_turn(&f, Role::Implementation, TurnPhase::Awaiting, "", 0).await;
+        save_pending_turn(&f, Role::Implementation, TurnPhase::Awaiting, 0, 0).await;
 
         assert_eq!(
             f.drive().await.unwrap(),
@@ -1767,10 +1802,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_correction_with_no_sign_of_delivery_stays_uncertain() {
-        let f = fixture(WorkItem::Ticket(ticket()), 3);
-        f.script(Role::Implementation, &[]).await;
+    /// The first invalid result is saved and its correction was being sent when the process
+    /// died; whether it arrived is up to the caller.
+    async fn correcting_after_a_restart(f: &Fixture, replies: &[&str]) {
+        f.script(Role::Implementation, replies).await;
+        f.script(Role::Review, &[APPROVED]).await;
         let agent = f.pipeline.agent(Role::Implementation);
         f.store
             .append_turn(
@@ -1786,18 +1822,59 @@ mod tests {
             )
             .await
             .unwrap();
-        show(&f, Role::Implementation, "nonsense").await;
-        save_pending_turn(
-            &f,
-            Role::Implementation,
-            TurnPhase::Correcting,
-            "nonsense",
-            0,
-        )
-        .await;
+        show(f, Role::Implementation, "nonsense").await;
+        save_pending_turn(f, Role::Implementation, TurnPhase::Correcting, 0, 0).await;
+    }
 
-        assert!(f.drive().await.unwrap_err().is_uncertain());
-        assert!(f.prompts(Role::Implementation).await.is_empty());
+    fn corrections_sent(prompts: &[String]) -> usize {
+        prompts
+            .iter()
+            .filter(|p| p.contains("was rejected"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_correction_that_never_arrived_is_sent_once_after_a_restart() {
+        let f = fixture(WorkItem::Ticket(ticket()), 3);
+        correcting_after_a_restart(&f, &[READY]).await;
+
+        assert_eq!(
+            f.drive().await.unwrap(),
+            ImplementationState::WaitingForMerge
+        );
+        assert_eq!(corrections_sent(&f.prompts(Role::Implementation).await), 1);
+        let history = f.store.load_history(&f.pipeline.run).await.unwrap();
+        let invalid = history
+            .iter()
+            .filter(|turn| matches!(turn.outcome, TurnOutcome::Invalid { .. }))
+            .count();
+        assert_eq!(invalid, 1);
+    }
+
+    #[tokio::test]
+    async fn a_delivered_correction_answered_with_identical_output_counts_after_a_restart() {
+        let f = fixture(WorkItem::Ticket(ticket()), 3);
+        correcting_after_a_restart(&f, &[]).await;
+        // The correction arrived and the agent answered with the same invalid output.
+        let pane = f.pane(Role::Implementation).await;
+        f.terminal
+            .send_prompt(&pane, "Your last result was rejected")
+            .await
+            .unwrap();
+        f.script(Role::Implementation, &[READY]).await;
+
+        assert_eq!(
+            f.drive().await.unwrap(),
+            ImplementationState::WaitingForMerge
+        );
+        // The delivered correction and the one for the second invalid result.
+        assert_eq!(corrections_sent(&f.prompts(Role::Implementation).await), 2);
+        let history = f.store.load_history(&f.pipeline.run).await.unwrap();
+        let invalid = history
+            .iter()
+            .filter(|turn| matches!(turn.outcome, TurnOutcome::Invalid { .. }))
+            .count();
+        assert_eq!(invalid, 2);
     }
 
     #[tokio::test]
@@ -2375,7 +2452,7 @@ mod tests {
             turn: Some(PendingTurn {
                 role: Role::Merge,
                 cycle: 1,
-                output_before: String::new(),
+                received_before: 0,
                 invalid_before: 0,
                 valid_before: 2,
                 corrections: 0,
@@ -2717,14 +2794,11 @@ mod tests {
         prompts + *f.terminal.launches.lock().unwrap()
     }
 
-    /// The whole loop: changes requested, approval, a conflict review, and the merge. Every
-    /// reply differs from the one before, as a delivered prompt is recognised by new output.
+    /// The whole loop: changes requested, approval, a conflict review, and the merge. Agents
+    /// repeat their previous output, which tells nothing about whether a prompt arrived.
     async fn full_task(f: &Fixture) {
-        let fixed = r#"{"ImplementationReady":"fixed"}"#;
-        let conflicts_fine = r#"{"ReviewApproved":"conflicts fine"}"#;
-        f.script(Role::Implementation, &[READY, fixed]).await;
-        f.script(Role::Review, &[CHANGES, APPROVED, conflicts_fine])
-            .await;
+        f.script(Role::Implementation, &[READY, READY]).await;
+        f.script(Role::Review, &[CHANGES, APPROVED, APPROVED]).await;
         f.script(Role::Merge, &[CONFLICTS, MERGED]).await;
         f.push_on_merge(commit("c1"));
     }
