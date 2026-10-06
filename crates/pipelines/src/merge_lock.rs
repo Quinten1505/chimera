@@ -9,6 +9,7 @@ use futures_util::lock::Mutex as AsyncMutex;
 use serde::{Deserialize, Serialize};
 
 use crate::error::PipelineError;
+use crate::policy::Policy;
 
 /// Enqueue position of a waiter; assigned once and never reused.
 pub type Sequence = u64;
@@ -127,8 +128,9 @@ impl MergeLock {
         Ok(entry.sequence)
     }
 
-    /// Enqueues `owner` and waits until it holds the lock.
-    pub async fn acquire(&self, owner: &str) -> Result<Sequence, PipelineError> {
+    /// Enqueues `owner` and waits until it holds the lock, or until the run is paused: then it
+    /// returns the pause, and `owner` keeps its place in the queue.
+    pub async fn acquire(&self, owner: &str, policy: &Policy) -> Result<Sequence, PipelineError> {
         let sequence = self.enqueue(owner).await?;
         std::future::poll_fn(|context| {
             let mut shared = self.shared.lock().unwrap();
@@ -138,14 +140,14 @@ impl MergeLock {
                 .as_ref()
                 .is_some_and(|h| h.owner == owner)
             {
-                Poll::Ready(())
-            } else {
-                shared.wakers.push(context.waker().clone());
-                Poll::Pending
+                return Poll::Ready(Ok(sequence));
             }
+            shared.wakers.push(context.waker().clone());
+            policy
+                .poll_paused(context)
+                .map(|reason| Err(PipelineError::Paused(reason)))
         })
-        .await;
-        Ok(sequence)
+        .await
     }
 
     /// Releases the lock after a verified push and grants it to the next waiter. Fails if
@@ -232,12 +234,16 @@ mod tests {
     use std::task::{Context, Waker};
 
     use async_trait::async_trait;
-    use chimera_core::TurnResult;
     use chimera_core::run_store::{EffectRecord, FakeRunStore};
+    use chimera_core::{Limits, TurnResult};
     use futures_executor::{LocalPool, block_on};
     use futures_util::task::LocalSpawnExt;
 
     use super::*;
+    use crate::error::PauseReason;
+
+    /// The policy of a run that is never paused.
+    static RUNNING: LazyLock<Policy> = LazyLock::new(|| Policy::new(&Limits::default()));
 
     fn run() -> RunId {
         RunId::new("run-1").unwrap()
@@ -362,7 +368,7 @@ mod tests {
     #[test]
     fn uncertain_enqueue_save_is_reconciled_before_the_next_mutation() {
         let (store, lock) = faulty();
-        block_on(lock.acquire("a")).unwrap();
+        block_on(lock.acquire("a", &RUNNING)).unwrap();
         store.set(Fault::Uncertain);
         assert!(matches!(
             block_on(lock.enqueue("b")),
@@ -378,7 +384,7 @@ mod tests {
     #[test]
     fn cancelled_enqueue_after_save_is_reconciled_before_the_next_mutation() {
         let (store, lock) = faulty();
-        block_on(lock.acquire("a")).unwrap();
+        block_on(lock.acquire("a", &RUNNING)).unwrap();
         store.set(Fault::HangAfterSave);
         poll_once_and_drop(lock.enqueue("b"));
 
@@ -389,7 +395,7 @@ mod tests {
     #[test]
     fn uncertain_release_save_is_reconciled_before_the_next_mutation() {
         let (store, lock) = faulty();
-        block_on(lock.acquire("a")).unwrap();
+        block_on(lock.acquire("a", &RUNNING)).unwrap();
         block_on(lock.enqueue("b")).unwrap();
         store.set(Fault::Uncertain);
         assert!(matches!(
@@ -407,7 +413,7 @@ mod tests {
     #[test]
     fn cancelled_release_after_save_is_reconciled_before_the_next_mutation() {
         let (store, lock) = faulty();
-        block_on(lock.acquire("a")).unwrap();
+        block_on(lock.acquire("a", &RUNNING)).unwrap();
         block_on(lock.enqueue("b")).unwrap();
         store.set(Fault::HangAfterSave);
         poll_once_and_drop(lock.release("a"));
@@ -430,7 +436,7 @@ mod tests {
         let spawner = pool.spawner();
 
         // The first owner holds the lock; the others queue up in order.
-        block_on(lock.acquire("w0")).unwrap();
+        block_on(lock.acquire("w0", &RUNNING)).unwrap();
         for index in 1..=5 {
             block_on(lock.enqueue(&format!("w{index}"))).unwrap();
         }
@@ -440,7 +446,7 @@ mod tests {
             spawner
                 .spawn_local(async move {
                     let owner = format!("w{index}");
-                    lock.acquire(&owner).await.unwrap();
+                    lock.acquire(&owner, &RUNNING).await.unwrap();
                     granted.lock().unwrap().push(owner.clone());
                     lock.release(&owner).await.unwrap();
                 })
@@ -465,7 +471,7 @@ mod tests {
         assert_eq!(lock.holder().as_deref(), Some("a"));
         assert_eq!(lock.waiting(), ["b"]);
 
-        let mut waiting = pin!(lock.acquire("b"));
+        let mut waiting = pin!(lock.acquire("b", &RUNNING));
         let mut context = Context::from_waker(Waker::noop());
         assert!(waiting.as_mut().poll(&mut context).is_pending());
 
@@ -481,9 +487,9 @@ mod tests {
         let lock = block_on(open(&store));
         let mut context = Context::from_waker(Waker::noop());
         {
-            let mut holding = Box::pin(lock.acquire("a"));
+            let mut holding = Box::pin(lock.acquire("a", &RUNNING));
             assert!(holding.as_mut().poll(&mut context).is_ready());
-            let mut waiting = Box::pin(lock.acquire("b"));
+            let mut waiting = Box::pin(lock.acquire("b", &RUNNING));
             assert!(waiting.as_mut().poll(&mut context).is_pending());
             // Both futures are dropped, as when a paused task is torn down.
         }
@@ -535,8 +541,8 @@ mod tests {
         let second = block_on(open(&store));
         assert!(Arc::ptr_eq(&first, &second));
 
-        assert_eq!(block_on(first.acquire("a")).unwrap(), 0);
-        let mut waiting = Box::pin(second.acquire("b"));
+        assert_eq!(block_on(first.acquire("a", &RUNNING)).unwrap(), 0);
+        let mut waiting = Box::pin(second.acquire("b", &RUNNING));
         let mut context = Context::from_waker(Waker::noop());
         assert!(waiting.as_mut().poll(&mut context).is_pending());
         assert_eq!(first.holder().as_deref(), Some("a"));
@@ -549,5 +555,33 @@ mod tests {
         let restored = block_on(open(&store));
         assert_eq!(restored.holder().as_deref(), Some("a"));
         assert_eq!(restored.waiting(), ["b"]);
+    }
+
+    #[test]
+    fn a_waiter_returns_on_a_pause_and_keeps_its_place() {
+        let store = store();
+        let lock = block_on(open(&store));
+        let policy = Policy::new(&Limits::default());
+        block_on(lock.acquire("a", &policy)).unwrap();
+        let mut pool = LocalPool::new();
+        let waiter = {
+            let (lock, policy) = (lock.clone(), &policy);
+            async move { lock.acquire("b", policy).await }
+        };
+        let mut waiter = Box::pin(waiter);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+
+        policy.pause(PauseReason::GlobalPause);
+        assert!(matches!(
+            pool.run_until(waiter),
+            Err(PipelineError::Paused(PauseReason::GlobalPause))
+        ));
+        assert_eq!(lock.holder().as_deref(), Some("a"));
+        assert_eq!(lock.waiting(), ["b"]);
+
+        // Resumed: the waiter keeps its sequence number and gets the lock after the holder.
+        block_on(lock.release("a")).unwrap();
+        assert_eq!(block_on(lock.acquire("b", &RUNNING)).unwrap(), 1);
     }
 }

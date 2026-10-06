@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::task::{Context, Poll, Waker};
 
 use chimera_core::error::PortError;
 use chimera_core::run_store::RunStore;
@@ -39,6 +40,8 @@ pub struct PolicyState {
 #[derive(Debug)]
 pub struct Policy {
     state: Mutex<PolicyState>,
+    /// Tasks waiting for the run to pause; registered and woken under the `state` lock.
+    pause_wakers: Mutex<Vec<Waker>>,
     /// Serializes saving, so that a save started later never stores an older snapshot.
     writes: AsyncMutex<()>,
 }
@@ -55,6 +58,7 @@ impl Policy {
     pub fn restore(state: PolicyState) -> Self {
         Self {
             state: Mutex::new(state),
+            pause_wakers: Mutex::default(),
             writes: AsyncMutex::new(()),
         }
     }
@@ -74,7 +78,35 @@ impl Policy {
 
     /// Sets the global pause unless the run is already paused; the first reason is kept.
     pub fn pause(&self, reason: PauseReason) {
-        self.state.lock().unwrap().paused.get_or_insert(reason);
+        let mut state = self.state.lock().unwrap();
+        if state.paused.is_none() {
+            self.set_paused(&mut state, reason);
+        }
+    }
+
+    /// Ready with the pause reason once the run is paused; until then `context` is woken when
+    /// it pauses.
+    pub fn poll_paused(&self, context: &mut Context<'_>) -> Poll<PauseReason> {
+        let state = self.state.lock().unwrap();
+        match state.paused {
+            Some(reason) => Poll::Ready(reason),
+            None => {
+                self.pause_wakers
+                    .lock()
+                    .unwrap()
+                    .push(context.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    fn set_paused(&self, state: &mut PolicyState, reason: PauseReason) {
+        state.paused = Some(reason);
+        self.pause_wakers
+            .lock()
+            .unwrap()
+            .drain(..)
+            .for_each(Waker::wake);
     }
 
     /// Pauses the run if the remote head of the feature branch is not the expected one.
@@ -116,7 +148,7 @@ impl Policy {
             ),
         };
         if *remaining == 0 {
-            state.paused = Some(exhausted);
+            self.set_paused(&mut state, exhausted);
             return Err(RetryRefused::Paused(exhausted));
         }
         *remaining -= 1;

@@ -886,7 +886,7 @@ impl Pipeline for ImplementationPipeline {
             }
             ImplementationState::WaitingForMerge => {
                 self.policy.check_start().map_err(PipelineError::Paused)?;
-                self.lock.acquire(&self.instance).await?;
+                self.lock.acquire(&self.instance, &self.policy).await?;
                 Ok(ImplementationState::Merging { attempt: 1 })
             }
             ImplementationState::Merging { attempt } => {
@@ -913,10 +913,12 @@ mod tests {
 
     use async_trait::async_trait;
     use chimera_core::error::PortError;
+    use chimera_core::forge::FakeForge;
     use chimera_core::repository::FakeRepository;
     use chimera_core::terminal::{FakeTerminal, Terminal, TurnStatus};
     use chimera_core::{
-        AgentProfile, Blocker, BranchName, IssueStatus, Limits, PaneId, Ticket, WorkspaceId,
+        AgentProfile, Blocker, BranchName, IssueStatus, Limits, PaneId, Ticket, TicketPlan,
+        WorkspaceId,
     };
 
     use super::*;
@@ -926,6 +928,7 @@ mod tests {
     use crate::environment::AgentLaunch;
     use crate::policy::Policy;
     use crate::test_support::CrashingStore;
+    use crate::ticket::{TicketPipeline, TicketProgress, TicketState};
 
     /// Answers each prompt to a pane with that pane's next scripted reply and finishes the turn.
     /// Prompts without a script left, and reset commands, get no reply.
@@ -2989,6 +2992,133 @@ mod tests {
             assert_eq!(history.len(), 7, "{context}");
             assert_eq!(holder(&f), None, "{context}");
         }
+    }
+
+    /// Polls until `condition` holds.
+    async fn until(mut condition: impl AsyncFnMut() -> bool) {
+        while !condition().await {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_queued_merge_returns_on_a_pause_so_the_tickets_drain_and_pause() {
+        let a = Arc::new(fixture(WorkItem::Ticket(ticket()), 5));
+        let second = Ticket {
+            issue: IssueRef::new("o", "r", 32).unwrap(),
+            ..ticket()
+        };
+        let b = Arc::new(fixture_for(
+            WorkItem::Ticket(second.clone()),
+            5,
+            "t32",
+            Some(&a),
+        ));
+        // A holds the lock, its merge agent has not answered yet; B is already queued.
+        ready_to_merge(&a, &[], &[]).await;
+        let merging = a
+            .pipeline
+            .step(ImplementationState::WaitingForMerge)
+            .await
+            .unwrap();
+        save_state(&a, merging).await;
+        ready_to_merge(&b, &[], &[]).await;
+        b.pipeline.lock.enqueue("t32").await.unwrap();
+
+        let specification = IssueRef::new("o", "r", 4).unwrap();
+        let forge = Arc::new(FakeForge::new("o", "r"));
+        forge.set_plan(
+            specification.clone(),
+            TicketPlan {
+                tickets: vec![ticket(), second],
+            },
+        );
+        let tasks = (a.clone(), b.clone());
+        let tickets = TicketPipeline::new(
+            a.pipeline.run.clone(),
+            specification,
+            a.store.clone(),
+            forge,
+            a.policy.clone(),
+            move |ticket: Ticket| {
+                let task = if ticket.issue == issue() {
+                    tasks.0.clone()
+                } else {
+                    tasks.1.clone()
+                };
+                async move { task.drive_through().await }
+            },
+        );
+        let run = tokio::spawn(async move { tickets.run().await });
+
+        // A's merge turn starts and B waits for the lock; then the run pauses.
+        until(async || !assignments(&a.prompts(Role::Merge).await, "merger").is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(a.pipeline.lock.waiting(), ["t32"]);
+        a.policy.pause(PauseReason::GlobalPause);
+        // The active turn finishes after the pause and is collected.
+        let pane = a.pane(Role::Merge).await;
+        a.terminal.inner.script_output(&pane, BLOCKED);
+        a.terminal
+            .inner
+            .script_statuses(&pane, [TurnStatus::Finished]);
+
+        let state = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the tickets drain")
+            .unwrap()
+            .unwrap();
+        let TicketState::Paused { reason, resume_at } = &state else {
+            panic!("{state:?}");
+        };
+        assert_eq!(*reason, PauseReason::GlobalPause);
+        assert!(
+            resume_at
+                .board()
+                .unwrap()
+                .entries
+                .iter()
+                .all(|entry| entry.progress == TicketProgress::Running)
+        );
+        let history = a.store.load_history(&a.pipeline.run).await.unwrap();
+        assert!(matches!(
+            history.last().unwrap().outcome,
+            TurnOutcome::Valid(Outcome::MergeBlocked(_))
+        ));
+
+        // A restart finds the paused tickets, both tasks where they stopped and the lock as it
+        // was.
+        let store = a.store.clone();
+        let lock = Arc::downgrade(&a.pipeline.lock);
+        drop((a, b));
+        assert!(lock.upgrade().is_none());
+        let run = RunId::new("run").unwrap();
+        let saved = |instance: &'static str| {
+            let store = store.clone();
+            let run = run.clone();
+            async move {
+                store
+                    .load_pipeline_state(&run, instance)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            serde_json::from_value::<TicketState>(saved("tickets").await).unwrap(),
+            state
+        );
+        assert_eq!(
+            serde_json::from_value::<ImplementationState>(saved("t31").await).unwrap(),
+            ImplementationState::Merging { attempt: 2 }
+        );
+        assert_eq!(
+            serde_json::from_value::<ImplementationState>(saved("t32").await).unwrap(),
+            ImplementationState::WaitingForMerge
+        );
+        let restored = MergeLock::open(store, run, &feature()).await.unwrap();
+        assert_eq!(restored.holder().as_deref(), Some("t31"));
+        assert_eq!(restored.waiting(), ["t32"]);
     }
 
     #[test]

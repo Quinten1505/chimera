@@ -2130,7 +2130,7 @@ mod tests {
             let store = Arc::new(CrashingStore::default());
             store.crash_at(Some(crash_at));
             f.forge.fail_next(PortError::failed("rate limited"));
-            let mut step = |state: PrReviewState| block_on(restarted_on(&f, &store).step(state));
+            let step = |state: PrReviewState| block_on(restarted_on(&f, &store).step(state));
             let mut state = state.clone();
             while let Ok(next) = step(state.clone()) {
                 state = next;
