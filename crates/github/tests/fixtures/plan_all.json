@@ -1,0 +1,221 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "subIssues": {
+          "nodes": [
+            {
+              "id": "I_kwDOU7ngNM8AAAABVNRA9w",
+              "number": 35,
+              "state": "CLOSED",
+              "repository": {
+                "name": "chimera",
+                "owner": {
+                  "login": "Quinten1505"
+                }
+              },
+              "blockedBy": {
+                "nodes": [
+                  {
+                    "number": 13,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MQ"
+                }
+              }
+            },
+            {
+              "id": "I_kwDOU7ngNM8AAAABVNRCOg",
+              "number": 36,
+              "state": "OPEN",
+              "repository": {
+                "name": "chimera",
+                "owner": {
+                  "login": "Quinten1505"
+                }
+              },
+              "blockedBy": {
+                "nodes": [
+                  {
+                    "number": 11,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  },
+                  {
+                    "number": 35,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Mg"
+                }
+              }
+            },
+            {
+              "id": "I_kwDOU7ngNM8AAAABVNRDQw",
+              "number": 37,
+              "state": "CLOSED",
+              "repository": {
+                "name": "chimera",
+                "owner": {
+                  "login": "Quinten1505"
+                }
+              },
+              "blockedBy": {
+                "nodes": [
+                  {
+                    "number": 9,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  },
+                  {
+                    "number": 35,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Mg"
+                }
+              }
+            },
+            {
+              "id": "I_kwDOU7ngNM8AAAABVNREJg",
+              "number": 38,
+              "state": "CLOSED",
+              "repository": {
+                "name": "chimera",
+                "owner": {
+                  "login": "Quinten1505"
+                }
+              },
+              "blockedBy": {
+                "nodes": [
+                  {
+                    "number": 9,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  },
+                  {
+                    "number": 35,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Mg"
+                }
+              }
+            },
+            {
+              "id": "I_kwDOU7ngNM8AAAABVNRFFw",
+              "number": 39,
+              "state": "OPEN",
+              "repository": {
+                "name": "chimera",
+                "owner": {
+                  "login": "Quinten1505"
+                }
+              },
+              "blockedBy": {
+                "nodes": [
+                  {
+                    "number": 38,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  },
+                  {
+                    "number": 37,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  },
+                  {
+                    "number": 36,
+                    "state": "OPEN",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  },
+                  {
+                    "number": 14,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "NA"
+                }
+              }
+            }
+          ],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "NQ"
+          }
+        }
+      }
+    }
+  }
+}

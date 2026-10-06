@@ -1,0 +1,75 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "subIssues": {
+          "nodes": [
+            {
+              "id": "I_kwDOU7ngNM8AAAABVNRFFw",
+              "number": 39,
+              "state": "OPEN",
+              "repository": {
+                "name": "chimera",
+                "owner": {
+                  "login": "Quinten1505"
+                }
+              },
+              "blockedBy": {
+                "nodes": [
+                  {
+                    "number": 38,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  },
+                  {
+                    "number": 37,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  },
+                  {
+                    "number": 36,
+                    "state": "OPEN",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  },
+                  {
+                    "number": 14,
+                    "state": "CLOSED",
+                    "repository": {
+                      "name": "chimera",
+                      "owner": {
+                        "login": "Quinten1505"
+                      }
+                    }
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "NA"
+                }
+              }
+            }
+          ],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "NQ"
+          }
+        }
+      }
+    }
+  }
+}

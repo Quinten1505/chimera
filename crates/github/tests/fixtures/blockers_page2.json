@@ -1,0 +1,24 @@
+{
+  "data": {
+    "node": {
+      "blockedBy": {
+        "nodes": [
+          {
+            "number": 14,
+            "state": "CLOSED",
+            "repository": {
+              "name": "chimera",
+              "owner": {
+                "login": "Quinten1505"
+              }
+            }
+          }
+        ],
+        "pageInfo": {
+          "hasNextPage": false,
+          "endCursor": "NA"
+        }
+      }
+    }
+  }
+}
