@@ -8,6 +8,8 @@ use thiserror::Error;
 pub enum StoreError {
     #[error("cannot determine the state directory: neither XDG_STATE_HOME nor HOME is set")]
     StateRootUnresolved,
+    #[error("invalid run id {id:?} for the run directory under {}: it must be a single plain path component", root.display())]
+    InvalidRunId { root: PathBuf, id: String },
     #[error("file system error at {}: {source}", path.display())]
     Io {
         path: PathBuf,

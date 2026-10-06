@@ -1,6 +1,8 @@
-use std::fs::{self, File};
-use std::io::Write;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 
@@ -12,32 +14,67 @@ use crate::StoreError;
 // Used by the operation tickets that build on this scaffold.
 #[allow(dead_code)]
 pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    write_json_atomic_with(
+        path,
+        value,
+        &mut std::iter::repeat_with(|| COUNTER.fetch_add(1, Ordering::Relaxed)),
+    )
+}
+
+/// `suffixes` supplies the candidate temporary-name suffixes, in order.
+fn write_json_atomic_with<T: Serialize>(
+    path: &Path,
+    value: &T,
+    suffixes: &mut dyn Iterator<Item = u64>,
+) -> Result<(), StoreError> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|source| StoreError::Serialize {
         path: path.to_path_buf(),
         source,
     })?;
 
-    let temporary = temporary_path(path);
-    let result = write_and_rename(&temporary, path, &bytes);
+    let (mut file, temporary) = create_temporary(path, suffixes)?;
+    let result = write_and_rename(&mut file, &temporary, path, &bytes);
+    drop(file);
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
 }
 
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut name = std::ffi::OsString::from(".");
-    name.push(path.file_name().unwrap_or_default());
-    name.push(format!(".{}.tmp", std::process::id()));
-    path.with_file_name(name)
+/// Exclusively creates a uniquely named temporary file next to `path`. An existing entry at a
+/// candidate name (file, symlink, ...) is never opened or removed; the next name is tried.
+fn create_temporary(
+    path: &Path,
+    suffixes: &mut dyn Iterator<Item = u64>,
+) -> Result<(File, PathBuf), StoreError> {
+    for suffix in suffixes {
+        let mut name = OsString::from(".");
+        name.push(path.file_name().unwrap_or_default());
+        name.push(format!(".{}.{suffix}.tmp", std::process::id()));
+        let temporary = path.with_file_name(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((file, temporary)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(StoreError::io(temporary, e)),
+        }
+    }
+    unreachable!("the suffix iterator is infinite")
 }
 
-fn write_and_rename(temporary: &Path, path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    let mut file = File::create(temporary).map_err(|e| StoreError::io(temporary, e))?;
+fn write_and_rename(
+    file: &mut File,
+    temporary: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), StoreError> {
     file.write_all(bytes)
         .map_err(|e| StoreError::io(temporary, e))?;
     file.sync_all().map_err(|e| StoreError::io(temporary, e))?;
-    drop(file);
     fs::rename(temporary, path).map_err(|e| StoreError::io(path, e))
 }
 
@@ -138,5 +175,73 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), "previous");
             assert_eq!(entries(dir.path()), ["state.json"]);
         }
+    }
+
+    #[test]
+    fn concurrent_writes_leave_one_complete_value_and_no_temporaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                let path = &path;
+                scope.spawn(move || {
+                    for j in 0..25 {
+                        write_json_atomic(path, &vec![i * 100 + j; 1000]).unwrap();
+                    }
+                });
+            }
+        });
+
+        let read: Vec<i32> = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read.len(), 1000);
+        assert!(read.iter().all(|v| *v == read[0]));
+        assert_eq!(entries(dir.path()), ["state.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_temporary_entries_are_preserved_and_skipped() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, "previous").unwrap();
+        let pid = std::process::id();
+        let squat_file = dir.path().join(format!(".state.json.{pid}.0.tmp"));
+        let squat_link = dir.path().join(format!(".state.json.{pid}.1.tmp"));
+        fs::write(&squat_file, "squatter").unwrap();
+        symlink(&path, &squat_link).unwrap();
+
+        write_json_atomic_with(&path, &7, &mut (0..)).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "7");
+        assert_eq!(fs::read_to_string(&squat_file).unwrap(), "squatter");
+        assert_eq!(fs::read_link(&squat_link).unwrap(), path);
+        assert_eq!(entries(dir.path()).len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_preserves_preexisting_temporary_entries_and_removes_only_its_own() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep"), "previous").unwrap();
+        let pid = std::process::id();
+        let squat_file = dir.path().join(format!(".state.json.{pid}.0.tmp"));
+        let squat_link = dir.path().join(format!(".state.json.{pid}.1.tmp"));
+        fs::write(&squat_file, "squatter").unwrap();
+        symlink(&path, &squat_link).unwrap();
+
+        let error = write_json_atomic_with(&path, &1, &mut (0..)).unwrap_err();
+
+        assert!(matches!(error, StoreError::Io { .. }));
+        assert_eq!(fs::read_to_string(&squat_file).unwrap(), "squatter");
+        assert_eq!(fs::read_link(&squat_link).unwrap(), path);
+        assert_eq!(fs::read_to_string(path.join("keep")).unwrap(), "previous");
+        assert_eq!(entries(dir.path()).len(), 3);
     }
 }

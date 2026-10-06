@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chimera_core::RunId;
 
@@ -11,9 +11,18 @@ pub fn state_root() -> Result<PathBuf, StoreError> {
     resolve_state_root(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
 
-/// The directory of one run: `<root>/<run-id>/`.
-pub fn run_directory(root: &Path, run: &RunId) -> PathBuf {
-    root.join(run.as_str())
+/// The directory of one run: `<root>/<run-id>/`. Fails when the run ID is not a single plain
+/// path component, so it cannot escape or alias the root.
+pub fn run_directory(root: &Path, run: &RunId) -> Result<PathBuf, StoreError> {
+    let id = run.as_str();
+    let mut components = Path::new(id).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) if name == id => Ok(root.join(id)),
+        _ => Err(StoreError::InvalidRunId {
+            root: root.to_path_buf(),
+            id: id.to_string(),
+        }),
+    }
 }
 
 fn non_empty(value: Option<OsString>) -> Option<PathBuf> {
@@ -71,8 +80,30 @@ mod tests {
     fn run_directory_is_under_root() {
         let run = RunId::new("run-1").unwrap();
         assert_eq!(
-            run_directory(Path::new("/root"), &run),
+            run_directory(Path::new("/root"), &run).unwrap(),
             PathBuf::from("/root/run-1")
         );
+    }
+
+    #[test]
+    fn run_directory_rejects_ids_that_are_not_a_single_component() {
+        for id in [
+            "/outside",
+            "../outside",
+            "..",
+            ".",
+            "a/b",
+            "a/",
+            "./a",
+            "a/..",
+            "a/../b",
+        ] {
+            let run = RunId::new(id).unwrap();
+            let error = run_directory(Path::new("/root"), &run).unwrap_err();
+            assert!(matches!(error, StoreError::InvalidRunId { .. }), "{id}");
+            let text = error.to_string();
+            assert!(text.contains("/root") && text.contains(id), "{text}");
+            assert!(chimera_core::error::PortError::from(error).is_failed());
+        }
     }
 }
