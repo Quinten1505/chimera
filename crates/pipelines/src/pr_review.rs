@@ -12,7 +12,7 @@ use chimera_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::agent_turn::{AgentTurns, TurnError, TurnRequest};
-use crate::driver::{Pipeline, PipelineState, drive};
+use crate::driver::{Pipeline, PipelineState};
 use crate::environment::{Environment, EnvironmentService, ProvisionSpec};
 use crate::error::{PauseReason, PipelineError};
 use crate::implementation::{ImplementationPipeline, ImplementationState, expected_head_key};
@@ -82,7 +82,8 @@ impl PipelineState for PrReviewState {
 
 /// Runs the Implementation pipeline that fixes the findings of a final review.
 pub trait Implement: Sync {
-    /// Runs the fix of review `cycle` until it is merged or paused.
+    /// Advances the fix of review `cycle` by one step and returns the state it is in: `Done`,
+    /// `Paused`, or a state to continue from on the next call.
     fn implement(
         &self,
         cycle: u32,
@@ -90,8 +91,10 @@ pub trait Implement: Sync {
     ) -> impl Future<Output = Result<ImplementationState, PipelineError>> + Send;
 }
 
-/// Drives the [`ImplementationPipeline`] that `build` makes for a review cycle and its findings.
-/// `build` must give the pipeline the findings as work item and the final configuration.
+/// Steps the [`ImplementationPipeline`] that `build` makes for a review cycle and its findings,
+/// saving its state after each step, so every step of the outer pipeline performs one effect
+/// of the fix. `build` must give the pipeline the findings as work item and the final
+/// configuration.
 ///
 /// A fix that is saved as paused is continued from where it paused: the outer pipeline only
 /// asks for it again after it was resumed, while a plain restart of a paused review never
@@ -111,27 +114,29 @@ where
         findings: &str,
     ) -> Result<ImplementationState, PipelineError> {
         let pipeline = (self.build)(cycle, findings);
-        if let Some(saved) = self
+        let state = match self
             .store
             .load_pipeline_state(&pipeline.run, &pipeline.instance)
             .await?
-            && let ImplementationState::Paused { resume_at, .. } = serde_json::from_value(saved)?
         {
-            self.store
-                .save_pipeline_state(
-                    &pipeline.run,
-                    &pipeline.instance,
-                    serde_json::to_value(&*resume_at)?,
-                )
-                .await?;
+            Some(saved) => match serde_json::from_value(saved)? {
+                ImplementationState::Paused { resume_at, .. } => *resume_at,
+                state => state,
+            },
+            None => pipeline.initial_state(),
+        };
+        if state.is_terminal() {
+            return Ok(state);
         }
-        drive(
-            self.store.as_ref(),
-            &pipeline.run,
-            &pipeline.instance.clone(),
-            &pipeline,
-        )
-        .await
+        let next = pipeline.step(state).await?;
+        self.store
+            .save_pipeline_state(
+                &pipeline.run,
+                &pipeline.instance,
+                serde_json::to_value(&next)?,
+            )
+            .await?;
+        Ok(next)
     }
 }
 
@@ -525,7 +530,7 @@ impl<I: Implement> PrReviewPipeline<I> {
         }
     }
 
-    /// Runs the fix; the review environment stays until the fix is merged.
+    /// Advances the fix by one step; the review environment stays until the fix is merged.
     async fn fix(
         &self,
         state: &PrReviewState,
@@ -536,7 +541,7 @@ impl<I: Implement> PrReviewPipeline<I> {
             match self.implementation.implement(cycle, findings).await? {
                 ImplementationState::Done(_) => PrReviewState::Refreshing { cycle },
                 ImplementationState::Paused { reason, .. } => paused(reason, state.clone()),
-                other => unreachable!("the Implementation pipeline stopped in {other:?}"),
+                _ => state.clone(),
             },
         )
     }
@@ -723,6 +728,7 @@ mod tests {
     use futures_executor::block_on;
 
     use super::*;
+    use crate::driver::drive;
     use crate::environment::AgentLaunch;
     use crate::merge_lock::MergeLock;
 
@@ -1622,6 +1628,57 @@ mod tests {
                 build,
             },
         }
+    }
+
+    #[test]
+    fn each_fixing_step_advances_the_fix_by_one_effect() {
+        let f = fixture(5, &[]);
+        let outer = drive_implementation_fixture(&f);
+        let fix = (outer.implementation.build)(1, "fix it");
+        let fixing = PrReviewState::Fixing {
+            cycle: 1,
+            findings: "fix it".into(),
+        };
+        let cleaning = ImplementationState::CleaningUp {
+            merged: CommitId::new("c0").unwrap(),
+        };
+        let fix_environment = |f: &Fixture| -> Environment {
+            let saved = block_on(f.store.load_pipeline_state(&run(), "fix/environment"));
+            serde_json::from_value(saved.unwrap().unwrap()).unwrap()
+        };
+        block_on(async {
+            fix.environment
+                .provision(
+                    f.store.as_ref(),
+                    &run(),
+                    "fix/environment",
+                    &fix.spec,
+                    &CommitId::new("c0").unwrap(),
+                )
+                .await
+                .unwrap();
+            f.store
+                .save_pipeline_state(&run(), "fix", serde_json::to_value(&cleaning).unwrap())
+                .await
+                .unwrap();
+        });
+        let load_fix = || block_on(f.store.load_pipeline_state(&run(), "fix")).unwrap();
+
+        // Close the workspace.
+        assert_eq!(block_on(outer.step(fixing.clone())).unwrap(), fixing);
+        assert_eq!(load_fix(), Some(serde_json::to_value(&cleaning).unwrap()));
+        let environment = fix_environment(&f);
+        assert!(environment.workspace.is_none() && environment.worktree_created);
+
+        // Remove the worktree.
+        assert_eq!(block_on(outer.step(fixing.clone())).unwrap(), fixing);
+        assert!(!fix_environment(&f).worktree_created);
+
+        // Prune; the fix is done.
+        assert_eq!(
+            block_on(outer.step(fixing)).unwrap(),
+            PrReviewState::Refreshing { cycle: 1 }
+        );
     }
 
     #[test]
