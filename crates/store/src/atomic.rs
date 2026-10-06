@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10,15 +10,55 @@ use serde::de::DeserializeOwned;
 use crate::StoreError;
 
 /// Writes `value` as JSON to `path`: serialize, write and flush a temporary file in the same
-/// directory, then rename it over the target. On any failure the previous content of `path`
-/// stays intact and the temporary file is removed.
+/// directory, rename it over the target, then flush the directory so the rename survives a crash.
+/// On a failure before the rename the previous content of `path` stays intact and the temporary
+/// file is removed; when only flushing the directory fails, `path` already holds the new content
+/// but may revert to the previous one after a crash, reported as [`StoreError::Unsynced`].
 pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     write_json_atomic_with(
         path,
         value,
         &mut std::iter::repeat_with(|| COUNTER.fetch_add(1, Ordering::Relaxed)),
+        &mut sync_directory,
     )
+}
+
+/// Flushes the entries of `directory`, such as a file created or renamed in it, to disk.
+pub(crate) fn sync_directory(directory: &Path) -> io::Result<()> {
+    File::open(directory)?.sync_all()
+}
+
+/// Creates `directory` and its missing ancestors like [`fs::create_dir_all`], flushing the parent
+/// of each directory it creates so that the new entries survive a crash.
+pub(crate) fn create_dir_all_durable(directory: &Path) -> Result<(), StoreError> {
+    create_dir_all_with(directory, &mut sync_directory)
+}
+
+fn create_dir_all_with(
+    directory: &Path,
+    sync: &mut dyn FnMut(&Path) -> io::Result<()>,
+) -> Result<(), StoreError> {
+    let parent = directory.parent().unwrap_or(directory);
+    match fs::create_dir(directory) {
+        Ok(()) => {}
+        Err(_) if directory.is_dir() => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound && parent != directory => {
+            create_dir_all_with(parent, sync)?;
+            match fs::create_dir(directory) {
+                Ok(()) => {}
+                Err(_) if directory.is_dir() => return Ok(()),
+                Err(e) => return Err(StoreError::io(directory, e)),
+            }
+        }
+        Err(e) => return Err(StoreError::io(directory, e)),
+    }
+    if let Err(e) = sync(parent) {
+        // An existing directory is assumed durable, so remove it to have a retry flush it again.
+        let _ = fs::remove_dir(directory);
+        return Err(StoreError::io(parent, e));
+    }
+    Ok(())
 }
 
 /// Reads and deserializes the JSON file at `path`; `None` when the file does not exist.
@@ -36,11 +76,12 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, S
         })
 }
 
-/// `suffixes` supplies the candidate temporary-name suffixes, in order.
+/// `suffixes` supplies the candidate temporary-name suffixes, in order; `sync` flushes a directory.
 fn write_json_atomic_with<T: Serialize>(
     path: &Path,
     value: &T,
     suffixes: &mut dyn Iterator<Item = u64>,
+    sync: &mut dyn FnMut(&Path) -> io::Result<()>,
 ) -> Result<(), StoreError> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|source| StoreError::Serialize {
         path: path.to_path_buf(),
@@ -53,7 +94,12 @@ fn write_json_atomic_with<T: Serialize>(
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result
+    result?;
+    let directory = path.parent().expect("a file path has a parent");
+    sync(directory).map_err(|source| StoreError::Unsynced {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Exclusively creates a uniquely named temporary file next to `path`. An existing entry at a
@@ -213,6 +259,107 @@ mod tests {
         assert_eq!(entries(dir.path()), ["state.json"]);
     }
 
+    #[test]
+    fn directory_is_synced_after_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, "previous").unwrap();
+        let mut synced = Vec::new();
+
+        write_json_atomic_with(&path, &7, &mut (0..), &mut |directory| {
+            // The rename is what the sync must persist, so it has already happened.
+            synced.push((directory.to_path_buf(), fs::read_to_string(&path).unwrap()));
+            assert_eq!(entries(dir.path()), ["state.json"]);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(synced, [(dir.path().to_path_buf(), "7".to_string())]);
+    }
+
+    #[test]
+    fn directory_sync_failure_is_unsynced_and_does_not_claim_the_previous_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, "previous").unwrap();
+
+        let error = write_json_atomic_with(&path, &7, &mut (0..), &mut |_| {
+            Err(io::Error::other("disk on fire"))
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, StoreError::Unsynced { .. }));
+        assert!(error.to_string().contains("state.json"));
+        assert!(error.to_string().contains("may not survive a crash"));
+        // The new content is in place; only its durability is unknown.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "7");
+        assert_eq!(entries(dir.path()), ["state.json"]);
+    }
+
+    #[test]
+    fn writes_before_the_rename_do_not_sync_the_directory_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep"), "previous").unwrap();
+        let mut synced = 0;
+
+        let error = write_json_atomic_with(&path, &1, &mut (0..), &mut |_| {
+            synced += 1;
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, StoreError::Io { .. }));
+        assert_eq!(synced, 0);
+    }
+
+    #[test]
+    fn created_directories_are_synced_into_their_parents_in_creation_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let deepest = dir.path().join("a/b/c");
+        let mut synced = Vec::new();
+
+        create_dir_all_with(&deepest, &mut |parent| {
+            let created: Vec<_> = fs::read_dir(parent).unwrap().collect();
+            assert_eq!(
+                created.len(),
+                1,
+                "the new entry exists before its parent is synced"
+            );
+            synced.push(parent.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(deepest.is_dir());
+        let (a, b) = (dir.path().join("a"), dir.path().join("a/b"));
+        assert_eq!(synced, [dir.path().to_path_buf(), a, b]);
+
+        // Existing directories were persisted when they were created.
+        create_dir_all_with(&deepest, &mut |_| panic!("nothing was created")).unwrap();
+        create_dir_all_durable(&deepest).unwrap();
+    }
+
+    #[test]
+    fn failed_directory_sync_removes_the_new_directory_so_a_retry_syncs_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run-1");
+
+        let error =
+            create_dir_all_with(&run, &mut |_| Err(io::Error::other("disk on fire"))).unwrap_err();
+
+        assert!(matches!(error, StoreError::Io { .. }));
+        assert!(!run.exists());
+        let mut synced = Vec::new();
+        create_dir_all_with(&run, &mut |parent| {
+            synced.push(parent.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(synced, [dir.path().to_path_buf()]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn preexisting_temporary_entries_are_preserved_and_skipped() {
@@ -227,7 +374,7 @@ mod tests {
         fs::write(&squat_file, "squatter").unwrap();
         symlink(&path, &squat_link).unwrap();
 
-        write_json_atomic_with(&path, &7, &mut (0..)).unwrap();
+        write_json_atomic_with(&path, &7, &mut (0..), &mut sync_directory).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "7");
         assert_eq!(fs::read_to_string(&squat_file).unwrap(), "squatter");
@@ -250,7 +397,7 @@ mod tests {
         fs::write(&squat_file, "squatter").unwrap();
         symlink(&path, &squat_link).unwrap();
 
-        let error = write_json_atomic_with(&path, &1, &mut (0..)).unwrap_err();
+        let error = write_json_atomic_with(&path, &1, &mut (0..), &mut sync_directory).unwrap_err();
 
         assert!(matches!(error, StoreError::Io { .. }));
         assert_eq!(fs::read_to_string(&squat_file).unwrap(), "squatter");

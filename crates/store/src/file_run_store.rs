@@ -8,6 +8,7 @@ use chimera_core::TurnResult;
 use chimera_core::error::PortError;
 use chimera_core::run_store::{EffectRecord, RunStore};
 
+use crate::atomic::create_dir_all_durable;
 use crate::history::{HistoryEntry, append_history, load_turns};
 use crate::paths::{run_directory, state_root, validate_root};
 use crate::{StoreError, merge_lock, pipeline, run_data};
@@ -114,7 +115,7 @@ impl RunStore for FileRunStore {
 
     async fn append_turn(&self, run: &RunId, turn: TurnResult) -> Result<(), PortError> {
         self.blocking(run, move |dir| {
-            std::fs::create_dir_all(dir).map_err(|e| StoreError::io(dir, e))?;
+            create_dir_all_durable(dir)?;
             // `history.md` is the only record; the port says neither which pipeline ran the turn
             // nor why, so the entry does not claim to know.
             append_history(

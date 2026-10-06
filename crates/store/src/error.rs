@@ -29,6 +29,12 @@ pub enum StoreError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// The file was replaced, but flushing its directory failed: a crash may revert the change.
+    #[error("{} was replaced, but syncing its directory failed, so the change may not survive a crash: {source}", path.display())]
+    Unsynced {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("cannot serialize {}: {source}", path.display())]
     Serialize {
         path: PathBuf,
@@ -50,10 +56,14 @@ impl StoreError {
     }
 }
 
-/// The store never reports an uncertain effect: every failure is classified as failed.
+/// A change that took effect but may not survive a crash is uncertain; every other failure leaves
+/// the stored state unchanged and is classified as failed.
 impl From<StoreError> for PortError {
     fn from(error: StoreError) -> Self {
-        PortError::failed(error.to_string())
+        match error {
+            StoreError::Unsynced { .. } => PortError::uncertain(error.to_string()),
+            _ => PortError::failed(error.to_string()),
+        }
     }
 }
 
@@ -72,6 +82,17 @@ mod tests {
         let text = port.to_string();
         assert!(text.contains("/state/run/file.json"));
         assert!(text.contains("disk on fire"));
+    }
+
+    #[test]
+    fn unsynced_change_is_uncertain_with_path_in_cause() {
+        let error = StoreError::Unsynced {
+            path: "/state/run/file.json".into(),
+            source: std::io::Error::other("disk on fire"),
+        };
+        let port: PortError = error.into();
+        assert!(port.is_uncertain());
+        assert!(port.to_string().contains("/state/run/file.json"));
     }
 
     #[test]

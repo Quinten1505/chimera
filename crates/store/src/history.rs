@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chimera_core::{Outcome, TurnOutcome, TurnResult};
 
 use crate::StoreError;
+use crate::atomic::sync_directory;
 
 const HISTORY_FILE: &str = "history.md";
 
@@ -41,13 +42,22 @@ pub(crate) struct HistoryEntry<'a> {
 }
 
 /// Appends `entry` to `history.md` in `run_directory`, creating the file on first append. Existing
-/// content is never rewritten; the entry is flushed to disk before this returns. On failure the
-/// entry is not left in the file; if the process dies mid-append instead, the next append first
-/// closes what the interrupted entry left open, so that entry is never loaded and later entries
-/// are.
+/// content is never rewritten; the entry, and the file's directory entry when the file was empty,
+/// are flushed to disk before this returns. On failure the entry is not left in the file; if the
+/// process dies mid-append instead, the next append first closes what the interrupted entry left
+/// open, so that entry is never loaded and later entries are.
 pub(crate) fn append_history(
     run_directory: &Path,
     entry: &HistoryEntry<'_>,
+) -> Result<(), StoreError> {
+    append_history_with(run_directory, entry, &mut sync_directory)
+}
+
+/// `sync` flushes a directory.
+fn append_history_with(
+    run_directory: &Path,
+    entry: &HistoryEntry<'_>,
+    sync: &mut dyn FnMut(&Path) -> io::Result<()>,
 ) -> Result<(), StoreError> {
     let path: PathBuf = run_directory.join(HISTORY_FILE);
     let _guard = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -66,13 +76,19 @@ pub(crate) fn append_history(
     let length = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
     let written = file
         .write_all(text.as_bytes())
-        .and_then(|()| file.sync_all());
-    if let Err(e) = written {
+        .and_then(|()| file.sync_all())
+        .map_err(|e| StoreError::io(&path, e))
+        // A new file is lost in a crash until its directory entry is flushed. An empty file may
+        // be one whose earlier first append failed at this step, so it is flushed again.
+        .and_then(|()| match length {
+            0 => sync(run_directory).map_err(|e| StoreError::io(run_directory, e)),
+            _ => Ok(()),
+        });
+    if written.is_err() {
         // A failed append must leave no entry behind, or a retry would record the turn twice.
         let _ = file.set_len(length);
-        return Err(StoreError::io(&path, e));
     }
-    Ok(())
+    written
 }
 
 /// What must precede the next entry so that it starts on its own line outside any fence, when the
@@ -492,6 +508,57 @@ mod tests {
         append_history(dir.path(), &entry).unwrap();
         assert_eq!(load_turns(dir.path()).unwrap(), [turn]);
         assert_eq!(headings(&read(dir.path())).len(), 1);
+    }
+
+    #[test]
+    fn creating_the_file_syncs_its_directory_after_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = valid("first");
+        let entry = HistoryEntry {
+            time: UNIX_EPOCH,
+            pipeline: None,
+            kind: None,
+            turn: &turn,
+        };
+        let mut synced = Vec::new();
+        let mut sync = |directory: &Path| {
+            synced.push((directory.to_path_buf(), load_turns(directory).unwrap()));
+            Ok(())
+        };
+
+        append_history_with(dir.path(), &entry, &mut sync).unwrap();
+        append_history_with(dir.path(), &entry, &mut sync).unwrap();
+
+        // Only the creating append syncs, once its entry is complete in the file.
+        assert_eq!(synced, [(dir.path().to_path_buf(), vec![turn])]);
+    }
+
+    #[test]
+    fn failed_directory_sync_leaves_nothing_to_load_and_a_retry_syncs_and_records_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = valid("retry me");
+        let entry = HistoryEntry {
+            time: UNIX_EPOCH,
+            pipeline: None,
+            kind: None,
+            turn: &turn,
+        };
+
+        let error = append_history_with(dir.path(), &entry, &mut |_| {
+            Err(io::Error::other("disk on fire"))
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, StoreError::Io { .. }));
+        assert!(load_turns(dir.path()).unwrap().is_empty());
+        let mut synced = 0;
+        append_history_with(dir.path(), &entry, &mut |_| {
+            synced += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(synced, 1);
+        assert_eq!(load_turns(dir.path()).unwrap(), [turn]);
     }
 
     #[test]

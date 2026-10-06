@@ -1,11 +1,10 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::StoreError;
-use crate::atomic::{read_json, write_json_atomic};
+use crate::atomic::{create_dir_all_durable, read_json, write_json_atomic};
 
 const FILE_NAME: &str = "merge-lock.json";
 
@@ -23,7 +22,7 @@ pub(crate) fn save_lock(run_dir: &Path, instance: &str, state: Value) -> Result<
     let path = run_dir.join(FILE_NAME);
     let mut locks: Locks = read_json(&path)?.unwrap_or_default();
     locks.insert(instance.to_string(), state);
-    fs::create_dir_all(run_dir).map_err(|e| StoreError::io(run_dir, e))?;
+    create_dir_all_durable(run_dir)?;
     write_json_atomic(&path, &locks)
 }
 
@@ -35,6 +34,8 @@ pub(crate) fn load_lock(run_dir: &Path, instance: &str) -> Result<Option<Value>,
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use serde_json::json;
 
     use super::*;

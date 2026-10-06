@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 
 use chimera_core::RunId;
@@ -6,7 +5,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::StoreError;
-use crate::atomic::{read_json, write_json_atomic};
+use crate::atomic::{create_dir_all_durable, read_json, write_json_atomic};
 use crate::paths::run_directory;
 
 const FILE_NAME: &str = "run.json";
@@ -19,7 +18,7 @@ pub(crate) fn save_run_data<T: Serialize>(
     data: &T,
 ) -> Result<(), StoreError> {
     let directory = run_directory(root, run)?;
-    fs::create_dir_all(&directory).map_err(|e| StoreError::io(&directory, e))?;
+    create_dir_all_durable(&directory)?;
     write_json_atomic(&directory.join(FILE_NAME), data)
 }
 
@@ -35,6 +34,7 @@ pub(crate) fn load_run_data<T: DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use chimera_core::{

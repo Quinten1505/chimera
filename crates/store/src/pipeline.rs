@@ -6,7 +6,7 @@ use chimera_core::run_store::EffectRecord;
 use serde::{Deserialize, Serialize};
 
 use crate::StoreError;
-use crate::atomic::write_json_atomic;
+use crate::atomic::{create_dir_all_durable, write_json_atomic};
 
 /// Whether an effect finished, as seen on load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +126,7 @@ fn read_file(path: &Path) -> Result<Option<PipelineFile>, StoreError> {
 
 fn write_file(path: &Path, file: &PipelineFile) -> Result<(), StoreError> {
     let directory = path.parent().expect("pipeline path has a parent");
-    fs::create_dir_all(directory).map_err(|e| StoreError::io(directory, e))?;
+    create_dir_all_durable(directory)?;
     write_json_atomic(path, file)
 }
 
