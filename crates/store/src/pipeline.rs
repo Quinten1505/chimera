@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::StoreError;
 use crate::atomic::write_json_atomic;
-use crate::paths::is_plain_component;
 
 /// Whether an effect finished, as seen on load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,13 +52,62 @@ fn pipelines_directory(run_dir: &Path) -> PathBuf {
     run_dir.join("pipelines")
 }
 
+/// File stem of the run-level effect records. It starts with a `%` that is not followed by two
+/// hex digits, which [`encode_id`] never produces, so no pipeline id can map to it.
+const RUN_EFFECTS_STEM: &str = "%run-effects";
+
+/// Name shown in errors for the run-level effect records.
+const RUN_EFFECTS_LABEL: &str = "<run>";
+
+/// Encodes a pipeline id as a file stem: ASCII letters, digits, `-` and `_` stay, every other
+/// byte becomes `%XX`. The mapping is injective and never yields a path separator or a leading dot.
+fn encode_id(id: &str) -> String {
+    let mut stem = String::with_capacity(id.len());
+    for byte in id.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
+            stem.push(char::from(byte));
+        } else {
+            stem.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    stem
+}
+
+/// The inverse of [`encode_id`]; `None` for a stem it cannot have produced.
+fn decode_id(stem: &str) -> Option<String> {
+    let bytes = stem.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let hex = stem.get(at + 1..at + 3)?;
+            if !hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+            {
+                return None;
+            }
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            at += 3;
+        } else {
+            decoded.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
 fn pipeline_path(run_dir: &Path, pipeline: &str) -> Result<PathBuf, StoreError> {
-    if !is_plain_component(pipeline) {
+    if pipeline.is_empty() {
         return Err(StoreError::InvalidPipelineId {
             id: pipeline.to_string(),
         });
     }
-    Ok(pipelines_directory(run_dir).join(format!("{pipeline}.json")))
+    Ok(pipelines_directory(run_dir).join(format!("{}.json", encode_id(pipeline))))
+}
+
+fn run_effects_path(run_dir: &Path) -> PathBuf {
+    pipelines_directory(run_dir).join(format!("{RUN_EFFECTS_STEM}.json"))
 }
 
 fn read_file(path: &Path) -> Result<Option<PipelineFile>, StoreError> {
@@ -83,7 +131,6 @@ fn write_file(path: &Path, file: &PipelineFile) -> Result<(), StoreError> {
 }
 
 /// Replaces the state of `pipeline`, keeping its effect records.
-#[allow(dead_code)]
 pub(crate) fn save_state(
     run_dir: &Path,
     pipeline: &str,
@@ -96,7 +143,6 @@ pub(crate) fn save_state(
 }
 
 /// The saved state of `pipeline`, or `None` when none was saved.
-#[allow(dead_code)]
 pub(crate) fn load_state(
     run_dir: &Path,
     pipeline: &str,
@@ -105,7 +151,8 @@ pub(crate) fn load_state(
     Ok(read_file(&path)?.and_then(|file| file.state))
 }
 
-/// Saves the intent of effect `key` before it runs. Fails when `key` already has a record.
+/// Saves the intent of effect `key` of `pipeline` before it runs. Fails when `key` already has a
+/// record.
 #[allow(dead_code)]
 pub(crate) fn record_intent(
     run_dir: &Path,
@@ -113,23 +160,11 @@ pub(crate) fn record_intent(
     key: &str,
     intent: &str,
 ) -> Result<(), StoreError> {
-    let path = pipeline_path(run_dir, pipeline)?;
-    let mut file = read_file(&path)?.unwrap_or_default();
-    if file.effects.iter().any(|effect| effect.key == key) {
-        return Err(StoreError::EffectAlreadyRecorded {
-            pipeline: pipeline.to_string(),
-            key: key.to_string(),
-        });
-    }
-    file.effects.push(EffectRecord {
-        key: key.to_string(),
-        intent: intent.to_string(),
-        outcome: None,
-    });
-    write_file(&path, &file)
+    record_intent_at(&pipeline_path(run_dir, pipeline)?, pipeline, key, intent)
 }
 
-/// Saves the outcome of effect `key` after it finished. Fails when no intent was recorded.
+/// Saves the outcome of effect `key` of `pipeline` after it finished. Fails when no intent was
+/// recorded.
 #[allow(dead_code)]
 pub(crate) fn record_outcome(
     run_dir: &Path,
@@ -137,18 +172,7 @@ pub(crate) fn record_outcome(
     key: &str,
     outcome: &str,
 ) -> Result<(), StoreError> {
-    let path = pipeline_path(run_dir, pipeline)?;
-    let mut file = read_file(&path)?.unwrap_or_default();
-    let record = file
-        .effects
-        .iter_mut()
-        .find(|effect| effect.key == key)
-        .ok_or_else(|| StoreError::EffectNotRecorded {
-            pipeline: pipeline.to_string(),
-            key: key.to_string(),
-        })?;
-    record.outcome = Some(outcome.to_string());
-    write_file(&path, &file)
+    record_outcome_at(&pipeline_path(run_dir, pipeline)?, pipeline, key, outcome)
 }
 
 /// The effects of `pipeline` in the order their intents were recorded, each classified.
@@ -157,8 +181,60 @@ pub(crate) fn load_effects(
     run_dir: &Path,
     pipeline: &str,
 ) -> Result<Vec<LoadedEffect>, StoreError> {
-    let path = pipeline_path(run_dir, pipeline)?;
-    let effects = read_file(&path)?
+    load_effects_at(&pipeline_path(run_dir, pipeline)?)
+}
+
+/// [`record_intent`] for the effects of the run itself, which belong to no pipeline instance.
+pub(crate) fn record_run_intent(run_dir: &Path, key: &str, intent: &str) -> Result<(), StoreError> {
+    record_intent_at(&run_effects_path(run_dir), RUN_EFFECTS_LABEL, key, intent)
+}
+
+/// [`record_outcome`] for the effects of the run itself.
+pub(crate) fn record_run_outcome(
+    run_dir: &Path,
+    key: &str,
+    outcome: &str,
+) -> Result<(), StoreError> {
+    record_outcome_at(&run_effects_path(run_dir), RUN_EFFECTS_LABEL, key, outcome)
+}
+
+/// [`load_effects`] for the effects of the run itself.
+pub(crate) fn load_run_effects(run_dir: &Path) -> Result<Vec<LoadedEffect>, StoreError> {
+    load_effects_at(&run_effects_path(run_dir))
+}
+
+fn record_intent_at(path: &Path, owner: &str, key: &str, intent: &str) -> Result<(), StoreError> {
+    let mut file = read_file(path)?.unwrap_or_default();
+    if file.effects.iter().any(|effect| effect.key == key) {
+        return Err(StoreError::EffectAlreadyRecorded {
+            pipeline: owner.to_string(),
+            key: key.to_string(),
+        });
+    }
+    file.effects.push(EffectRecord {
+        key: key.to_string(),
+        intent: intent.to_string(),
+        outcome: None,
+    });
+    write_file(path, &file)
+}
+
+fn record_outcome_at(path: &Path, owner: &str, key: &str, outcome: &str) -> Result<(), StoreError> {
+    let mut file = read_file(path)?.unwrap_or_default();
+    let record = file
+        .effects
+        .iter_mut()
+        .find(|effect| effect.key == key)
+        .ok_or_else(|| StoreError::EffectNotRecorded {
+            pipeline: owner.to_string(),
+            key: key.to_string(),
+        })?;
+    record.outcome = Some(outcome.to_string());
+    write_file(path, &file)
+}
+
+fn load_effects_at(path: &Path) -> Result<Vec<LoadedEffect>, StoreError> {
+    let effects = read_file(path)?
         .map(|file| file.effects)
         .unwrap_or_default();
     Ok(effects
@@ -174,7 +250,8 @@ pub(crate) fn load_effects(
         .collect())
 }
 
-/// Ids of all pipeline instances with a saved file, sorted.
+/// Ids of all pipeline instances with a saved file, sorted. The run-level effect records are not
+/// a pipeline instance.
 #[allow(dead_code)]
 pub(crate) fn list_pipelines(run_dir: &Path) -> Result<Vec<String>, StoreError> {
     let directory = pipelines_directory(run_dir);
@@ -191,8 +268,9 @@ pub(crate) fn list_pipelines(run_dir: &Path) -> Result<Vec<String>, StoreError> 
             .file_name()
             .to_str()
             .and_then(|n| n.strip_suffix(".json"))
+            .and_then(decode_id)
         {
-            ids.push(id.to_string());
+            ids.push(id);
         }
     }
     ids.sort();
@@ -366,15 +444,83 @@ mod tests {
     }
 
     #[test]
-    fn invalid_pipeline_ids_are_rejected() {
+    fn empty_pipeline_id_is_rejected() {
         let run = dir();
-        for id in ["../x", "a/b", "..", "/abs", ""] {
-            let error = save_state(run.path(), id, json!(1)).unwrap_err();
-            assert!(
-                matches!(error, StoreError::InvalidPipelineId { .. }),
-                "{id}"
-            );
+        let error = save_state(run.path(), "", json!(1)).unwrap_err();
+        assert!(matches!(error, StoreError::InvalidPipelineId { .. }));
+    }
+
+    #[test]
+    fn ids_with_separators_stay_inside_the_pipelines_directory() {
+        let run = dir();
+        let ids = [
+            "../x",
+            "a/b",
+            "..",
+            "/abs",
+            ".",
+            "merge_lock:spec/8-store",
+            "ü",
+            "%41",
+        ];
+        for (n, id) in ids.iter().enumerate() {
+            save_state(run.path(), id, json!(n)).unwrap();
         }
+        for (n, id) in ids.iter().enumerate() {
+            assert_eq!(load_state(run.path(), id).unwrap(), Some(json!(n)), "{id}");
+        }
+        let files = fs::read_dir(run.path().join("pipelines")).unwrap().count();
+        assert_eq!(files, ids.len());
+        assert_eq!(fs::read_dir(run.path()).unwrap().count(), 1);
+        let mut listed = list_pipelines(run.path()).unwrap();
+        listed.sort();
+        let mut expected: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        expected.sort();
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn id_encoding_round_trips() {
+        for id in [
+            "a",
+            "a.b",
+            "%",
+            "%25",
+            "x y",
+            "é/√",
+            "_effects",
+            "%run-effects",
+        ] {
+            assert_eq!(decode_id(&encode_id(id)).as_deref(), Some(id));
+        }
+        assert_eq!(decode_id(RUN_EFFECTS_STEM), None);
+    }
+
+    #[test]
+    fn run_effects_do_not_collide_with_any_pipeline_id() {
+        let run = dir();
+        record_run_intent(run.path(), "k", "run intent").unwrap();
+        for id in ["_effects", "%run-effects", "effects", "<run>"] {
+            save_state(run.path(), id, json!(id)).unwrap();
+            record_intent(run.path(), id, "k", id).unwrap();
+        }
+
+        let run_effects = load_run_effects(run.path()).unwrap();
+        assert_eq!(run_effects.len(), 1);
+        assert_eq!(run_effects[0].record.intent, "run intent");
+        for id in ["_effects", "%run-effects", "effects", "<run>"] {
+            assert_eq!(load_state(run.path(), id).unwrap(), Some(json!(id)));
+            assert_eq!(load_effects(run.path(), id).unwrap()[0].record.intent, id);
+        }
+        assert_eq!(
+            list_pipelines(run.path()).unwrap(),
+            ["%run-effects", "<run>", "_effects", "effects"]
+        );
+        record_run_outcome(run.path(), "k", "done").unwrap();
+        assert_eq!(
+            load_run_effects(run.path()).unwrap()[0].status,
+            EffectStatus::Completed
+        );
     }
 
     #[test]

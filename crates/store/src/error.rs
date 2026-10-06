@@ -6,8 +6,14 @@ use thiserror::Error;
 /// Error raised by the store. Every file-related variant names the path involved.
 #[derive(Debug, Error)]
 pub enum StoreError {
-    #[error("cannot determine the state directory: neither XDG_STATE_HOME nor HOME is set")]
+    #[error(
+        "cannot determine the state directory: neither an absolute XDG_STATE_HOME nor an absolute HOME is set"
+    )]
     StateRootUnresolved,
+    #[error("invalid state root {}: {reason}", root.display())]
+    InvalidRoot { root: PathBuf, reason: &'static str },
+    #[error("state root {} is inside the repository or worktree {}", root.display(), repository.display())]
+    RootInRepository { root: PathBuf, repository: PathBuf },
     #[error("invalid run id {id:?} for the run directory under {}: it must be a single plain path component", root.display())]
     InvalidRunId { root: PathBuf, id: String },
     #[error("unknown run: no run data in the run directory {}", directory.display())]

@@ -1,8 +1,9 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use chimera_core::{AgentConfiguration, Feature, IssueRef, RunId, TicketPlan};
-use serde::{Deserialize, Serialize};
+use chimera_core::RunId;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::StoreError;
 use crate::atomic::{read_json, write_json_atomic};
@@ -10,26 +11,13 @@ use crate::paths::run_directory;
 
 const FILE_NAME: &str = "run.json";
 
-/// What a run was started with.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunInput {
-    pub repository: PathBuf,
-    pub specification: IssueRef,
-    pub configuration_file: PathBuf,
-}
-
-/// The contents of `run.json`: fixed for the run once the Configuration and Feature pipelines
-/// have produced them.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RunData {
-    pub input: RunInput,
-    pub ticket_plan: TicketPlan,
-    pub feature: Feature,
-    pub configuration: AgentConfiguration,
-}
-
-/// Writes `run.json` in the run's directory atomically, creating the directory if needed.
-pub(crate) fn save_run_data(root: &Path, run: &RunId, data: &RunData) -> Result<(), StoreError> {
+/// Writes `run.json` in the run's directory atomically, creating the directory if needed. The
+/// data is opaque: it is stored as given, including fields the store does not know.
+pub(crate) fn save_run_data<T: Serialize>(
+    root: &Path,
+    run: &RunId,
+    data: &T,
+) -> Result<(), StoreError> {
     let directory = run_directory(root, run)?;
     fs::create_dir_all(&directory).map_err(|e| StoreError::io(&directory, e))?;
     write_json_atomic(&directory.join(FILE_NAME), data)
@@ -37,16 +25,44 @@ pub(crate) fn save_run_data(root: &Path, run: &RunId, data: &RunData) -> Result<
 
 /// Reads `run.json` of `run`. A run without it is unknown: [`StoreError::RunNotFound`] names the
 /// run directory that was looked up.
-pub(crate) fn load_run_data(root: &Path, run: &RunId) -> Result<RunData, StoreError> {
+pub(crate) fn load_run_data<T: DeserializeOwned>(
+    root: &Path,
+    run: &RunId,
+) -> Result<T, StoreError> {
     let directory = run_directory(root, run)?;
     read_json(&directory.join(FILE_NAME))?.ok_or(StoreError::RunNotFound { directory })
 }
 
 #[cfg(test)]
 mod tests {
-    use chimera_core::{AgentProfile, BranchName, CommitId, Ticket};
+    use std::path::PathBuf;
+
+    use chimera_core::{
+        AgentConfiguration, AgentProfile, BranchName, CommitId, Feature, IssueRef, Ticket,
+        TicketPlan,
+    };
+    use serde::Deserialize;
+    use serde_json::json;
 
     use super::*;
+
+    /// What a run was started with.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RunInput {
+        pub repository: PathBuf,
+        pub specification: IssueRef,
+        pub configuration_file: PathBuf,
+    }
+
+    /// The contents of `run.json`: fixed for the run once the Configuration and Feature pipelines
+    /// have produced them.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct RunData {
+        pub input: RunInput,
+        pub ticket_plan: TicketPlan,
+        pub feature: Feature,
+        pub configuration: AgentConfiguration,
+    }
 
     fn issue(number: u64) -> IssueRef {
         IssueRef::new("octo", "repo", number).unwrap()
@@ -95,7 +111,7 @@ mod tests {
 
         save_run_data(root.path(), &run(), &data()).unwrap();
 
-        let loaded = load_run_data(root.path(), &run()).unwrap();
+        let loaded = load_run_data::<RunData>(root.path(), &run()).unwrap();
         assert_eq!(loaded, data());
         assert_eq!(
             loaded.input.configuration_file,
@@ -113,7 +129,10 @@ mod tests {
         save_run_data(root.path(), &run(), &data()).unwrap();
         save_run_data(root.path(), &run(), &changed).unwrap();
 
-        assert_eq!(load_run_data(root.path(), &run()).unwrap(), changed);
+        assert_eq!(
+            load_run_data::<RunData>(root.path(), &run()).unwrap(),
+            changed
+        );
     }
 
     #[test]
@@ -126,15 +145,22 @@ mod tests {
         save_run_data(root.path(), &run(), &data()).unwrap();
         save_run_data(root.path(), &other, &changed).unwrap();
 
-        assert_eq!(load_run_data(root.path(), &run()).unwrap(), data());
-        assert_eq!(load_run_data(root.path(), &other).unwrap(), changed);
+        assert_eq!(
+            load_run_data::<RunData>(root.path(), &run()).unwrap(),
+            data()
+        );
+        assert_eq!(
+            load_run_data::<RunData>(root.path(), &other).unwrap(),
+            changed
+        );
     }
 
     #[test]
     fn unknown_run_is_a_failed_error_naming_the_run_directory() {
         let root = tempfile::tempdir().unwrap();
 
-        let error = load_run_data(root.path(), &RunId::new("nope").unwrap()).unwrap_err();
+        let error =
+            load_run_data::<RunData>(root.path(), &RunId::new("nope").unwrap()).unwrap_err();
 
         assert!(matches!(error, StoreError::RunNotFound { .. }));
         assert!(
@@ -147,12 +173,29 @@ mod tests {
     }
 
     #[test]
+    fn opaque_values_and_unknown_fields_round_trip_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let values = [
+            json!({"x": 1}),
+            json!(null),
+            json!([1, "two", {"three": null}]),
+            json!("text"),
+            json!({"input": {"future_field": [1, 2]}, "extra": {"a": null}}),
+        ];
+        for value in values {
+            save_run_data(root.path(), &run(), &value).unwrap();
+            let loaded: serde_json::Value = load_run_data(root.path(), &run()).unwrap();
+            assert_eq!(loaded, value);
+        }
+    }
+
+    #[test]
     fn corrupt_run_data_is_a_deserialize_error() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("run-1")).unwrap();
         fs::write(root.path().join("run-1/run.json"), "{").unwrap();
 
-        let error = load_run_data(root.path(), &run()).unwrap_err();
+        let error = load_run_data::<serde_json::Value>(root.path(), &run()).unwrap_err();
 
         assert!(matches!(error, StoreError::Deserialize { .. }));
     }

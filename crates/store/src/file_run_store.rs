@@ -8,19 +8,14 @@ use chimera_core::TurnResult;
 use chimera_core::error::PortError;
 use chimera_core::run_store::{EffectRecord, RunStore};
 
-use crate::history::{HistoryEntry, TurnKind, append_history, append_turn_record, load_turns};
-use crate::paths::{run_directory, state_root};
-use crate::run_data::{self, RunData};
-use crate::{StoreError, pipeline};
-
-/// The pipeline file that holds a run's effect records: the port records effects per run, the
-/// store keeps them per pipeline file. The name cannot be used as a real pipeline id.
-const EFFECTS_PIPELINE: &str = "_effects";
-
-/// The pipeline name `history.md` shows for turns, which the port does not attribute to one.
-const HISTORY_PIPELINE: &str = "-";
+use crate::history::{HistoryEntry, append_history, load_turns};
+use crate::paths::{run_directory, state_root, validate_root};
+use crate::{StoreError, merge_lock, pipeline, run_data};
 
 /// [`RunStore`] on the file system: one directory per run under the state root.
+///
+/// Pipeline instances whose id starts with `merge_lock:` are merge locks and live in
+/// `merge-lock.json`; every other instance has its own file under `pipelines/`.
 #[derive(Debug, Clone)]
 pub struct FileRunStore {
     root: PathBuf,
@@ -29,17 +24,21 @@ pub struct FileRunStore {
 }
 
 impl FileRunStore {
-    /// A store under `$XDG_STATE_HOME/chimera/runs`, or `~/.local/state/chimera/runs`.
+    /// A store under `$XDG_STATE_HOME/chimera/runs`, or `~/.local/state/chimera/runs`. A relative
+    /// `XDG_STATE_HOME` is ignored; the root is never under the current directory or a repository.
     pub fn from_xdg_default() -> Result<Self, StoreError> {
-        Ok(Self::with_root(state_root()?))
+        Self::with_root(state_root()?)
     }
 
-    /// A store whose run directories are created under `root`.
-    pub fn with_root(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
+    /// A store whose run directories are created under `root`, which must be an absolute path
+    /// outside every git repository and worktree.
+    pub fn with_root(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        let root = root.into();
+        validate_root(&root)?;
+        Ok(Self {
+            root,
             lock: Arc::default(),
-        }
+        })
     }
 
     /// Runs `operation` on a blocking thread with the run's directory.
@@ -60,15 +59,6 @@ impl FileRunStore {
     }
 }
 
-fn check_pipeline(pipeline: &str) -> Result<(), PortError> {
-    if pipeline == EFFECTS_PIPELINE {
-        return Err(PortError::failed(format!(
-            "pipeline id {pipeline:?} is reserved for effect records"
-        )));
-    }
-    Ok(())
-}
-
 #[async_trait]
 impl RunStore for FileRunStore {
     async fn save_pipeline_state(
@@ -77,10 +67,15 @@ impl RunStore for FileRunStore {
         pipeline: &str,
         state: serde_json::Value,
     ) -> Result<(), PortError> {
-        check_pipeline(pipeline)?;
         let pipeline = pipeline.to_string();
-        self.blocking(run, move |dir| pipeline::save_state(dir, &pipeline, state))
-            .await
+        self.blocking(run, move |dir| {
+            if pipeline.starts_with(merge_lock::INSTANCE_PREFIX) {
+                merge_lock::save_lock(dir, &pipeline, state)
+            } else {
+                pipeline::save_state(dir, &pipeline, state)
+            }
+        })
+        .await
     }
 
     async fn load_pipeline_state(
@@ -88,15 +83,18 @@ impl RunStore for FileRunStore {
         run: &RunId,
         pipeline: &str,
     ) -> Result<Option<serde_json::Value>, PortError> {
-        check_pipeline(pipeline)?;
         let pipeline = pipeline.to_string();
-        self.blocking(run, move |dir| pipeline::load_state(dir, &pipeline))
-            .await
+        self.blocking(run, move |dir| {
+            if pipeline.starts_with(merge_lock::INSTANCE_PREFIX) {
+                merge_lock::load_lock(dir, &pipeline)
+            } else {
+                pipeline::load_state(dir, &pipeline)
+            }
+        })
+        .await
     }
 
     async fn save_run_data(&self, run: &RunId, data: serde_json::Value) -> Result<(), PortError> {
-        let data: RunData = serde_json::from_value(data)
-            .map_err(|e| PortError::failed(format!("invalid run data: {e}")))?;
         let (root, run_id) = (self.root.clone(), run.clone());
         self.blocking(run, move |_| run_data::save_run_data(&root, &run_id, &data))
             .await
@@ -104,33 +102,27 @@ impl RunStore for FileRunStore {
 
     async fn load_run_data(&self, run: &RunId) -> Result<Option<serde_json::Value>, PortError> {
         let (root, run_id) = (self.root.clone(), run.clone());
-        let data = self
-            .blocking(run, move |_| {
-                match run_data::load_run_data(&root, &run_id) {
-                    Ok(data) => Ok(Some(data)),
-                    Err(StoreError::RunNotFound { .. }) => Ok(None),
-                    Err(e) => Err(e),
-                }
-            })
-            .await?;
-        data.map(|data| {
-            serde_json::to_value(data)
-                .map_err(|e| PortError::failed(format!("cannot represent run data: {e}")))
+        self.blocking(run, move |_| {
+            match run_data::load_run_data(&root, &run_id) {
+                Ok(data) => Ok(Some(data)),
+                Err(StoreError::RunNotFound { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
         })
-        .transpose()
+        .await
     }
 
     async fn append_turn(&self, run: &RunId, turn: TurnResult) -> Result<(), PortError> {
         self.blocking(run, move |dir| {
             std::fs::create_dir_all(dir).map_err(|e| StoreError::io(dir, e))?;
-            // The JSON line is the source for `load_history`; `history.md` is the readable log.
-            append_turn_record(dir, &turn)?;
+            // `history.md` is the only record; the port says neither which pipeline ran the turn
+            // nor why, so the entry does not claim to know.
             append_history(
                 dir,
                 &HistoryEntry {
                     time: SystemTime::now(),
-                    pipeline: HISTORY_PIPELINE,
-                    kind: TurnKind::Initial,
+                    pipeline: None,
+                    kind: None,
                     turn: &turn,
                 },
             )
@@ -150,7 +142,7 @@ impl RunStore for FileRunStore {
     ) -> Result<(), PortError> {
         let (key, intent) = (key.to_string(), intent.to_string());
         self.blocking(run, move |dir| {
-            pipeline::record_intent(dir, EFFECTS_PIPELINE, &key, &intent)
+            pipeline::record_run_intent(dir, &key, &intent)
         })
         .await
     }
@@ -163,14 +155,14 @@ impl RunStore for FileRunStore {
     ) -> Result<(), PortError> {
         let (key, outcome) = (key.to_string(), outcome.to_string());
         self.blocking(run, move |dir| {
-            pipeline::record_outcome(dir, EFFECTS_PIPELINE, &key, &outcome)
+            pipeline::record_run_outcome(dir, &key, &outcome)
         })
         .await
     }
 
     async fn load_effects(&self, run: &RunId) -> Result<Vec<EffectRecord>, PortError> {
         self.blocking(run, |dir| {
-            Ok(pipeline::load_effects(dir, EFFECTS_PIPELINE)?
+            Ok(pipeline::load_run_effects(dir)?
                 .into_iter()
                 .map(|loaded| loaded.record)
                 .collect())
@@ -181,52 +173,17 @@ impl RunStore for FileRunStore {
 
 #[cfg(test)]
 mod tests {
-    use chimera_core::{
-        AgentConfiguration, AgentId, AgentProfile, BranchName, CommitId, Feature, IssueRef,
-        IssueStatus, Outcome, Role, Ticket, TicketPlan, TurnOutcome,
-    };
+    use chimera_core::{AgentId, Outcome, Role, TurnOutcome};
     use serde_json::json;
 
     use super::*;
-    use crate::merge_lock::{MergeLockEntry, MergeLockState, load_merge_lock, save_merge_lock};
-    use crate::run_data::RunInput;
 
     fn run() -> RunId {
         RunId::new("run-1").unwrap()
     }
 
-    fn issue(number: u64) -> IssueRef {
-        IssueRef::new("octo", "repo", number).unwrap()
-    }
-
-    fn run_data() -> serde_json::Value {
-        let data = RunData {
-            input: RunInput {
-                repository: PathBuf::from("/work/repo"),
-                specification: issue(8),
-                configuration_file: PathBuf::from("/work/chimera.toml"),
-            },
-            ticket_plan: TicketPlan {
-                tickets: vec![Ticket {
-                    issue: issue(56),
-                    status: IssueStatus::Open,
-                    blockers: vec![],
-                }],
-            },
-            feature: Feature {
-                specification: issue(8),
-                base_branch: BranchName::new("main").unwrap(),
-                feature_branch: BranchName::new("spec/8-store").unwrap(),
-                expected_remote_head: CommitId::new("abc123").unwrap(),
-                draft_pull_request: issue(9),
-            },
-            configuration: AgentConfiguration {
-                implementation: AgentProfile::new("codex", "m1", "implement"),
-                review: AgentProfile::new("codex", "m2", "review"),
-                merge: AgentProfile::new("claude", "m3", "merge"),
-            },
-        };
-        serde_json::to_value(data).unwrap()
+    fn store(root: &tempfile::TempDir) -> FileRunStore {
+        FileRunStore::with_root(root.path()).unwrap()
     }
 
     fn turn(explanation: &str) -> TurnResult {
@@ -237,93 +194,21 @@ mod tests {
         }
     }
 
-    fn lock_state() -> MergeLockState {
-        let entry = |owner: &str, sequence| MergeLockEntry {
-            owner: owner.into(),
-            sequence,
-        };
-        MergeLockState {
-            holder: Some(entry("impl-1", 1)),
-            waiters: vec![entry("impl-3", 3), entry("impl-2", 2)],
-        }
-    }
-
-    #[tokio::test]
-    async fn restart_restores_everything_in_order() {
-        let root = tempfile::tempdir().unwrap();
-        let id = run();
-        let store: Arc<dyn RunStore> = Arc::new(FileRunStore::with_root(root.path()));
-
-        store.save_run_data(&id, run_data()).await.unwrap();
-        store
-            .save_pipeline_state(&id, "impl-1", json!({"step": "Review"}))
-            .await
-            .unwrap();
-        store
-            .save_pipeline_state(&id, "impl-2", json!(null))
-            .await
-            .unwrap();
-        store
-            .record_effect_intent(&id, "merge-1", "merge #1")
-            .await
-            .unwrap();
-        store
-            .record_effect_outcome(&id, "merge-1", "merged abc")
-            .await
-            .unwrap();
-        store
-            .record_effect_intent(&id, "merge-2", "merge #2")
-            .await
-            .unwrap();
-        save_merge_lock(root.path(), &id, &lock_state()).unwrap();
-        for explanation in ["first", "second", "third"] {
-            store.append_turn(&id, turn(explanation)).await.unwrap();
-        }
-        drop(store);
-
-        let store: Arc<dyn RunStore> = Arc::new(FileRunStore::with_root(root.path()));
-
-        assert_eq!(store.load_run_data(&id).await.unwrap(), Some(run_data()));
-        assert_eq!(
-            store.load_pipeline_state(&id, "impl-1").await.unwrap(),
-            Some(json!({"step": "Review"}))
-        );
-        assert_eq!(
-            store.load_pipeline_state(&id, "impl-2").await.unwrap(),
-            Some(json!(null))
-        );
-        assert_eq!(
-            store.load_effects(&id).await.unwrap(),
-            [
-                EffectRecord {
-                    key: "merge-1".into(),
-                    intent: "merge #1".into(),
-                    outcome: Some("merged abc".into()),
-                },
-                EffectRecord {
-                    key: "merge-2".into(),
-                    intent: "merge #2".into(),
-                    outcome: None,
-                },
-            ]
-        );
-        assert_eq!(load_merge_lock(root.path(), &id).unwrap(), lock_state());
-        assert_eq!(
-            store.load_history(&id).await.unwrap(),
-            [turn("first"), turn("second"), turn("third")]
-        );
-        let log = std::fs::read_to_string(root.path().join("run-1/history.md")).unwrap();
-        assert_eq!(log.matches("## ").count(), 3);
-    }
-
     #[tokio::test]
     async fn unknown_run_loads_as_empty() {
         let root = tempfile::tempdir().unwrap();
-        let store = FileRunStore::with_root(root.path());
+        let store = store(&root);
         let id = run();
 
         assert_eq!(store.load_run_data(&id).await.unwrap(), None);
         assert_eq!(store.load_pipeline_state(&id, "p").await.unwrap(), None);
+        assert_eq!(
+            store
+                .load_pipeline_state(&id, "merge_lock:b")
+                .await
+                .unwrap(),
+            None
+        );
         assert!(store.load_history(&id).await.unwrap().is_empty());
         assert!(store.load_effects(&id).await.unwrap().is_empty());
     }
@@ -331,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn effect_misuse_fails_and_keeps_records() {
         let root = tempfile::tempdir().unwrap();
-        let store = FileRunStore::with_root(root.path());
+        let store = store(&root);
         let id = run();
         store.record_effect_intent(&id, "k", "first").await.unwrap();
 
@@ -344,12 +229,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_inputs_fail_without_touching_the_root() {
+    async fn run_data_is_stored_losslessly() {
         let root = tempfile::tempdir().unwrap();
-        let store = FileRunStore::with_root(root.path());
+        let store = store(&root);
+        let values = [
+            json!({"x": 1}),
+            json!(null),
+            json!([1, {"a": null}]),
+            json!({"input": {"repository": "/r", "future": [1]}, "unknown": true}),
+        ];
+        for value in values {
+            store.save_run_data(&run(), value.clone()).await.unwrap();
+            assert_eq!(store.load_run_data(&run()).await.unwrap(), Some(value));
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_ids_never_collide_with_run_effects_or_each_other() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(&root);
+        let id = run();
+        store
+            .record_effect_intent(&id, "k", "run effect")
+            .await
+            .unwrap();
+        let pipelines = [
+            "_effects",
+            "%run-effects",
+            "effects",
+            "a/b",
+            "a%2Fb",
+            "../x",
+        ];
+        for name in pipelines {
+            store
+                .save_pipeline_state(&id, name, json!(name))
+                .await
+                .unwrap();
+        }
+
+        for name in pipelines {
+            assert_eq!(
+                store.load_pipeline_state(&id, name).await.unwrap(),
+                Some(json!(name))
+            );
+        }
+        let effects = store.load_effects(&id).await.unwrap();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].intent, "run effect");
+        // Nothing was written outside the run directory.
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn merge_lock_ids_are_stored_in_merge_lock_json() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(&root);
+        let state = json!({"holder": {"owner": "a", "sequence": 0}});
+
+        store
+            .save_pipeline_state(&run(), "merge_lock:spec/8-store", state.clone())
+            .await
+            .unwrap();
+
+        assert!(root.path().join("run-1/merge-lock.json").is_file());
+        assert!(!root.path().join("run-1/pipelines").exists());
+        assert_eq!(
+            store
+                .load_pipeline_state(&run(), "merge_lock:spec/8-store")
+                .await
+                .unwrap(),
+            Some(state)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_run_ids_fail_without_touching_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(&root);
         let escaping = RunId::new("../outside").unwrap();
 
-        assert!(store.save_run_data(&run(), json!({"x": 1})).await.is_err());
+        assert!(store.save_run_data(&escaping, json!(1)).await.is_err());
         assert!(
             store
                 .save_pipeline_state(&escaping, "p", json!(1))
@@ -358,14 +318,7 @@ mod tests {
         );
         assert!(
             store
-                .save_pipeline_state(&run(), "_effects", json!(1))
-                .await
-                .unwrap_err()
-                .is_failed()
-        );
-        assert!(
-            store
-                .save_pipeline_state(&run(), "../p", json!(1))
+                .save_pipeline_state(&run(), "", json!(1))
                 .await
                 .unwrap_err()
                 .is_failed()
@@ -374,9 +327,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_append_is_not_loaded_and_a_retry_records_once() {
+        let root = tempfile::tempdir().unwrap();
+        let id = run();
+        let history = root.path().join("run-1/history.md");
+        let first = store(&root);
+        // A directory in place of the file makes the Markdown write fail.
+        std::fs::create_dir_all(&history).unwrap();
+
+        let failed = first.append_turn(&id, turn("once")).await.unwrap_err();
+        assert!(failed.is_failed());
+        std::fs::remove_dir(&history).unwrap();
+        drop(first);
+
+        let restarted = store(&root);
+        assert!(restarted.load_history(&id).await.unwrap().is_empty());
+        restarted.append_turn(&id, turn("once")).await.unwrap();
+
+        assert_eq!(restarted.load_history(&id).await.unwrap(), [turn("once")]);
+        let log = std::fs::read_to_string(&history).unwrap();
+        assert_eq!(
+            log.matches("\n## ").count() + log.starts_with("## ") as usize,
+            1
+        );
+        assert!(!root.path().join("run-1/turns.jsonl").exists());
+    }
+
+    #[tokio::test]
     async fn concurrent_effect_intents_are_all_kept() {
         let root = tempfile::tempdir().unwrap();
-        let store = FileRunStore::with_root(root.path());
+        let store = store(&root);
         let id = run();
 
         let tasks: Vec<_> = (0..16)
@@ -395,5 +375,14 @@ mod tests {
         }
 
         assert_eq!(store.load_effects(&id).await.unwrap().len(), 16);
+    }
+
+    #[test]
+    fn constructor_rejects_relative_and_repository_roots() {
+        assert!(FileRunStore::with_root("relative-state").is_err());
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        let error = FileRunStore::with_root(repository.path().join("runs")).unwrap_err();
+        assert!(matches!(error, StoreError::RootInRepository { .. }));
     }
 }

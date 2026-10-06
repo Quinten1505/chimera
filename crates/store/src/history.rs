@@ -9,7 +9,10 @@ use chimera_core::{Outcome, TurnOutcome, TurnResult};
 use crate::StoreError;
 
 const HISTORY_FILE: &str = "history.md";
-const TURNS_FILE: &str = "turns.jsonl";
+
+/// An entry carries its turn as one line of this form, after the readable summary.
+const RECORD_PREFIX: &str = "<!-- chimera-turn ";
+const RECORD_SUFFIX: &str = " -->";
 
 /// Serializes appends within this process so entries from different pipeline instances never
 /// interleave; each entry is also written with a single `write_all` to a file opened for append.
@@ -17,11 +20,12 @@ static APPEND_LOCK: Mutex<()> = Mutex::new(());
 
 /// Why the turn took place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The port does not say why a turn took place, so the store records no kind for its turns yet.
+#[allow(dead_code)]
 pub(crate) enum TurnKind {
     /// The first turn of an assignment.
     Initial,
     /// A turn asking the agent to correct invalid output.
-    #[allow(dead_code)]
     Correction,
 }
 
@@ -29,14 +33,16 @@ pub(crate) enum TurnKind {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HistoryEntry<'a> {
     pub time: SystemTime,
-    /// The pipeline instance that ran the turn.
-    pub pipeline: &'a str,
-    pub kind: TurnKind,
+    /// The pipeline instance that ran the turn, when known.
+    pub pipeline: Option<&'a str>,
+    /// Why the turn took place, when known.
+    pub kind: Option<TurnKind>,
     pub turn: &'a TurnResult,
 }
 
 /// Appends `entry` to `history.md` in `run_directory`, creating the file on first append. Existing
-/// content is never rewritten; the entry is flushed to disk before this returns.
+/// content is never rewritten; the entry is flushed to disk before this returns. On failure the
+/// entry is not left in the file.
 pub(crate) fn append_history(
     run_directory: &Path,
     entry: &HistoryEntry<'_>,
@@ -49,50 +55,54 @@ pub(crate) fn append_history(
         .create(true)
         .open(&path)
         .map_err(|e| StoreError::io(&path, e))?;
-    file.write_all(text.as_bytes())
-        .map_err(|e| StoreError::io(&path, e))?;
-    file.sync_all().map_err(|e| StoreError::io(&path, e))
+    let length = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
+    let written = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all());
+    if let Err(e) = written {
+        // A failed append must leave no entry behind, or a retry would record the turn twice.
+        let _ = file.set_len(length);
+        return Err(StoreError::io(&path, e));
+    }
+    Ok(())
 }
 
-/// Appends `turn` as one JSON line to `turns.jsonl`, the machine-readable counterpart of
-/// `history.md` that [`load_turns`] reads back.
-pub(crate) fn append_turn_record(
-    run_directory: &Path,
-    turn: &TurnResult,
-) -> Result<(), StoreError> {
-    let path = run_directory.join(TURNS_FILE);
-    let mut line = serde_json::to_vec(turn).map_err(|source| StoreError::Serialize {
-        path: path.clone(),
-        source,
-    })?;
-    line.push(b'\n');
-    let _guard = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&path)
-        .map_err(|e| StoreError::io(&path, e))?;
-    file.write_all(&line)
-        .map_err(|e| StoreError::io(&path, e))?;
-    file.sync_all().map_err(|e| StoreError::io(&path, e))
-}
-
-/// Reads the turns of `turns.jsonl` in append order; a run without turns has none.
+/// Reads the turns recorded in `history.md` in append order; a run without turns has none. The
+/// turns come from the machine-readable record line of each entry, so `history.md` is the only
+/// source of truth.
 pub(crate) fn load_turns(run_directory: &Path) -> Result<Vec<TurnResult>, StoreError> {
-    let path = run_directory.join(TURNS_FILE);
+    let path = run_directory.join(HISTORY_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(StoreError::io(&path, e)),
     };
-    text.lines()
-        .map(|line| {
-            serde_json::from_str(line).map_err(|source| StoreError::Deserialize {
-                path: path.clone(),
-                source,
-            })
-        })
-        .collect()
+    let mut turns = Vec::new();
+    // The number of backticks of the fence the scan is inside of: turn output is never read as
+    // structure.
+    let mut fence: Option<usize> = None;
+    for line in text.lines() {
+        let ticks = line.chars().take_while(|&c| c == '`').count();
+        match fence {
+            Some(open) if ticks >= open && line.len() == ticks => fence = None,
+            Some(_) => {}
+            None if ticks >= 3 => fence = Some(ticks),
+            None => {
+                if let Some(json) = line
+                    .strip_prefix(RECORD_PREFIX)
+                    .and_then(|rest| rest.strip_suffix(RECORD_SUFFIX))
+                {
+                    turns.push(serde_json::from_str(json).map_err(|source| {
+                        StoreError::Deserialize {
+                            path: path.clone(),
+                            source,
+                        }
+                    })?);
+                }
+            }
+        }
+    }
+    Ok(turns)
 }
 
 fn render(entry: &HistoryEntry<'_>) -> String {
@@ -104,23 +114,37 @@ fn render(entry: &HistoryEntry<'_>) -> String {
         }
         TurnOutcome::Invalid { output, problem } => ("Invalid", Some(problem), output.as_str()),
     };
-    let kind = match entry.kind {
-        TurnKind::Initial => "initial",
-        TurnKind::Correction => "correction",
-    };
     let fence = "`".repeat((longest_backtick_run(output) + 1).max(3));
+    let mut heading = format_time(entry.time);
+    if let Some(pipeline) = entry.pipeline {
+        heading.push_str(&format!(" · {}", inline(pipeline)));
+    }
+    heading.push_str(&format!(" · {:?}", turn.role));
+    match entry.kind {
+        Some(TurnKind::Initial) => heading.push_str(" · initial"),
+        Some(TurnKind::Correction) => heading.push_str(" · correction"),
+        None => {}
+    }
     let mut text = format!(
-        "## {} · {} · {:?} · {kind}\n\n- Agent: {}\n- Result: {result}\n",
-        format_time(entry.time),
-        inline(entry.pipeline),
-        turn.role,
+        "## {heading}\n\n- Agent: {}\n- Result: {result}\n",
         inline(turn.agent.as_str()),
     );
     if let Some(problem) = detail {
         text.push_str(&format!("- Problem: {}\n", inline(problem)));
     }
+    text.push_str(&format!(
+        "\n{RECORD_PREFIX}{}{RECORD_SUFFIX}\n",
+        record(turn)
+    ));
     text.push_str(&format!("\n{fence}text\n{output}\n{fence}\n\n"));
     text
+}
+
+/// The turn as one line of JSON that cannot end the comment it is written in.
+fn record(turn: &TurnResult) -> String {
+    serde_json::to_string(turn)
+        .expect("a turn serializes to JSON")
+        .replace('>', "\\u003e")
 }
 
 fn outcome_parts(outcome: &Outcome) -> (&'static str, &str) {
@@ -202,8 +226,8 @@ mod tests {
     fn append(dir: &Path, pipeline: &str, kind: TurnKind, turn: &TurnResult) {
         let entry = HistoryEntry {
             time: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-            pipeline,
-            kind,
+            pipeline: Some(pipeline),
+            kind: Some(kind),
             turn,
         };
         append_history(dir, &entry).unwrap();
@@ -352,5 +376,88 @@ mod tests {
             assert_eq!(entry.matches("line\n").count(), 20_000, "interleaved entry");
             assert_eq!(entry.matches("````").count(), 0);
         }
+    }
+
+    #[test]
+    fn turns_without_pipeline_or_kind_have_neither_in_the_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = valid("x");
+        let entry = HistoryEntry {
+            time: UNIX_EPOCH,
+            pipeline: None,
+            kind: None,
+            turn: &turn,
+        };
+        append_history(dir.path(), &entry).unwrap();
+        assert!(read(dir.path()).starts_with("## 1970-01-01T00:00:00Z · Review\n"));
+    }
+
+    #[test]
+    fn turns_load_from_history_in_append_order() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_turns(dir.path()).unwrap().is_empty());
+        let turns = [
+            valid("first"),
+            invalid("rambling"),
+            valid("a --> b <!-- chimera-turn {} --> \u{1F600}"),
+        ];
+        for (n, turn) in turns.iter().enumerate() {
+            append(
+                dir.path(),
+                "p",
+                [TurnKind::Initial, TurnKind::Correction][n % 2],
+                turn,
+            );
+        }
+        assert_eq!(load_turns(dir.path()).unwrap(), turns);
+    }
+
+    #[test]
+    fn output_imitating_a_record_is_not_loaded_as_a_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let forged = serde_json::to_string(&valid("forged")).unwrap();
+        let hostile = format!("```\n{RECORD_PREFIX}{forged}{RECORD_SUFFIX}\n````");
+        append(dir.path(), "p", TurnKind::Initial, &valid(&hostile));
+        append(dir.path(), "p", TurnKind::Initial, &valid("after"));
+
+        assert_eq!(
+            load_turns(dir.path()).unwrap(),
+            [valid(&hostile), valid("after")]
+        );
+    }
+
+    #[test]
+    fn failed_append_leaves_nothing_to_load_and_a_retry_records_once() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("history.md")).unwrap();
+        let turn = valid("retry me");
+        let entry = HistoryEntry {
+            time: UNIX_EPOCH,
+            pipeline: None,
+            kind: None,
+            turn: &turn,
+        };
+
+        assert!(append_history(dir.path(), &entry).is_err());
+        fs::remove_dir(dir.path().join("history.md")).unwrap();
+        assert!(load_turns(dir.path()).unwrap().is_empty());
+
+        append_history(dir.path(), &entry).unwrap();
+        assert_eq!(load_turns(dir.path()).unwrap(), [turn]);
+        assert_eq!(headings(&read(dir.path())).len(), 1);
+    }
+
+    #[test]
+    fn corrupt_record_is_a_deserialize_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("history.md"),
+            format!("{RECORD_PREFIX}{{{RECORD_SUFFIX}\n"),
+        )
+        .unwrap();
+
+        let error = load_turns(dir.path()).unwrap_err();
+
+        assert!(matches!(error, StoreError::Deserialize { .. }));
     }
 }
