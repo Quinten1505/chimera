@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod repository;
+pub mod terminal;
 
 use std::collections::BTreeMap;
 use std::fmt;
