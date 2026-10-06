@@ -1,0 +1,18 @@
+[package]
+name = "chimera-store"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chimera-core.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+pulldown-cmark = { version = "0.13", default-features = false }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
