@@ -129,6 +129,7 @@ dependencies = [
 name = "chimera-github"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chimera-core",
  "reqwest",
  "serde_json",

@@ -55,6 +55,7 @@ impl Client {
     }
 
     /// Overall time allowed per request, from connecting to reading the response.
+    #[cfg(test)]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.http = http_client(timeout);
         self.timeout = timeout;

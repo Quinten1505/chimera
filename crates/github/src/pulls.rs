@@ -75,6 +75,30 @@ impl Client {
         &self,
         pull_request: &IssueRef,
     ) -> Result<(), GitHubError> {
+        let (id, is_draft) = self.pull_request_node(pull_request).await?;
+        if !is_draft {
+            return Ok(());
+        }
+        self.graphql(Access::Mutate, MARK_READY_MUTATION, json!({ "id": id }))
+            .await
+            .map(|_| ())
+    }
+
+    /// Whether `pull_request` is still a draft.
+    pub async fn pull_request_is_draft(
+        &self,
+        pull_request: &IssueRef,
+    ) -> Result<bool, GitHubError> {
+        self.pull_request_node(pull_request)
+            .await
+            .map(|(_, is_draft)| is_draft)
+    }
+
+    /// The GraphQL node id and draft flag of `pull_request`.
+    async fn pull_request_node(
+        &self,
+        pull_request: &IssueRef,
+    ) -> Result<(String, bool), GitHubError> {
         let variables = json!({
             "owner": pull_request.owner(),
             "name": pull_request.repository(),
@@ -84,17 +108,12 @@ impl Client {
             .graphql(Access::Read, PULL_REQUEST_QUERY, variables)
             .await?;
         let node = &data["repository"]["pullRequest"];
-        let (Some(id), Some(is_draft)) = (node["id"].as_str(), node["isDraft"].as_bool()) else {
-            return Err(GitHubError::Failed(format!(
+        match (node["id"].as_str(), node["isDraft"].as_bool()) {
+            (Some(id), Some(is_draft)) => Ok((id.to_owned(), is_draft)),
+            _ => Err(GitHubError::Failed(format!(
                 "pull request {pull_request} not found"
-            )));
-        };
-        if !is_draft {
-            return Ok(());
+            ))),
         }
-        self.graphql(Access::Mutate, MARK_READY_MUTATION, json!({ "id": id }))
-            .await
-            .map(|_| ())
     }
 }
 

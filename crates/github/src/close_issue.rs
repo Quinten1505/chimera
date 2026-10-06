@@ -1,4 +1,4 @@
-use chimera_core::IssueRef;
+use chimera_core::{IssueRef, IssueStatus};
 use reqwest::Method;
 use serde_json::json;
 
@@ -18,6 +18,24 @@ impl Client {
         self.rest(Access::Mutate, Method::PATCH, &path, Some(&body))
             .await
             .map(|_| ())
+    }
+
+    /// Whether `issue` is open or closed.
+    pub async fn issue_status(&self, issue: &IssueRef) -> Result<IssueStatus, GitHubError> {
+        let path = format!(
+            "/repos/{}/{}/issues/{}",
+            issue.owner(),
+            issue.repository(),
+            issue.number()
+        );
+        let response = self.rest(Access::Read, Method::GET, &path, None).await?;
+        match response["state"].as_str() {
+            Some("open") => Ok(IssueStatus::Open),
+            Some("closed") => Ok(IssueStatus::Closed),
+            _ => Err(GitHubError::Failed(format!(
+                "issue {issue} has no recognizable state"
+            ))),
+        }
     }
 }
 
