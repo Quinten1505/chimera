@@ -277,9 +277,22 @@ mod tests {
     #[test]
     fn remote_suffix_match_is_not_the_feature_branch() {
         let repo = TestRepo::new();
-        git(repo.work(), &["push", "origin", "main:other/f"]);
+        git(
+            repo.work(),
+            &["push", "origin", "main:refs/heads/other/refs/heads/f"],
+        );
+        let lookup = git(repo.work(), &["ls-remote", "origin", "refs/heads/f"]);
+        assert!(
+            lookup.ends_with("refs/heads/other/refs/heads/f"),
+            "{lookup}"
+        );
         create_feature_branch(&Runner::new(), repo.work(), &name("f"), &name("main")).unwrap();
         assert_eq!(remote_head(&repo, "f"), remote_head(&repo, "main"));
+        assert_eq!(git(repo.work(), &["config", "branch.f.remote"]), "origin");
+        assert_eq!(
+            git(repo.work(), &["config", "branch.f.merge"]),
+            "refs/heads/f"
+        );
     }
 
     #[test]
