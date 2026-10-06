@@ -58,6 +58,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chimera-git"
+version = "0.1.0"
+dependencies = [
+ "chimera-core",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "chimera-github"
 version = "0.1.0"
 dependencies = [
