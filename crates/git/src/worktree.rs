@@ -96,6 +96,41 @@ pub(crate) fn prune(runner: &Runner, repo: &Path) -> Result<(), GitError> {
     Ok(())
 }
 
+/// Whether `path` is a registered worktree of `repo`.
+pub(crate) fn exists(runner: &Runner, repo: &Path, path: &Path) -> Result<bool, GitError> {
+    let path = &repo.join(path);
+    Ok(registered(runner, repo)?
+        .iter()
+        .any(|worktree| same_path(&worktree.path, path)))
+}
+
+/// Moves the branch checked out in the worktree at `path` to `commit`, fetching `origin` first if
+/// the commit is not available locally. Already being at `commit` is not an error.
+pub(crate) fn update(
+    runner: &Runner,
+    repo: &Path,
+    path: &Path,
+    commit: &str,
+) -> Result<(), GitError> {
+    if !exists(runner, repo, path)? {
+        return Err(GitError::Failed {
+            command: "reset".to_owned(),
+            status: "not run".to_owned(),
+            stderr: format!("{} is not a worktree", repo.join(path).display()),
+        });
+    }
+    let path = &repo.join(path);
+    let object = format!("{commit}^{{commit}}");
+    if runner
+        .run(repo, &["cat-file", "-e", &object], Effect::Read)
+        .is_err()
+    {
+        runner.run(repo, &["fetch", "--prune", "origin"], Effect::Local)?;
+    }
+    runner.run(path, &["reset", "--hard", &object], Effect::Local)?;
+    Ok(())
+}
+
 struct Worktree {
     path: PathBuf,
     /// Full ref name, `None` when detached.
@@ -329,5 +364,49 @@ mod tests {
         let (repo, path) = repo_with_feature();
         create(&Runner::new(), repo.work(), &path, "task/a", "feature").unwrap();
         assert!(!branch_exists(&Runner::new(), &repo.origin(), "refs/heads/task/a").unwrap());
+    }
+
+    #[test]
+    fn exists_reflects_registration() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        assert!(!exists(&runner, repo.work(), &path).unwrap());
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        assert!(exists(&runner, repo.work(), &path).unwrap());
+        assert!(exists(&runner, repo.work(), repo.work()).unwrap());
+    }
+
+    #[test]
+    fn update_moves_branch_to_fetched_commit() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        let other = repo.work().join("../other");
+        repo.commit_file(&other, "g.txt", "more");
+        runner
+            .run(&other, &["push", "origin", "feature"], Effect::Remote)
+            .unwrap();
+        let target = rev(&other, "HEAD");
+        update(&runner, repo.work(), &path, &target).unwrap();
+        assert_eq!(rev(&path, "HEAD"), target);
+        assert_eq!(rev(repo.work(), "task/a"), target);
+        update(&runner, repo.work(), &path, &target).unwrap();
+    }
+
+    #[test]
+    fn update_of_missing_worktree_fails() {
+        let (repo, path) = repo_with_feature();
+        let head = rev(repo.work(), "HEAD");
+        let error = update(&Runner::new(), repo.work(), &path, &head).unwrap_err();
+        assert!(matches!(error, GitError::Failed { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn update_to_unknown_commit_fails() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
+        let error = update(&runner, repo.work(), &path, &"1".repeat(40)).unwrap_err();
+        assert!(matches!(error, GitError::Failed { .. }), "{error:?}");
     }
 }
