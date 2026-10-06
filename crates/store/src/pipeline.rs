@@ -27,8 +27,22 @@ pub(crate) struct LoadedEffect {
 /// Contents of `pipelines/<id>.json`. The state is opaque: the store never looks inside it.
 #[derive(Default, Serialize, Deserialize)]
 struct PipelineFile {
+    /// Absent when no state was saved; a saved JSON `null` is `Some(Null)`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value"
+    )]
     state: Option<serde_json::Value>,
     effects: Vec<EffectRecord>,
+}
+
+/// Deserializes a present field as `Some`, even when it is JSON `null` (plain `Option` maps that to `None`).
+fn present_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 // The operations below are used by the `RunStore` implementation built on this module.
@@ -282,6 +296,43 @@ mod tests {
         let run = dir();
         record_intent(run.path(), "p", "a", "first").unwrap();
         assert_eq!(load_state(run.path(), "p").unwrap(), None);
+    }
+
+    #[test]
+    fn null_state_round_trips_distinct_from_absent() {
+        let run = dir();
+        save_state(run.path(), "p", serde_json::Value::Null).unwrap();
+
+        assert_eq!(
+            load_state(run.path(), "p").unwrap(),
+            Some(serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn overwriting_with_null_replaces_previous_state() {
+        let run = dir();
+        save_state(run.path(), "p", json!({"step": 1})).unwrap();
+        save_state(run.path(), "p", serde_json::Value::Null).unwrap();
+
+        assert_eq!(
+            load_state(run.path(), "p").unwrap(),
+            Some(serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn null_state_survives_intent_and_outcome_writes() {
+        let run = dir();
+        save_state(run.path(), "p", serde_json::Value::Null).unwrap();
+        record_intent(run.path(), "p", "k", "i").unwrap();
+        record_outcome(run.path(), "p", "k", "o").unwrap();
+
+        assert_eq!(
+            load_state(run.path(), "p").unwrap(),
+            Some(serde_json::Value::Null)
+        );
+        assert_eq!(load_effects(run.path(), "p").unwrap().len(), 1);
     }
 
     #[test]
