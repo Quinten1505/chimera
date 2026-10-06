@@ -1,0 +1,9 @@
+[package]
+name = "chimera-configuration"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
