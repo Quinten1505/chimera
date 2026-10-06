@@ -31,6 +31,9 @@ struct LockState {
 #[derive(Default)]
 struct Shared {
     state: LockState,
+    /// A save started and did not complete cleanly (failed, uncertain or cancelled), so the
+    /// stored state may differ from `state` until it is reloaded.
+    stale: bool,
     wakers: Vec<Waker>,
 }
 
@@ -87,6 +90,7 @@ impl MergeLock {
             instance,
             shared: Mutex::new(Shared {
                 state,
+                stale: false,
                 wakers: Vec::new(),
             }),
             writes: AsyncMutex::new(()),
@@ -100,7 +104,7 @@ impl MergeLock {
     /// already holds or waits keeps its sequence number.
     pub async fn enqueue(&self, owner: &str) -> Result<Sequence, PipelineError> {
         let _write = self.writes.lock().await;
-        let mut state = self.snapshot();
+        let mut state = self.current().await?;
         if let Some(entry) = state
             .holder
             .iter()
@@ -148,7 +152,7 @@ impl MergeLock {
     /// `owner` is not the holder.
     pub async fn release(&self, owner: &str) -> Result<(), PipelineError> {
         let _write = self.writes.lock().await;
-        let mut state = self.snapshot();
+        let mut state = self.current().await?;
         if state
             .holder
             .as_ref()
@@ -181,17 +185,41 @@ impl MergeLock {
             .collect()
     }
 
-    fn snapshot(&self) -> LockState {
-        self.shared.lock().unwrap().state.clone()
+    /// The state to mutate. If an earlier save may or may not have been persisted, the stored
+    /// state is the truth, so reload it first. Callers hold `writes`.
+    async fn current(&self) -> Result<LockState, PipelineError> {
+        {
+            let shared = self.shared.lock().unwrap();
+            if !shared.stale {
+                return Ok(shared.state.clone());
+            }
+        }
+        let state = match self
+            .store
+            .load_pipeline_state(&self.run, &self.instance)
+            .await?
+        {
+            Some(saved) => serde_json::from_value(saved)?,
+            None => LockState::default(),
+        };
+        let mut shared = self.shared.lock().unwrap();
+        shared.state = state.clone();
+        shared.stale = false;
+        shared.wakers.drain(..).for_each(Waker::wake);
+        Ok(state)
     }
 
     /// Saves `state`, then makes it current and wakes the waiters. Callers hold `writes`.
     async fn commit(&self, state: LockState) -> Result<(), PipelineError> {
+        let saved = serde_json::to_value(&state)?;
+        // Stays set if the save errs or this future is dropped mid-save.
+        self.shared.lock().unwrap().stale = true;
         self.store
-            .save_pipeline_state(&self.run, &self.instance, serde_json::to_value(&state)?)
+            .save_pipeline_state(&self.run, &self.instance, saved)
             .await?;
         let mut shared = self.shared.lock().unwrap();
         shared.state = state;
+        shared.stale = false;
         shared.wakers.drain(..).for_each(Waker::wake);
         Ok(())
     }
@@ -203,7 +231,9 @@ mod tests {
     use std::pin::pin;
     use std::task::{Context, Waker};
 
-    use chimera_core::run_store::FakeRunStore;
+    use async_trait::async_trait;
+    use chimera_core::TurnResult;
+    use chimera_core::run_store::{EffectRecord, FakeRunStore};
     use futures_executor::{LocalPool, block_on};
     use futures_util::task::LocalSpawnExt;
 
@@ -221,6 +251,170 @@ mod tests {
         MergeLock::open(store.clone(), run(), &branch())
             .await
             .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum Fault {
+        None,
+        /// Persists, then reports the outcome as unknown.
+        Uncertain,
+        /// Persists, then never completes.
+        HangAfterSave,
+    }
+
+    /// Fake store whose next pipeline-state save persists and then misbehaves.
+    struct FaultyStore {
+        inner: FakeRunStore,
+        fault: Mutex<Fault>,
+    }
+
+    impl FaultyStore {
+        fn set(&self, fault: Fault) {
+            *self.fault.lock().unwrap() = fault;
+        }
+    }
+
+    #[async_trait]
+    impl RunStore for FaultyStore {
+        async fn save_pipeline_state(
+            &self,
+            run: &RunId,
+            pipeline: &str,
+            state: serde_json::Value,
+        ) -> Result<(), PortError> {
+            self.inner.save_pipeline_state(run, pipeline, state).await?;
+            let fault = std::mem::replace(&mut *self.fault.lock().unwrap(), Fault::None);
+            match fault {
+                Fault::None => Ok(()),
+                Fault::Uncertain => Err(PortError::uncertain("save outcome unknown")),
+                Fault::HangAfterSave => std::future::pending().await,
+            }
+        }
+
+        async fn load_pipeline_state(
+            &self,
+            run: &RunId,
+            pipeline: &str,
+        ) -> Result<Option<serde_json::Value>, PortError> {
+            self.inner.load_pipeline_state(run, pipeline).await
+        }
+
+        async fn save_run_data(
+            &self,
+            run: &RunId,
+            data: serde_json::Value,
+        ) -> Result<(), PortError> {
+            self.inner.save_run_data(run, data).await
+        }
+
+        async fn load_run_data(&self, run: &RunId) -> Result<Option<serde_json::Value>, PortError> {
+            self.inner.load_run_data(run).await
+        }
+
+        async fn append_turn(&self, run: &RunId, turn: TurnResult) -> Result<(), PortError> {
+            self.inner.append_turn(run, turn).await
+        }
+
+        async fn load_history(&self, run: &RunId) -> Result<Vec<TurnResult>, PortError> {
+            self.inner.load_history(run).await
+        }
+
+        async fn record_effect_intent(
+            &self,
+            run: &RunId,
+            key: &str,
+            intent: &str,
+        ) -> Result<(), PortError> {
+            self.inner.record_effect_intent(run, key, intent).await
+        }
+
+        async fn record_effect_outcome(
+            &self,
+            run: &RunId,
+            key: &str,
+            outcome: &str,
+        ) -> Result<(), PortError> {
+            self.inner.record_effect_outcome(run, key, outcome).await
+        }
+
+        async fn load_effects(&self, run: &RunId) -> Result<Vec<EffectRecord>, PortError> {
+            self.inner.load_effects(run).await
+        }
+    }
+
+    fn faulty() -> (Arc<FaultyStore>, Arc<MergeLock>) {
+        let faulty = Arc::new(FaultyStore {
+            inner: FakeRunStore::new(),
+            fault: Mutex::new(Fault::None),
+        });
+        let store: Arc<dyn RunStore> = faulty.clone();
+        let lock = block_on(open(&store));
+        (faulty, lock)
+    }
+
+    /// Polls `future` once, then drops it, as when its task is cancelled.
+    fn poll_once_and_drop<F: Future>(future: F) {
+        let mut future = Box::pin(future);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(future.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[test]
+    fn uncertain_enqueue_save_is_reconciled_before_the_next_mutation() {
+        let (store, lock) = faulty();
+        block_on(lock.acquire("a")).unwrap();
+        store.set(Fault::Uncertain);
+        assert!(matches!(
+            block_on(lock.enqueue("b")),
+            Err(PipelineError::Port(PortError::Uncertain(_)))
+        ));
+
+        // b was persisted, so c queues behind it with a fresh sequence number.
+        assert_eq!(block_on(lock.enqueue("c")).unwrap(), 2);
+        assert_eq!(block_on(lock.enqueue("b")).unwrap(), 1);
+        assert_eq!(lock.waiting(), ["b", "c"]);
+    }
+
+    #[test]
+    fn cancelled_enqueue_after_save_is_reconciled_before_the_next_mutation() {
+        let (store, lock) = faulty();
+        block_on(lock.acquire("a")).unwrap();
+        store.set(Fault::HangAfterSave);
+        poll_once_and_drop(lock.enqueue("b"));
+
+        assert_eq!(block_on(lock.enqueue("c")).unwrap(), 2);
+        assert_eq!(lock.waiting(), ["b", "c"]);
+    }
+
+    #[test]
+    fn uncertain_release_save_is_reconciled_before_the_next_mutation() {
+        let (store, lock) = faulty();
+        block_on(lock.acquire("a")).unwrap();
+        block_on(lock.enqueue("b")).unwrap();
+        store.set(Fault::Uncertain);
+        assert!(matches!(
+            block_on(lock.release("a")),
+            Err(PipelineError::Port(PortError::Uncertain(_)))
+        ));
+
+        // The release was persisted: b holds, and a no longer does.
+        assert!(block_on(lock.release("a")).is_err());
+        assert_eq!(lock.holder().as_deref(), Some("b"));
+        block_on(lock.release("b")).unwrap();
+        assert_eq!(lock.holder(), None);
+    }
+
+    #[test]
+    fn cancelled_release_after_save_is_reconciled_before_the_next_mutation() {
+        let (store, lock) = faulty();
+        block_on(lock.acquire("a")).unwrap();
+        block_on(lock.enqueue("b")).unwrap();
+        store.set(Fault::HangAfterSave);
+        poll_once_and_drop(lock.release("a"));
+
+        assert!(block_on(lock.release("a")).is_err());
+        assert_eq!(lock.holder().as_deref(), Some("b"));
+        assert_eq!(block_on(lock.enqueue("c")).unwrap(), 2);
     }
 
     fn store() -> Arc<dyn RunStore> {
