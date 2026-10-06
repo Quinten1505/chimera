@@ -89,9 +89,19 @@ impl Client {
         &self,
         pull_request: &IssueRef,
     ) -> Result<bool, GitHubError> {
-        self.pull_request_node(pull_request)
-            .await
-            .map(|(_, is_draft)| is_draft)
+        let path = format!(
+            "/repos/{}/{}/pulls/{}",
+            encode(pull_request.owner()),
+            encode(pull_request.repository()),
+            pull_request.number(),
+        );
+        let response = self.rest(Access::Read, Method::GET, &path, None).await?;
+        response
+            .get("draft")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                GitHubError::Failed(format!("pull request {pull_request} has no draft flag"))
+            })
     }
 
     /// The GraphQL node id and draft flag of `pull_request`.
@@ -275,6 +285,49 @@ mod tests {
     const READY: &str = r#"{"data":{"repository":{"pullRequest":{"id":"PR_1","isDraft":false}}}}"#;
     const MARKED: &str =
         r#"{"data":{"markPullRequestReadyForReview":{"pullRequest":{"isDraft":false}}}}"#;
+
+    async fn is_draft(
+        status: &'static str,
+        body: &'static str,
+    ) -> (Result<bool, GitHubError>, Vec<String>) {
+        let (url, requests) = serve(vec![(status, body)]).await;
+        let result = client(&url).pull_request_is_draft(&pr(5)).await;
+        (result, requests.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn is_draft_reads_the_flag_over_rest() {
+        let (result, requests) = is_draft("200 OK", r#"{"number":5,"draft":true}"#).await;
+        assert!(result.unwrap());
+        assert!(
+            requests[0].starts_with("GET /repos/octo/repo/pulls/5 HTTP/1.1"),
+            "{}",
+            requests[0]
+        );
+        let (result, _) = is_draft("200 OK", r#"{"number":5,"draft":false}"#).await;
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_draft_with_a_missing_or_malformed_flag_is_failed() {
+        for body in [
+            r#"{"number":5}"#,
+            r#"{"draft":"yes"}"#,
+            r#"{"draft":null}"#,
+            "[]",
+        ] {
+            let (result, _) = is_draft("200 OK", body).await;
+            assert!(matches!(result, Err(GitHubError::Failed(_))), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn is_draft_failed_reads_are_classified() {
+        let (result, _) = is_draft("404 Not Found", r#"{"message":"Not Found"}"#).await;
+        assert!(matches!(result, Err(GitHubError::Failed(_))));
+        let (result, _) = is_draft("500 Internal Server Error", "").await;
+        assert!(matches!(result, Err(GitHubError::Failed(_))));
+    }
 
     #[tokio::test]
     async fn mark_ready_converts_a_draft() {
