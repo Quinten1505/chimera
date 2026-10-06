@@ -7,6 +7,7 @@ mod agent_turn;
 mod driver;
 mod environment;
 mod error;
+mod feature;
 mod merge_lock;
 mod policy;
 
@@ -16,5 +17,6 @@ pub use environment::{
     AgentLaunch, Environment, EnvironmentAgent, EnvironmentService, ProvisionSpec,
 };
 pub use error::{PauseReason, PipelineError};
+pub use feature::{FeaturePipeline, FeatureState};
 pub use merge_lock::{MergeLock, Sequence};
 pub use policy::{Budget, Policy, PolicyState, RetryRefused};

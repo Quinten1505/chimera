@@ -146,6 +146,7 @@ mod fake {
                 )));
             }
             let head = state.head(base)?;
+            state.remote_heads.insert(feature.clone(), head.clone());
             state.branches.insert(feature.clone(), head);
             Ok(())
         }
@@ -240,6 +241,10 @@ mod fake {
             let fake = FakeRepository::new(branch("main"), commit("c0"));
             block_on(fake.create_feature_branch(&branch("feat"), &branch("main"))).unwrap();
             assert!(fake.has_branch(&branch("feat")));
+            assert_eq!(
+                block_on(fake.remote_head(&branch("feat"))).unwrap(),
+                commit("c0")
+            );
             assert!(
                 block_on(fake.create_feature_branch(&branch("feat"), &branch("main"))).is_err()
             );
