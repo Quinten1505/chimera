@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use chimera_core::error::PortError;
 use chimera_core::run_store::RunStore;
 use chimera_core::{CommitId, Limits, RunId};
+use futures_util::lock::Mutex as AsyncMutex;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{PauseReason, PipelineError};
@@ -38,6 +39,8 @@ pub struct PolicyState {
 #[derive(Debug)]
 pub struct Policy {
     state: Mutex<PolicyState>,
+    /// Serializes saving, so that a save started later never stores an older snapshot.
+    writes: AsyncMutex<()>,
 }
 
 impl Policy {
@@ -52,6 +55,7 @@ impl Policy {
     pub fn restore(state: PolicyState) -> Self {
         Self {
             state: Mutex::new(state),
+            writes: AsyncMutex::new(()),
         }
     }
 
@@ -119,8 +123,11 @@ impl Policy {
         Ok(())
     }
 
-    /// Saves the current state so it survives a restart.
+    /// Saves the current state so it survives a restart. Saves are ordered: the snapshot is
+    /// taken only once the previous save finished, so the stored state is never older than the
+    /// one a completed save stored.
     pub async fn save(&self, store: &dyn RunStore, run: &RunId) -> Result<(), PipelineError> {
+        let _write = self.writes.lock().await;
         let value = serde_json::to_value(self.snapshot())?;
         store
             .save_pipeline_state(run, STORE_INSTANCE, value)
@@ -143,8 +150,13 @@ impl Policy {
 
 #[cfg(test)]
 mod tests {
-    use chimera_core::run_store::FakeRunStore;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use chimera_core::TurnResult;
+    use chimera_core::run_store::{EffectRecord, FakeRunStore};
     use futures_executor::block_on;
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -279,5 +291,109 @@ mod tests {
         let policy = block_on(Policy::load_or_new(&store, &run, &limits(7, 8))).unwrap();
         assert_eq!(policy.snapshot().agent_recovery_remaining, 7);
         assert_eq!(policy.snapshot().github_retries_remaining, 8);
+    }
+
+    /// Holds the first pipeline state save back until a later one has been stored, or until a
+    /// timeout passes if no later save can reach the store meanwhile.
+    struct ReorderingStore {
+        inner: FakeRunStore,
+        saves: Mutex<usize>,
+        later_stored: Notify,
+    }
+
+    #[async_trait]
+    impl RunStore for ReorderingStore {
+        async fn save_pipeline_state(
+            &self,
+            run: &RunId,
+            pipeline: &str,
+            state: serde_json::Value,
+        ) -> Result<(), PortError> {
+            let number = {
+                let mut saves = self.saves.lock().unwrap();
+                *saves += 1;
+                *saves
+            };
+            if number == 1 {
+                let later = self.later_stored.notified();
+                let _ = tokio::time::timeout(Duration::from_secs(1), later).await;
+                return self.inner.save_pipeline_state(run, pipeline, state).await;
+            }
+            let saved = self.inner.save_pipeline_state(run, pipeline, state).await;
+            self.later_stored.notify_one();
+            saved
+        }
+        async fn load_pipeline_state(
+            &self,
+            run: &RunId,
+            pipeline: &str,
+        ) -> Result<Option<serde_json::Value>, PortError> {
+            self.inner.load_pipeline_state(run, pipeline).await
+        }
+        async fn save_run_data(
+            &self,
+            run: &RunId,
+            data: serde_json::Value,
+        ) -> Result<(), PortError> {
+            self.inner.save_run_data(run, data).await
+        }
+        async fn load_run_data(&self, run: &RunId) -> Result<Option<serde_json::Value>, PortError> {
+            self.inner.load_run_data(run).await
+        }
+        async fn append_turn(&self, run: &RunId, turn: TurnResult) -> Result<(), PortError> {
+            self.inner.append_turn(run, turn).await
+        }
+        async fn load_history(&self, run: &RunId) -> Result<Vec<TurnResult>, PortError> {
+            self.inner.load_history(run).await
+        }
+        async fn record_effect_intent(
+            &self,
+            run: &RunId,
+            key: &str,
+            intent: &str,
+        ) -> Result<(), PortError> {
+            self.inner.record_effect_intent(run, key, intent).await
+        }
+        async fn record_effect_outcome(
+            &self,
+            run: &RunId,
+            key: &str,
+            outcome: &str,
+        ) -> Result<(), PortError> {
+            self.inner.record_effect_outcome(run, key, outcome).await
+        }
+        async fn load_effects(&self, run: &RunId) -> Result<Vec<EffectRecord>, PortError> {
+            self.inner.load_effects(run).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delayed_older_save_never_overwrites_a_newer_one() {
+        let store = ReorderingStore {
+            inner: FakeRunStore::new(),
+            saves: Mutex::new(0),
+            later_stored: Notify::new(),
+        };
+        let run = RunId::new("run-1").unwrap();
+        let policy = Policy::new(&limits(3, 3));
+
+        let (first, second) = tokio::join!(policy.save(&store, &run), async {
+            // The first save has taken its snapshot and is held back in the store.
+            tokio::task::yield_now().await;
+            policy
+                .permit_retry(Budget::GithubRetry, &failed(), false)
+                .unwrap();
+            policy.pause(PauseReason::GlobalPause);
+            policy.save(&store, &run).await
+        });
+        first.unwrap();
+        second.unwrap();
+
+        let restored = Policy::load_or_new(&store, &run, &Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(restored.snapshot(), policy.snapshot());
+        assert_eq!(restored.check_start(), Err(PauseReason::GlobalPause));
+        assert_eq!(restored.snapshot().github_retries_remaining, 2);
     }
 }
