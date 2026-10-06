@@ -155,6 +155,41 @@ impl AgentTurns {
         }
     }
 
+    /// Clears the context of the agent in `pane` with its profile's reset command.
+    pub async fn reset(&self, pane: &PaneId, profile: &AgentProfile) -> Result<(), PortError> {
+        self.terminal
+            .send_prompt(pane, &profile.reset_command)
+            .await
+    }
+
+    /// The output currently shown by `pane`.
+    pub async fn read_output(&self, pane: &PaneId) -> Result<String, PortError> {
+        self.terminal.read_output(pane).await
+    }
+
+    /// Picks up a turn whose prompt may already have been delivered, without sending it again.
+    /// `output_before` is what the pane showed before the prompt was sent: if the agent is idle
+    /// and still shows it, the prompt never arrived and `None` is returned so the caller can
+    /// send it. Otherwise waits for the turn and validates its output as [`Self::run_turn`]
+    /// does. The policy is not checked: the turn already started.
+    pub async fn resume_turn(
+        &self,
+        request: &TurnRequest<'_>,
+        max_corrections: u32,
+        output_before: &str,
+    ) -> Result<Option<CompletedTurn>, TurnError> {
+        match self.terminal.read_status(request.pane).await? {
+            TurnStatus::Gone => return Err(TurnError::AgentLost),
+            TurnStatus::Finished
+                if self.terminal.read_output(request.pane).await? == output_before =>
+            {
+                return Ok(None);
+            }
+            _ => {}
+        }
+        self.finish_turn(request, max_corrections).await.map(Some)
+    }
+
     fn check_policy(&self) -> Result<(), TurnError> {
         self.policy.check_start().map_err(TurnError::Paused)
     }
