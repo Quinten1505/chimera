@@ -1,0 +1,78 @@
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use chimera_core::RunId;
+
+use crate::StoreError;
+
+/// The directory holding all runs: `$XDG_STATE_HOME/chimera/runs`, falling back to
+/// `~/.local/state/chimera/runs`.
+pub fn state_root() -> Result<PathBuf, StoreError> {
+    resolve_state_root(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+/// The directory of one run: `<root>/<run-id>/`.
+pub fn run_directory(root: &Path, run: &RunId) -> PathBuf {
+    root.join(run.as_str())
+}
+
+fn non_empty(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+fn resolve_state_root(
+    xdg_state_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, StoreError> {
+    let base = match non_empty(xdg_state_home) {
+        Some(xdg) => xdg,
+        None => non_empty(home)
+            .ok_or(StoreError::StateRootUnresolved)?
+            .join(".local/state"),
+    };
+    Ok(base.join("chimera").join("runs"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os(value: &str) -> Option<OsString> {
+        Some(OsString::from(value))
+    }
+
+    #[test]
+    fn uses_xdg_state_home() {
+        assert_eq!(
+            resolve_state_root(os("/xdg"), os("/home/me")).unwrap(),
+            PathBuf::from("/xdg/chimera/runs")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_home_when_xdg_unset_or_empty() {
+        let expected = PathBuf::from("/home/me/.local/state/chimera/runs");
+        assert_eq!(resolve_state_root(None, os("/home/me")).unwrap(), expected);
+        assert_eq!(
+            resolve_state_root(os(""), os("/home/me")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn fails_when_nothing_is_known() {
+        for (xdg, home) in [(None, None), (os(""), os(""))] {
+            let error = resolve_state_root(xdg, home).unwrap_err();
+            assert!(matches!(error, StoreError::StateRootUnresolved));
+        }
+    }
+
+    #[test]
+    fn run_directory_is_under_root() {
+        let run = RunId::new("run-1").unwrap();
+        assert_eq!(
+            run_directory(Path::new("/root"), &run),
+            PathBuf::from("/root/run-1")
+        );
+    }
+}

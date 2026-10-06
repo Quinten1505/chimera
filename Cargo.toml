@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/core", "crates/pipelines", "crates/github", "crates/configuration", "crates/herdr"]
-default-members = [".", "crates/core", "crates/pipelines", "crates/github", "crates/configuration", "crates/herdr"]
+members = ["crates/core", "crates/pipelines", "crates/github", "crates/configuration", "crates/herdr", "crates/store"]
+default-members = [".", "crates/core", "crates/pipelines", "crates/github", "crates/configuration", "crates/herdr", "crates/store"]
 resolver = "3"
 
 [workspace.package]
@@ -14,6 +14,7 @@ chimera-pipelines = { path = "crates/pipelines" }
 chimera-github = { path = "crates/github" }
 chimera-configuration = { path = "crates/configuration" }
 chimera-herdr = { path = "crates/herdr" }
+chimera-store = { path = "crates/store" }
 
 [package]
 name = "chimera"
