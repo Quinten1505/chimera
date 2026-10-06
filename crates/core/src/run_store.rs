@@ -42,7 +42,9 @@ pub trait RunStore: Send + Sync {
 
     async fn load_history(&self, run: &RunId) -> Result<Vec<TurnResult>, PortError>;
 
-    /// Records that the effect `key` is about to run.
+    /// Records that the effect `key` is about to run. Keys are unique within a run: recording an
+    /// intent for a key that already has one fails with [`PortError::Failed`] and leaves the
+    /// existing record unchanged.
     async fn record_effect_intent(
         &self,
         run: &RunId,
@@ -166,15 +168,17 @@ mod fake {
             intent: &str,
         ) -> Result<(), PortError> {
             let mut state = self.state.lock().unwrap();
-            state
-                .effects
-                .entry(run.clone())
-                .or_default()
-                .push(EffectRecord {
-                    key: key.to_string(),
-                    intent: intent.to_string(),
-                    outcome: None,
-                });
+            let effects = state.effects.entry(run.clone()).or_default();
+            if effects.iter().any(|effect| effect.key == key) {
+                return Err(PortError::failed(format!(
+                    "intent already recorded for effect {key}"
+                )));
+            }
+            effects.push(EffectRecord {
+                key: key.to_string(),
+                intent: intent.to_string(),
+                outcome: None,
+            });
             Ok(())
         }
 
@@ -280,6 +284,38 @@ mod fake {
             assert_eq!(effects[0].outcome.as_deref(), Some("pushed c1"));
             assert_eq!(effects[1].key, "pr");
             assert_eq!(effects[1].outcome, None);
+        }
+
+        #[test]
+        fn duplicate_effect_intent_is_rejected_without_mutation() {
+            let store: Arc<dyn RunStore> = Arc::new(FakeRunStore::new());
+            block_on(store.record_effect_intent(&run(), "push", "push feat")).unwrap();
+            let error =
+                block_on(store.record_effect_intent(&run(), "push", "push again")).unwrap_err();
+            assert!(error.is_failed());
+            block_on(store.record_effect_outcome(&run(), "push", "pushed c1")).unwrap();
+
+            assert_eq!(
+                block_on(store.load_effects(&run())).unwrap(),
+                vec![EffectRecord {
+                    key: "push".into(),
+                    intent: "push feat".into(),
+                    outcome: Some("pushed c1".into()),
+                }]
+            );
+        }
+
+        #[test]
+        fn effect_record_serde_round_trip() {
+            for outcome in [None, Some("pushed c1".to_string())] {
+                let record = EffectRecord {
+                    key: "push".into(),
+                    intent: "push feat".into(),
+                    outcome,
+                };
+                let json = serde_json::to_string(&record).unwrap();
+                assert_eq!(serde_json::from_str::<EffectRecord>(&json).unwrap(), record);
+            }
         }
 
         #[test]

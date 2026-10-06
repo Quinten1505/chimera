@@ -1,12 +1,13 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::error::PortError;
 use crate::{PaneId, WorkspaceId};
 
 /// Lifecycle of the agent running in a pane, as far as a turn is concerned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnStatus {
     Running,
     Finished,
@@ -287,6 +288,14 @@ mod tests {
         terminal.script_output(&pane, "result text");
         assert_eq!(terminal.read_output(&pane).await.unwrap(), "result text");
         assert_eq!(terminal.read_output(&other).await.unwrap(), "");
+    }
+
+    #[test]
+    fn turn_status_serde_round_trip() {
+        for status in [TurnStatus::Running, TurnStatus::Finished, TurnStatus::Gone] {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(serde_json::from_str::<TurnStatus>(&json).unwrap(), status);
+        }
     }
 
     #[tokio::test]
