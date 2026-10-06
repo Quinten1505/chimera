@@ -15,6 +15,11 @@ const HISTORY_FILE: &str = "history.md";
 const RECORD_PREFIX: &str = "<!-- chimera-turn ";
 const RECORD_SUFFIX: &str = " -->";
 
+/// A line starting with this outside a fence opens an HTML comment that hides everything up to the
+/// line containing [`COMMENT_CLOSE`] when the Markdown is rendered.
+const COMMENT_OPEN: &str = "<!--";
+const COMMENT_CLOSE: &str = "-->";
+
 /// Serializes appends within this process so entries from different pipeline instances never
 /// interleave; each entry is also written with a single `write_all` to a file opened for append.
 static APPEND_LOCK: Mutex<()> = Mutex::new(());
@@ -45,7 +50,7 @@ pub(crate) struct HistoryEntry<'a> {
 /// content is never rewritten; the entry, and the file's directory entry when the file was empty,
 /// are flushed to disk before this returns. On failure the entry is not left in the file; if the
 /// process dies mid-append instead, the next append first closes what the interrupted entry left
-/// open, so that entry is never loaded and later entries are.
+/// open, so that entry is never loaded and later entries are, and are visible when rendered.
 pub(crate) fn append_history(
     run_directory: &Path,
     entry: &HistoryEntry<'_>,
@@ -91,16 +96,22 @@ fn append_history_with(
     written
 }
 
-/// What must precede the next entry so that it starts on its own line outside any fence, when the
-/// file ends in an interrupted entry. An interrupted entry has no complete record, so it is never
-/// loaded as a turn.
+/// What must precede the next entry so that it starts on its own line outside any fence or HTML
+/// comment, when the file ends in an interrupted entry. An interrupted entry has no complete
+/// record, so it is never loaded as a turn; closing its comment on a line of its own keeps it so.
 fn repair(existing: &[u8]) -> String {
     let mut text = String::new();
     if !existing.is_empty() && !existing.ends_with(b"\n") {
         text.push('\n');
     }
-    if let Some(ticks) = scan(&String::from_utf8_lossy(existing)).open_fence {
+    let existing = String::from_utf8_lossy(existing);
+    let scan = scan(&existing);
+    if let Some(ticks) = scan.open_fence {
         text.push_str(&"`".repeat(ticks));
+        text.push('\n');
+    }
+    if scan.open_comment {
+        text.push_str(COMMENT_CLOSE);
         text.push('\n');
     }
     text
@@ -111,6 +122,8 @@ struct Scan<'a> {
     records: Vec<&'a str>,
     /// The number of backticks of the fence still open at the end of the text.
     open_fence: Option<usize>,
+    /// Whether the last line opens an HTML comment it does not close.
+    open_comment: bool,
 }
 
 /// Finds the records of complete entries. Turn output is never read as structure: lines inside a
@@ -137,9 +150,16 @@ fn scan(text: &str) -> Scan<'_> {
             }
         }
     }
+    // Each append closes what an interrupted one left open, so only the last line, a record cut
+    // short, can leave a comment open.
+    let open_comment = fence.is_none()
+        && lines
+            .last()
+            .is_some_and(|line| line.starts_with(COMMENT_OPEN) && !line.contains(COMMENT_CLOSE));
     Scan {
         records,
         open_fence: fence,
+        open_comment,
     }
 }
 
@@ -559,6 +579,16 @@ mod tests {
         .unwrap();
         assert_eq!(synced, 1);
         assert_eq!(load_turns(dir.path()).unwrap(), [turn]);
+    }
+
+    #[test]
+    fn interrupted_record_comment_is_closed_on_its_own_line() {
+        let cut = format!("{RECORD_PREFIX}{{\"agent\":");
+        assert_eq!(repair(cut.as_bytes()), "\n-->\n");
+        assert_eq!(repair(format!("{cut} --").as_bytes()), "\n-->\n");
+        // A complete record line, or a comment inside a fence, needs no terminator.
+        assert_eq!(repair(format!("{cut}{RECORD_SUFFIX}").as_bytes()), "\n");
+        assert_eq!(repair(b"```text\n<!-- x\n"), "```\n");
     }
 
     #[test]

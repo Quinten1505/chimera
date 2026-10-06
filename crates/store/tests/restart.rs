@@ -201,6 +201,33 @@ async fn pipeline_ids_with_separators_and_reserved_looking_names_do_not_collide(
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
 
+/// What a reader of the rendered `history.md` sees: the text of each level-2 heading and of each
+/// code block, in order. Nothing inside an HTML comment is among them.
+fn rendered(markdown: &str) -> (Vec<String>, Vec<String>) {
+    use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+
+    let (mut headings, mut blocks) = (Vec::new(), Vec::new());
+    let mut current: Option<String> = None;
+    for event in Parser::new(markdown) {
+        match event {
+            Event::Start(Tag::Heading {
+                level: HeadingLevel::H2,
+                ..
+            })
+            | Event::Start(Tag::CodeBlock(_)) => current = Some(String::new()),
+            Event::Text(text) => {
+                if let Some(current) = &mut current {
+                    current.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::Heading(HeadingLevel::H2)) => headings.extend(current.take()),
+            Event::End(TagEnd::CodeBlock) => blocks.extend(current.take()),
+            _ => {}
+        }
+    }
+    (headings, blocks)
+}
+
 /// The bytes of the entry that appending `turn` after `before` adds to `history.md`.
 async fn entry_bytes(turn: &TurnResult, before: &[TurnResult]) -> Vec<u8> {
     let root = tempfile::tempdir().unwrap();
@@ -234,6 +261,8 @@ async fn append_interrupted_at_any_byte_is_not_loaded_and_later_appends_are() {
         std::fs::create_dir_all(root.path().join("run-1")).unwrap();
         let mut bytes = prefix.clone();
         bytes.extend_from_slice(&tail[..cut]);
+        // The interrupted entry may end in a partial character.
+        let (torn_headings, torn_blocks) = rendered(&String::from_utf8_lossy(&bytes));
         std::fs::write(root.path().join("run-1/history.md"), bytes).unwrap();
 
         let store = open(&root);
@@ -251,6 +280,22 @@ async fn append_interrupted_at_any_byte_is_not_loaded_and_later_appends_are() {
         assert_eq!(
             open(&root).load_history(&id).await.unwrap(),
             expected,
+            "cut {cut}"
+        );
+
+        // Both entries after the interrupted one are visible when the Markdown is rendered.
+        let bytes = std::fs::read(root.path().join("run-1/history.md")).unwrap();
+        let (headings, blocks) = rendered(&String::from_utf8_lossy(&bytes));
+        assert_eq!(headings.len(), torn_headings.len() + 2, "cut {cut}");
+        assert!(headings[headings.len() - 2].ends_with(" · Implementation"));
+        assert!(headings[headings.len() - 1].ends_with(" · Review"));
+        let TurnOutcome::Invalid { output, .. } = &torn.outcome else {
+            unreachable!()
+        };
+        assert_eq!(blocks.len(), torn_blocks.len() + 2, "cut {cut}");
+        assert_eq!(
+            blocks[blocks.len() - 2..],
+            [format!("{output}\n"), "last\n".to_string()],
             "cut {cut}"
         );
     }
