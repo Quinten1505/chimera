@@ -20,10 +20,13 @@ pub struct GitRepository {
 
 impl GitRepository {
     /// `dir` is the repository's working directory; relative worktree paths resolve against it.
+    /// A relative `dir` is resolved against the current directory here, once, because `git` runs
+    /// inside `dir` and would otherwise resolve paths derived from it a second time.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
         Self {
             runner: Runner::new(),
-            dir: dir.into(),
+            dir: std::path::absolute(&dir).unwrap_or(dir),
         }
     }
 

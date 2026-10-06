@@ -16,7 +16,7 @@ pub(crate) fn create(
     task_branch: &str,
     feature: &str,
 ) -> Result<PathBuf, GitError> {
-    let path = &repo.join(path);
+    let path = &location(repo, path);
     let branch_ref = format!("refs/heads/{task_branch}");
     if path.symlink_metadata().is_ok() {
         let on_task_branch = registered(runner, repo)?.into_iter().any(|worktree| {
@@ -68,7 +68,7 @@ pub(crate) fn remove(
     path: &Path,
     task_branch: &str,
 ) -> Result<(), GitError> {
-    let path = &repo.join(path);
+    let path = &location(repo, path);
     if registered(runner, repo)?
         .iter()
         .any(|worktree| same_path(&worktree.path, path))
@@ -99,7 +99,7 @@ pub(crate) fn prune(runner: &Runner, repo: &Path) -> Result<(), GitError> {
 /// Whether `path` is a registered, usable worktree of `repo`: its directory must exist and
 /// belong to the same repository, so stale metadata and unrelated directories do not count.
 pub(crate) fn exists(runner: &Runner, repo: &Path, path: &Path) -> Result<bool, GitError> {
-    let path = &repo.join(path);
+    let path = &location(repo, path);
     let is_registered = registered(runner, repo)?
         .iter()
         .any(|worktree| same_path(&worktree.path, path));
@@ -139,10 +139,10 @@ pub(crate) fn update(
         return Err(GitError::Failed {
             command: "reset".to_owned(),
             status: "not run".to_owned(),
-            stderr: format!("{} is not a worktree", repo.join(path).display()),
+            stderr: format!("{} is not a worktree", location(repo, path).display()),
         });
     }
-    let path = &repo.join(path);
+    let path = &location(repo, path);
     let object = format!("{commit}^{{commit}}");
     if runner
         .run(repo, &["cat-file", "-e", &object], Effect::Read)
@@ -167,6 +167,13 @@ pub(crate) fn update(
     }
     runner.run(path, &["reset", "--hard", &object], Effect::Local)?;
     Ok(())
+}
+
+/// The absolute location of the worktree at `path`; a relative `path` resolves against `repo`.
+/// Git runs inside `repo`, so a relative result would be resolved against `repo` again.
+fn location(repo: &Path, path: &Path) -> PathBuf {
+    let joined = repo.join(path);
+    std::path::absolute(&joined).unwrap_or(joined)
 }
 
 struct Worktree {
