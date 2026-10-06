@@ -261,6 +261,11 @@ impl ImplementationPipeline {
                 }
                 return Ok(Err(error.into()));
             }
+            // Confirmed delivery: no reconciliation is needed on a restart.
+            turn.corrections += 1;
+            turn.phase = TurnPhase::Awaiting;
+            pending.turn = Some(turn.clone());
+            self.save_pending(pending).await?;
         }
     }
 
@@ -814,6 +819,59 @@ mod tests {
                 resume_at: Box::new(ImplementationState::Implementing { cycle: 1 }),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_correction_with_identical_output_still_counts() {
+        let f = fixture(WorkItem::Ticket(ticket()), 2);
+        f.script(Role::Implementation, &["nonsense", "nonsense"])
+            .await;
+
+        assert_eq!(
+            f.drive().await.unwrap(),
+            ImplementationState::Paused {
+                reason: PauseReason::LimitExhausted,
+                resume_at: Box::new(ImplementationState::Implementing { cycle: 1 }),
+            }
+        );
+        let history = f.store.load_history(&f.pipeline.run).await.unwrap();
+        let invalid = history
+            .iter()
+            .filter(|turn| matches!(turn.outcome, TurnOutcome::Invalid { .. }))
+            .count();
+        assert_eq!(invalid, 2);
+    }
+
+    #[tokio::test]
+    async fn restart_from_a_confirmed_correction_does_not_resend_it() {
+        let f = fixture(WorkItem::Ticket(ticket()), 3);
+        f.script(Role::Implementation, &[]).await;
+        f.script(Role::Review, &[APPROVED]).await;
+        let agent = f.pipeline.agent(Role::Implementation);
+        f.store
+            .append_turn(
+                &f.pipeline.run,
+                TurnResult {
+                    agent,
+                    role: Role::Implementation,
+                    outcome: TurnOutcome::Invalid {
+                        output: "nonsense".into(),
+                        problem: "no outcome found".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        // The correction was confirmed and saved; the agent finished with the same output.
+        show(&f, Role::Implementation, READY).await;
+        save_pending_turn(&f, Role::Implementation, TurnPhase::Awaiting, "nonsense", 1).await;
+
+        assert_eq!(
+            f.drive().await.unwrap(),
+            ImplementationState::WaitingForMerge
+        );
+        let sent = f.prompts(Role::Implementation).await;
+        assert!(sent.iter().all(|p| !p.contains("was rejected")));
     }
 
     #[tokio::test]
