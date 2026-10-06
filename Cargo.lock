@@ -98,8 +98,10 @@ dependencies = [
 name = "chimera-configuration"
 version = "0.1.0"
 dependencies = [
+ "chimera-core",
  "serde",
  "serde_yaml_ng",
+ "thiserror",
 ]
 
 [[package]]

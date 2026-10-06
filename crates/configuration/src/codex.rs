@@ -1,5 +1,6 @@
 use serde::Deserialize;
-use std::{fmt, fs, io, path::Path};
+use std::{fs, io, path::Path};
+use thiserror::Error;
 
 /// Named agent profiles. Workspace assignment and workflow remain in Rust.
 #[derive(Debug, Clone, Deserialize)]
@@ -10,19 +11,23 @@ pub struct CodexConfiguration {
 
 impl CodexConfiguration {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigurationError> {
-        Self::from_yaml(&fs::read_to_string(path).map_err(ConfigurationError::Io)?)
+        Self::from_yaml(&fs::read_to_string(path)?)
     }
 
     pub fn from_yaml(yaml: &str) -> Result<Self, ConfigurationError> {
-        let configuration: Self = serde_yaml::from_str(yaml).map_err(ConfigurationError::Yaml)?;
+        let configuration: Self = serde_yaml::from_str(yaml)?;
         if configuration.agents.is_empty() {
-            return Err(ConfigurationError::Invalid("agents"));
+            return Err(ConfigurationError::Invalid {
+                field: "agents".into(),
+            });
         }
         for (name, options) in &configuration.agents {
             if name.trim().is_empty() || name.chars().any(char::is_control) {
-                return Err(ConfigurationError::Invalid("agent profile name"));
+                return Err(ConfigurationError::Invalid {
+                    field: format!("agents.{name}"),
+                });
             }
-            options.validate()?;
+            options.validate(&format!("agents.{name}."))?;
         }
         Ok(configuration)
     }
@@ -53,14 +58,16 @@ pub struct CodexOptions {
 }
 
 impl CodexOptions {
-    fn validate(&self) -> Result<(), ConfigurationError> {
+    fn validate(&self, prefix: &str) -> Result<(), ConfigurationError> {
         for (field, value) in [
             ("model", &self.model),
             ("reasoning_effort", &self.reasoning_effort),
             ("service_tier", &self.service_tier),
         ] {
             if value.trim().is_empty() || value.chars().any(char::is_control) {
-                return Err(ConfigurationError::Invalid(field));
+                return Err(ConfigurationError::Invalid {
+                    field: format!("{prefix}{field}"),
+                });
             }
         }
         Ok(())
@@ -68,7 +75,7 @@ impl CodexOptions {
 
     /// Individual argv entries, passed to Herdr without constructing a shell command.
     pub fn launch_args(&self) -> Result<Vec<String>, ConfigurationError> {
-        self.validate()?;
+        self.validate("")?;
         let mut args = vec![
             "--model".into(),
             self.model.clone(),
@@ -91,34 +98,32 @@ fn toml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ConfigurationError {
-    Io(io::Error),
-    Yaml(serde_yaml::Error),
-    Invalid(&'static str),
+    #[error("cannot read configuration file: {0}")]
+    Io(#[from] io::Error),
+    #[error("invalid YAML at line {line}, column {column}")]
+    Yaml {
+        line: usize,
+        column: usize,
+        #[source]
+        source: serde_yaml::Error,
+    },
+    #[error("{field} must be nonempty and contain no control characters")]
+    Invalid { field: String },
+    #[error("unknown agent profile: {0}")]
     UnknownProfile(String),
 }
 
-impl fmt::Display for ConfigurationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "Cannot read Codex configuration: {error}"),
-            Self::Yaml(error) => write!(f, "Invalid Codex YAML: {error}"),
-            Self::UnknownProfile(name) => write!(f, "Unknown agent profile: {name}"),
-            Self::Invalid(field) => write!(
-                f,
-                "{field} must be nonempty and contain no control characters"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ConfigurationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Yaml(error) => Some(error),
-            Self::Invalid(_) | Self::UnknownProfile(_) => None,
+impl From<serde_yaml::Error> for ConfigurationError {
+    fn from(source: serde_yaml::Error) -> Self {
+        let (line, column) = source
+            .location()
+            .map_or((0, 0), |location| (location.line(), location.column()));
+        Self::Yaml {
+            line,
+            column,
+            source,
         }
     }
 }
@@ -171,6 +176,18 @@ mod tests {
         ] {
             assert!(CodexConfiguration::from_yaml(yaml).is_err());
         }
+    }
+
+    #[test]
+    fn errors_name_field_path_and_yaml_location() {
+        let yaml = include_str!("../../../codex.yaml").replace("model: gpt-6-luna", "model: ''");
+        let message = CodexConfiguration::from_yaml(&yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("agents.builder.model"), "{message}");
+        let error = CodexConfiguration::from_yaml("model: [invalid").unwrap_err();
+        assert!(matches!(error, ConfigurationError::Yaml { line: 1, .. }));
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
