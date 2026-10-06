@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chimera_core::error::PortError;
+use chimera_core::repository::Repository;
 use chimera_core::run_store::RunStore;
 use chimera_core::{
     AgentConfiguration, AgentId, CommitId, IssueRef, MergedOk, Outcome, Role, RunId, TurnOutcome,
@@ -12,6 +13,8 @@ use crate::agent_turn::{AgentTurns, TurnError, TurnRequest};
 use crate::driver::{Pipeline, PipelineState};
 use crate::environment::{Environment, EnvironmentService, ProvisionSpec};
 use crate::error::{PauseReason, PipelineError};
+use crate::merge_lock::MergeLock;
+use crate::policy::Policy;
 
 /// State of one implementation pipeline instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,9 +47,8 @@ pub enum ImplementationState {
 }
 
 impl PipelineState for ImplementationState {
-    /// The steps from `WaitingForMerge` on are not implemented yet, so the driver stops there.
     fn is_terminal(&self) -> bool {
-        matches!(self, Self::WaitingForMerge | Self::Done(_))
+        matches!(self, Self::Done(_))
     }
 
     fn is_paused(&self) -> bool {
@@ -54,8 +56,11 @@ impl PipelineState for ImplementationState {
     }
 }
 
-/// `(WorkItem, AgentConfiguration)` up to `WaitingForMerge`: provisioning and the
-/// implementation/review loop.
+/// `(WorkItem, AgentConfiguration)` to `MergedOk`: provisioning, the implementation/review loop,
+/// the merge under the feature branch's merge lock, its verification and the cleanup.
+///
+/// The merge agent ends the explanation of `MergeSuccessful` with the commit it pushed; that
+/// commit is what verification looks for on the remote.
 pub struct ImplementationPipeline {
     pub run: RunId,
     /// Names this task in the store and its agents in the history.
@@ -66,8 +71,15 @@ pub struct ImplementationPipeline {
     pub configuration: AgentConfiguration,
     /// Implementation/review cycles allowed, corrections included.
     pub cycle_limit: u32,
+    /// Merge attempts allowed, corrections included.
+    pub merge_limit: u32,
     pub spec: ProvisionSpec,
+    /// The remote head of the feature branch when no merge has updated the expected one yet.
+    pub initial_remote_head: CommitId,
     pub store: Arc<dyn RunStore>,
+    pub repository: Arc<dyn Repository>,
+    pub policy: Arc<Policy>,
+    pub lock: Arc<MergeLock>,
     pub environment: Arc<EnvironmentService>,
     pub turns: Arc<AgentTurns>,
 }
@@ -92,13 +104,13 @@ impl ImplementationPipeline {
 
     /// The turns of this task's agents, oldest first.
     async fn history(&self) -> Result<Vec<TurnResult>, PipelineError> {
-        let (implementation, review) = (self.agent(Role::Implementation), self.agent(Role::Review));
+        let agents = [Role::Implementation, Role::Review, Role::Merge].map(|role| self.agent(role));
         Ok(self
             .store
             .load_history(&self.run)
             .await?
             .into_iter()
-            .filter(|turn| turn.agent == implementation || turn.agent == review)
+            .filter(|turn| agents.contains(&turn.agent))
             .collect())
     }
 
@@ -303,102 +315,25 @@ impl ImplementationPipeline {
                     .as_ref()
                     .filter(|turn| turn.role == role && turn.cycle == cycle)
                     .map_or(invalid, |turn| turn.invalid_before);
-                let used = cycle as usize + invalid_before;
-                if used > self.cycle_limit as usize {
-                    return Ok(paused(PauseReason::LimitExhausted, state));
-                }
                 let other = if role == Role::Review {
                     Role::Implementation
                 } else {
                     Role::Review
                 };
-                let previous = valid(other).next_back().map(outcome_text);
-                let has_previous = previous.is_some();
-                // Every assignment keeps the findings next to the latest description.
-                let description = match (&self.work_item, previous) {
-                    (WorkItem::Findings(findings), Some(previous)) => Some(format!(
-                        "Findings:\n{findings}\n\nLatest description:\n{previous}"
-                    )),
-                    (WorkItem::Findings(findings), None) => Some(format!("Findings:\n{findings}")),
-                    (_, previous) => previous,
-                };
-                let agent = self.agent(role);
-                let environment = self.load_environment().await?;
-                let pane = environment.pane(role).ok_or_else(|| {
-                    PipelineError::Environment(format!("no {role:?} agent in the environment"))
-                })?;
-                let request = TurnRequest {
-                    run: &self.run,
-                    agent: &agent,
-                    pane,
-                    role,
-                    profile: self.configuration.profile(role),
-                    issue: &self.issue,
-                    previous_description: description.as_deref(),
-                };
-                let max_corrections = (self.cycle_limit as usize - used) as u32;
-                let fresh = PendingTurn {
+                let plan = TurnPlan {
                     role,
                     cycle,
-                    output_before: self.turns.read_output(pane).await?,
                     invalid_before,
-                    corrections: 0,
-                    phase: TurnPhase::Sending,
+                    used: cycle as usize + invalid_before,
+                    limit: self.cycle_limit,
+                    previous: valid(other)
+                        .next_back()
+                        .map(|outcome| (other, outcome_text(outcome))),
+                    remember: false,
                 };
-                let mut reset_failed = None;
-                let result = self
-                    .execute_turn(
-                        &mut pending,
-                        &request,
-                        fresh,
-                        has_previous.then_some(other),
-                        max_corrections,
-                        &mut reset_failed,
-                    )
-                    .await?;
-                match result {
-                    Ok(outcome) => {
-                        // A reset that failed stays owed: it is retried before the state moves
-                        // on, and the saved result of the turn is kept.
-                        pending.turn = None;
-                        self.save_pending(&pending).await?;
-                        if let Some(error) = reset_failed {
-                            return Err(error);
-                        }
-                        outcome
-                    }
-                    Err(error) => match error {
-                        TurnError::AgentLost => {
-                            let command_line = &self
-                                .spec
-                                .agents
-                                .iter()
-                                .find(|launch| launch.role == role)
-                                .ok_or_else(|| {
-                                    PipelineError::Environment(format!(
-                                        "no {role:?} launch in spec"
-                                    ))
-                                })?
-                                .command_line;
-                            self.environment
-                                .relaunch(&environment, role, command_line)
-                                .await?;
-                            pending.turn = None;
-                            self.save_pending(&pending).await?;
-                            return Ok(state);
-                        }
-                        TurnError::CorrectionsExhausted { .. } => {
-                            pending.turn = None;
-                            self.save_pending(&pending).await?;
-                            return Ok(paused(PauseReason::LimitExhausted, state));
-                        }
-                        TurnError::Paused(reason) => {
-                            // Nothing was sent.
-                            self.save_pending(&Pending::default()).await?;
-                            return Err(PipelineError::Paused(reason));
-                        }
-                        other => return Err(other.into()),
-                    },
+                match self.run_turn(&mut pending, state, plan).await? {
+                    Ok(outcome) => outcome,
+                    Err(next) => return Ok(next),
                 }
             }
         };
@@ -409,6 +344,341 @@ impl ImplementationPipeline {
             other => unreachable!("{other:?} is not valid for the {role:?} role"),
         })
     }
+
+    /// Starts the turn of `plan`, or continues it after a restart, and returns its outcome. When
+    /// the turn cannot finish now, returns the state to continue from instead.
+    async fn run_turn(
+        &self,
+        pending: &mut Pending,
+        state: ImplementationState,
+        plan: TurnPlan,
+    ) -> Result<Result<Outcome, ImplementationState>, PipelineError> {
+        let TurnPlan {
+            role,
+            cycle,
+            invalid_before,
+            used,
+            limit,
+            previous,
+            remember,
+        } = plan;
+        if used > limit as usize {
+            return Ok(Err(paused(PauseReason::LimitExhausted, state)));
+        }
+        let sender = previous
+            .as_ref()
+            .map(|(sender, _)| *sender)
+            .filter(|sender| *sender != role);
+        let previous = previous.map(|(_, text)| text);
+        // Every assignment keeps the findings next to the latest description.
+        let description = match (&self.work_item, previous) {
+            (WorkItem::Findings(findings), Some(previous)) => Some(format!(
+                "Findings:\n{findings}\n\nLatest description:\n{previous}"
+            )),
+            (WorkItem::Findings(findings), None) => Some(format!("Findings:\n{findings}")),
+            (_, previous) => previous,
+        };
+        let agent = self.agent(role);
+        let environment = self.load_environment().await?;
+        let pane = environment.pane(role).ok_or_else(|| {
+            PipelineError::Environment(format!("no {role:?} agent in the environment"))
+        })?;
+        let request = TurnRequest {
+            run: &self.run,
+            agent: &agent,
+            pane,
+            role,
+            profile: self.configuration.profile(role),
+            issue: &self.issue,
+            previous_description: description.as_deref(),
+        };
+        let max_corrections = (limit as usize - used) as u32;
+        let fresh = PendingTurn {
+            role,
+            cycle,
+            output_before: self.turns.read_output(pane).await?,
+            invalid_before,
+            valid_before: valid_count(&self.history().await?),
+            corrections: 0,
+            phase: TurnPhase::Sending,
+        };
+        let mut reset_failed = None;
+        let result = self
+            .execute_turn(
+                pending,
+                &request,
+                fresh,
+                sender,
+                max_corrections,
+                &mut reset_failed,
+            )
+            .await?;
+        match result {
+            Ok(outcome) => {
+                // A reset that failed stays owed: it is retried before the state moves on, and
+                // the saved result of the turn is kept.
+                pending.turn = None;
+                if remember {
+                    let valid = valid_count(&self.history().await?);
+                    pending.finished = Some(Finished { state, valid });
+                }
+                self.save_pending(pending).await?;
+                if let Some(error) = reset_failed {
+                    return Err(error);
+                }
+                Ok(Ok(outcome))
+            }
+            Err(TurnError::AgentLost) => {
+                let command_line = &self
+                    .spec
+                    .agents
+                    .iter()
+                    .find(|launch| launch.role == role)
+                    .ok_or_else(|| {
+                        PipelineError::Environment(format!("no {role:?} launch in spec"))
+                    })?
+                    .command_line;
+                self.environment
+                    .relaunch(&environment, role, command_line)
+                    .await?;
+                pending.turn = None;
+                self.save_pending(pending).await?;
+                Ok(Err(state))
+            }
+            Err(TurnError::CorrectionsExhausted { .. }) => {
+                pending.turn = None;
+                self.save_pending(pending).await?;
+                Ok(Err(paused(PauseReason::LimitExhausted, state)))
+            }
+            Err(TurnError::Paused(reason)) => {
+                // Nothing was sent.
+                pending.turn = None;
+                self.save_pending(pending).await?;
+                Err(PipelineError::Paused(reason))
+            }
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    /// Runs the turn of `role` in the merge phase unless its result was already saved, then
+    /// moves on. A merge attempt can span several turns (the merge agent, the conflict review and
+    /// the merge agent again), so a saved result is recognised by the turn it ended, not by a
+    /// count.
+    async fn merge_turn_step(
+        &self,
+        state: ImplementationState,
+        role: Role,
+        attempt: u32,
+    ) -> Result<ImplementationState, PipelineError> {
+        let mut pending = self.load_pending().await?;
+        self.reset_owed(&mut pending).await?;
+        let history = self.history().await?;
+        let valid = valid_turns(&history);
+        let started = pending
+            .turn
+            .as_ref()
+            .filter(|turn| turn.role == role && turn.cycle == attempt);
+        let finished = pending
+            .finished
+            .as_ref()
+            .is_some_and(|finished| finished.state == state && finished.valid == valid.len());
+        let saved = finished || started.is_some_and(|turn| valid.len() > turn.valid_before);
+        let outcome = if saved {
+            if !finished {
+                // The result was saved but the turn was not closed.
+                pending.turn = None;
+                pending.finished = Some(Finished {
+                    state: state.clone(),
+                    valid: valid.len(),
+                });
+                self.save_pending(&pending).await?;
+            }
+            valid.last().expect("a valid turn was saved").1.clone()
+        } else {
+            let total_invalid = history
+                .iter()
+                .filter(|turn| matches!(turn.outcome, TurnOutcome::Invalid { .. }))
+                .count();
+            let invalid_before = started.map_or(total_invalid, |turn| turn.invalid_before);
+            let plan = TurnPlan {
+                role,
+                cycle: attempt,
+                invalid_before,
+                used: attempt as usize + self.merge_phase_invalid(&history, invalid_before),
+                limit: self.merge_limit,
+                previous: valid
+                    .last()
+                    .map(|(sender, outcome)| (*sender, outcome_text(outcome))),
+                remember: true,
+            };
+            match self.run_turn(&mut pending, state, plan).await? {
+                Ok(outcome) => outcome,
+                Err(next) => return Ok(next),
+            }
+        };
+        Ok(match outcome {
+            Outcome::MergeSuccessful(_) => ImplementationState::Verifying { attempt },
+            Outcome::MergeReadyForConflictReview(_) => {
+                ImplementationState::ConflictReview { attempt }
+            }
+            Outcome::MergeBlocked(_) => ImplementationState::Merging {
+                attempt: attempt + 1,
+            },
+            Outcome::ReviewApproved(_) | Outcome::ChangesRequested(_) => {
+                ImplementationState::Merging { attempt }
+            }
+            other => unreachable!("{other:?} is not valid for the {role:?} role"),
+        })
+    }
+
+    /// Invalid results of the merge agent and of the conflict reviews among the first
+    /// `invalid_before` invalid results of the history.
+    fn merge_phase_invalid(&self, history: &[TurnResult], invalid_before: usize) -> usize {
+        let (merge, review) = (self.agent(Role::Merge), self.agent(Role::Review));
+        let mut merging = false;
+        history
+            .iter()
+            .filter_map(|turn| {
+                merging |= turn.agent == merge;
+                matches!(turn.outcome, TurnOutcome::Invalid { .. })
+                    .then_some(turn.agent == merge || (merging && turn.agent == review))
+            })
+            .take(invalid_before)
+            .filter(|counts| *counts)
+            .count()
+    }
+
+    fn expected_head_key(&self) -> String {
+        format!("remote_head:{}", self.spec.feature)
+    }
+
+    /// The remote head of the feature branch as Chimera last knew it, shared by all instances.
+    async fn expected_head(&self) -> Result<CommitId, PipelineError> {
+        Ok(
+            match self
+                .store
+                .load_pipeline_state(&self.run, &self.expected_head_key())
+                .await?
+            {
+                Some(saved) => serde_json::from_value(saved)?,
+                None => self.initial_remote_head.clone(),
+            },
+        )
+    }
+
+    /// Checks the pushed commit through the repository instead of trusting the merge agent, then
+    /// records it as the expected remote head and releases the merge lock. What was verified is
+    /// saved first, so a restart never merges again and only repeats the idempotent rest.
+    async fn verify(&self, attempt: u32) -> Result<ImplementationState, PipelineError> {
+        let mut pending = self.load_pending().await?;
+        let merged = match pending.verified.clone() {
+            Some(merged) => merged,
+            None => {
+                let history = self.history().await?;
+                let reported =
+                    valid_turns(&history)
+                        .last()
+                        .and_then(|(_, outcome)| match outcome {
+                            Outcome::MergeSuccessful(text) => pushed_commit(text),
+                            _ => None,
+                        });
+                let expected = self.expected_head().await?;
+                let actual = self.repository.remote_head(&self.spec.feature).await?;
+                match actual {
+                    // Nothing was pushed: the lock is kept and the merge is retried.
+                    Some(actual) if actual == expected => {
+                        return Ok(ImplementationState::Merging {
+                            attempt: attempt + 1,
+                        });
+                    }
+                    Some(actual) if reported.as_ref() == Some(&actual) => {
+                        pending.verified = Some(actual.clone());
+                        self.save_pending(&pending).await?;
+                        actual
+                    }
+                    other => {
+                        // Neither the expected head nor the verified push. The branch being gone
+                        // is just as unexpected.
+                        let reason = match other {
+                            Some(actual) => self
+                                .policy
+                                .check_remote_head(&expected, &actual)
+                                .expect_err("the heads differ"),
+                            None => {
+                                self.policy.pause(PauseReason::UnexpectedRemoteChange);
+                                PauseReason::UnexpectedRemoteChange
+                            }
+                        };
+                        return Err(PipelineError::Paused(reason));
+                    }
+                }
+            }
+        };
+        self.store
+            .save_pipeline_state(
+                &self.run,
+                &self.expected_head_key(),
+                serde_json::to_value(&merged)?,
+            )
+            .await?;
+        if self.lock.holder().as_deref() == Some(self.instance.as_str()) {
+            self.lock.release(&self.instance).await?;
+        }
+        Ok(ImplementationState::CleaningUp { merged })
+    }
+
+    /// Closes the workspace and removes the worktree. What was removed is saved even if a later
+    /// removal fails, so a retry continues where this one stopped.
+    async fn clean_up(&self, merged: CommitId) -> Result<ImplementationState, PipelineError> {
+        let mut environment = self.load_environment().await?;
+        let cleaned = self.environment.cleanup(&mut environment).await;
+        self.store
+            .save_pipeline_state(
+                &self.run,
+                &self.environment_key(),
+                serde_json::to_value(&environment)?,
+            )
+            .await?;
+        cleaned?;
+        Ok(ImplementationState::Done(MergedOk { commit: merged }))
+    }
+}
+
+/// The valid results of a history with the role that produced each, oldest first.
+fn valid_turns(history: &[TurnResult]) -> Vec<(Role, &Outcome)> {
+    history
+        .iter()
+        .filter_map(|turn| match &turn.outcome {
+            TurnOutcome::Valid(outcome) => Some((turn.role, outcome)),
+            TurnOutcome::Invalid { .. } => None,
+        })
+        .collect()
+}
+
+fn valid_count(history: &[TurnResult]) -> usize {
+    valid_turns(history).len()
+}
+
+/// The commit a merge agent ends its explanation with.
+fn pushed_commit(text: &str) -> Option<CommitId> {
+    let last = text.split_whitespace().next_back()?;
+    CommitId::new(last.trim_matches(|c: char| !c.is_alphanumeric())).ok()
+}
+
+/// What a turn needs besides its role: how it counts against its limit and what it is told.
+struct TurnPlan {
+    role: Role,
+    /// Identifies the turn in `Pending` while it is in flight.
+    cycle: u32,
+    /// Invalid results in the history when the turn started.
+    invalid_before: usize,
+    /// Cycles or attempts used, corrections included.
+    used: usize,
+    limit: u32,
+    /// The previous agent's role and description.
+    previous: Option<(Role, String)>,
+    /// Keep a marker of the finished turn in `Pending` for the merge phase.
+    remember: bool,
 }
 
 /// What a step that was interrupted may have left half done, saved before the effect runs.
@@ -419,6 +689,19 @@ struct Pending {
     /// The sender of a handoff whose context still has to be cleared. Set only once the
     /// receiver is known to have its prompt.
     reset: Option<Role>,
+    /// The last merge-phase turn that finished, until the next one starts.
+    #[serde(default)]
+    finished: Option<Finished>,
+    /// The pushed commit that was verified.
+    #[serde(default)]
+    verified: Option<CommitId>,
+}
+
+/// A merge-phase turn that finished in `state`, when `valid` valid results were in the history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Finished {
+    state: ImplementationState,
+    valid: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,6 +713,9 @@ struct PendingTurn {
     output_before: String,
     /// Invalid results in the history when the turn started; later ones are its corrections.
     invalid_before: usize,
+    /// Valid results in the history when the turn started; a later one is its result.
+    #[serde(default)]
+    valid_before: usize,
     /// Corrections known to be delivered.
     corrections: u32,
     phase: TurnPhase,
@@ -492,7 +778,22 @@ impl Pipeline for ImplementationPipeline {
             ImplementationState::Reviewing { cycle } => {
                 self.turn_step(state, Role::Review, cycle).await
             }
-            other => Ok(other),
+            ImplementationState::WaitingForMerge => {
+                self.policy.check_start().map_err(PipelineError::Paused)?;
+                self.lock.acquire(&self.instance).await?;
+                Ok(ImplementationState::Merging { attempt: 1 })
+            }
+            ImplementationState::Merging { attempt } => {
+                self.merge_turn_step(state, Role::Merge, attempt).await
+            }
+            ImplementationState::ConflictReview { attempt } => {
+                self.merge_turn_step(state, Role::Review, attempt).await
+            }
+            ImplementationState::Verifying { attempt } => self.verify(attempt).await,
+            ImplementationState::CleaningUp { merged } => self.clean_up(merged).await,
+            other @ (ImplementationState::Done(_) | ImplementationState::Paused { .. }) => {
+                Ok(other)
+            }
         }
     }
 }
@@ -514,6 +815,8 @@ mod tests {
     };
 
     use super::*;
+    use futures_executor::block_on;
+
     use crate::driver::drive;
     use crate::environment::AgentLaunch;
     use crate::policy::Policy;
@@ -533,6 +836,8 @@ mod tests {
         fail_send: Mutex<Option<PortError>>,
         /// Fails the next correction after delivering it.
         fail_correction_after_send: Mutex<Option<PortError>>,
+        /// Every prompt delivered, kept after the pane is closed.
+        sent: Mutex<HashMap<PaneId, Vec<String>>>,
     }
 
     #[async_trait]
@@ -580,6 +885,12 @@ mod tests {
                 self.inner.script_statuses(pane, [TurnStatus::Finished]);
             }
             self.inner.send_prompt(pane, prompt).await?;
+            self.sent
+                .lock()
+                .unwrap()
+                .entry(pane.clone())
+                .or_default()
+                .push(prompt.to_string());
             if prompt.contains("was rejected")
                 && let Some(error) = self.fail_correction_after_send.lock().unwrap().take()
             {
@@ -607,6 +918,7 @@ mod tests {
     struct Fixture {
         terminal: Arc<ScriptedTerminal>,
         store: Arc<FakeRunStore>,
+        repository: Arc<FakeRepository>,
         policy: Arc<Policy>,
         pipeline: ImplementationPipeline,
     }
@@ -624,12 +936,29 @@ mod tests {
     }
 
     fn fixture(work_item: WorkItem, cycle_limit: u32) -> Fixture {
+        fixture_for(work_item, cycle_limit, "t31", None)
+    }
+
+    /// A pipeline instance `instance`; with `other` it shares that fixture's run store,
+    /// repository and policy, and so the merge lock.
+    fn fixture_for(
+        work_item: WorkItem,
+        cycle_limit: u32,
+        instance: &str,
+        other: Option<&Fixture>,
+    ) -> Fixture {
         let branch = |name: &str| BranchName::new(name).unwrap();
-        let repository = Arc::new(FakeRepository::new(
-            branch("main"),
-            CommitId::new("c0").unwrap(),
-        ));
-        repository.add_branch(branch("feat"), CommitId::new("c0").unwrap());
+        let repository = match other {
+            Some(other) => other.repository.clone(),
+            None => {
+                let repository = Arc::new(FakeRepository::new(
+                    branch("main"),
+                    CommitId::new("c0").unwrap(),
+                ));
+                repository.add_branch(branch("feat"), CommitId::new("c0").unwrap());
+                repository
+            }
+        };
         let terminal = Arc::new(ScriptedTerminal {
             inner: FakeTerminal::new(),
             replies: Mutex::default(),
@@ -639,11 +968,21 @@ mod tests {
             fail_after_send: Mutex::default(),
             fail_send: Mutex::default(),
             fail_correction_after_send: Mutex::default(),
+            sent: Mutex::default(),
         });
-        let store = Arc::new(FakeRunStore::new());
-        let policy = Arc::new(Policy::new(&Limits::default()));
+        let store = other.map_or_else(|| Arc::new(FakeRunStore::new()), |f| f.store.clone());
+        let policy = other.map_or_else(
+            || Arc::new(Policy::new(&Limits::default())),
+            |f| f.policy.clone(),
+        );
+        let lock = block_on(MergeLock::open(
+            store.clone(),
+            RunId::new("run").unwrap(),
+            &branch("feat"),
+        ))
+        .unwrap();
         let environment = Arc::new(EnvironmentService::new(
-            repository,
+            repository.clone(),
             terminal.clone(),
             policy.clone(),
         ));
@@ -656,7 +995,7 @@ mod tests {
         let profile = |name: &str| AgentProfile::new("p", "m", format!("You are {name}."));
         let pipeline = ImplementationPipeline {
             run: RunId::new("run").unwrap(),
-            instance: "t31".into(),
+            instance: instance.into(),
             work_item,
             issue: issue(),
             configuration: AgentConfiguration {
@@ -665,9 +1004,10 @@ mod tests {
                 merge: profile("merger"),
             },
             cycle_limit,
+            merge_limit: 3,
             spec: ProvisionSpec {
-                worktree: "/wt".into(),
-                task_branch: branch("task"),
+                worktree: format!("/wt/{instance}").into(),
+                task_branch: branch(&format!("task-{instance}")),
                 feature: branch("feat"),
                 agents: [Role::Implementation, Role::Review, Role::Merge]
                     .map(|role| AgentLaunch {
@@ -676,20 +1016,52 @@ mod tests {
                     })
                     .to_vec(),
             },
+            initial_remote_head: CommitId::new("c0").unwrap(),
             store: store.clone(),
+            repository: repository.clone(),
+            policy: policy.clone(),
+            lock,
             environment,
             turns,
         };
         Fixture {
             terminal,
             store,
+            repository,
             policy,
             pipeline,
         }
     }
 
     impl Fixture {
+        /// Drives the task until its work is approved and it waits for the merge.
         async fn drive(&self) -> Result<ImplementationState, PipelineError> {
+            let mut state = match self
+                .store
+                .load_pipeline_state(&self.pipeline.run, &self.pipeline.instance)
+                .await?
+            {
+                Some(saved) => serde_json::from_value(saved)?,
+                None => self.pipeline.initial_state(),
+            };
+            while !matches!(
+                state,
+                ImplementationState::WaitingForMerge | ImplementationState::Paused { .. }
+            ) {
+                state = self.pipeline.step(state).await?;
+                self.store
+                    .save_pipeline_state(
+                        &self.pipeline.run,
+                        &self.pipeline.instance,
+                        serde_json::to_value(&state)?,
+                    )
+                    .await?;
+            }
+            Ok(state)
+        }
+
+        /// Drives the task to the end, through the merge.
+        async fn drive_through(&self) -> Result<ImplementationState, PipelineError> {
             drive(
                 self.store.as_ref(),
                 &self.pipeline.run,
@@ -733,7 +1105,14 @@ mod tests {
         }
 
         async fn prompts(&self, role: Role) -> Vec<String> {
-            self.terminal.inner.prompts(&self.pane(role).await)
+            let pane = self.pane(role).await;
+            self.terminal
+                .sent
+                .lock()
+                .unwrap()
+                .get(&pane)
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
@@ -1020,10 +1399,11 @@ mod tests {
                 cycle: 1,
                 output_before: output_before.into(),
                 invalid_before: 0,
+                valid_before: 0,
                 corrections,
                 phase,
             }),
-            reset: None,
+            ..Pending::default()
         };
         f.pipeline.save_pending(&pending).await.unwrap();
     }
@@ -1417,6 +1797,345 @@ mod tests {
         }
         assert!(implementation[1].contains("fix it"));
         assert!(review[0].contains("done"));
+    }
+
+    const CONFLICTS: &str = r#"{"MergeReadyForConflictReview":"resolved"}"#;
+    const MERGED: &str = r#"{"MergeSuccessful":"merged and pushed c1"}"#;
+    const BLOCKED: &str = r#"{"MergeBlocked":"tests fail"}"#;
+
+    fn commit(id: &str) -> CommitId {
+        CommitId::new(id).unwrap()
+    }
+
+    fn feature() -> BranchName {
+        BranchName::new("feat").unwrap()
+    }
+
+    /// Approves the work, scripts the merge agent and the conflict reviews, and stops at
+    /// `WaitingForMerge`.
+    async fn ready_to_merge(f: &Fixture, merge: &[&str], conflict_reviews: &[&str]) {
+        f.script(Role::Implementation, &[READY]).await;
+        let reviews: Vec<&str> = [APPROVED]
+            .into_iter()
+            .chain(conflict_reviews.iter().copied())
+            .collect();
+        f.script(Role::Review, &reviews).await;
+        f.script(Role::Merge, merge).await;
+        assert_eq!(
+            f.drive().await.unwrap(),
+            ImplementationState::WaitingForMerge
+        );
+    }
+
+    fn holder(f: &Fixture) -> Option<String> {
+        f.pipeline.lock.holder()
+    }
+
+    #[tokio::test]
+    async fn a_clean_merge_is_verified_without_another_review() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[MERGED], &[]).await;
+        f.repository.set_remote_head(feature(), commit("c1"));
+
+        assert_eq!(
+            f.drive_through().await.unwrap(),
+            ImplementationState::Done(MergedOk {
+                commit: commit("c1")
+            })
+        );
+
+        assert_eq!(holder(&f), None);
+        assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c1"));
+        assert_eq!(
+            assignments(&f.prompts(Role::Review).await, "reviewer").len(),
+            1
+        );
+        assert_eq!(
+            assignments(&f.prompts(Role::Merge).await, "merger").len(),
+            1
+        );
+        // The environment is cleaned up and the history is kept.
+        let path = f.pipeline.spec.worktree.clone();
+        assert_eq!(f.repository.worktree_branch(&path), None);
+        assert!(
+            f.pipeline
+                .load_environment()
+                .await
+                .unwrap()
+                .workspace
+                .is_none()
+        );
+        assert_eq!(
+            f.store.load_history(&f.pipeline.run).await.unwrap().len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_for_merge_holds_the_lock_before_merging() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[], &[]).await;
+
+        let next = f
+            .pipeline
+            .step(ImplementationState::WaitingForMerge)
+            .await
+            .unwrap();
+
+        assert_eq!(next, ImplementationState::Merging { attempt: 1 });
+        assert_eq!(holder(&f), Some("t31".into()));
+    }
+
+    #[tokio::test]
+    async fn a_global_pause_stops_before_the_lock_is_taken() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[], &[]).await;
+        f.policy.pause(PauseReason::GlobalPause);
+
+        let error = f
+            .pipeline
+            .step(ImplementationState::WaitingForMerge)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Paused(PauseReason::GlobalPause)
+        ));
+        assert_eq!(holder(&f), None);
+    }
+
+    #[tokio::test]
+    async fn conflict_review_corrections_return_to_the_merge_agent_which_keeps_the_lock() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[CONFLICTS, MERGED], &[CHANGES]).await;
+        f.repository.set_remote_head(feature(), commit("c1"));
+
+        let mut state = f
+            .pipeline
+            .step(ImplementationState::WaitingForMerge)
+            .await
+            .unwrap();
+        let mut visited = vec![state.clone()];
+        while !matches!(state, ImplementationState::CleaningUp { .. }) {
+            state = f.pipeline.step(state).await.unwrap();
+            if !matches!(state, ImplementationState::CleaningUp { .. }) {
+                assert_eq!(holder(&f), Some("t31".into()), "{state:?}");
+            }
+            visited.push(state.clone());
+        }
+
+        assert_eq!(
+            visited,
+            [
+                ImplementationState::Merging { attempt: 1 },
+                ImplementationState::ConflictReview { attempt: 1 },
+                ImplementationState::Merging { attempt: 1 },
+                ImplementationState::Verifying { attempt: 1 },
+                ImplementationState::CleaningUp {
+                    merged: commit("c1")
+                },
+            ]
+        );
+        let merger = assignments(&f.prompts(Role::Merge).await, "merger");
+        assert_eq!(merger.len(), 2);
+        assert!(merger[1].contains("fix it"));
+        // The conflict review is the reviewer's second assignment and sees the merge agent's
+        // description.
+        let reviewer = assignments(&f.prompts(Role::Review).await, "reviewer");
+        assert_eq!(reviewer.len(), 2);
+        assert!(reviewer[1].contains("resolved"));
+        assert_eq!(holder(&f), None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_push_keeps_the_lock_and_retries_the_merge() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[MERGED, MERGED], &[]).await;
+        let mut state = f
+            .pipeline
+            .step(ImplementationState::WaitingForMerge)
+            .await
+            .unwrap();
+
+        // The agent reports a push, but the remote did not move.
+        state = f.pipeline.step(state).await.unwrap();
+        assert_eq!(state, ImplementationState::Verifying { attempt: 1 });
+        state = f.pipeline.step(state).await.unwrap();
+        assert_eq!(state, ImplementationState::Merging { attempt: 2 });
+        assert_eq!(holder(&f), Some("t31".into()));
+        assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c0"));
+
+        f.repository.set_remote_head(feature(), commit("c1"));
+        state = f.pipeline.step(state).await.unwrap();
+        assert_eq!(state, ImplementationState::Verifying { attempt: 2 });
+        state = f.pipeline.step(state).await.unwrap();
+        assert_eq!(
+            state,
+            ImplementationState::CleaningUp {
+                merged: commit("c1")
+            }
+        );
+        assert_eq!(holder(&f), None);
+        assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c1"));
+    }
+
+    #[tokio::test]
+    async fn a_blocked_merge_counts_as_an_attempt() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[BLOCKED], &[]).await;
+        let state = f
+            .pipeline
+            .step(ImplementationState::WaitingForMerge)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.pipeline.step(state).await.unwrap(),
+            ImplementationState::Merging { attempt: 2 }
+        );
+        assert_eq!(holder(&f), Some("t31".into()));
+    }
+
+    #[tokio::test]
+    async fn an_unverified_remote_change_pauses_the_run_and_keeps_the_lock() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[MERGED], &[]).await;
+        // Somebody else moved the branch; it is not the commit the agent reported.
+        f.repository.set_remote_head(feature(), commit("c9"));
+
+        let error = f.drive_through().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Paused(PauseReason::UnexpectedRemoteChange)
+        ));
+        assert_eq!(
+            f.policy.check_start(),
+            Err(PauseReason::UnexpectedRemoteChange)
+        );
+        assert_eq!(holder(&f), Some("t31".into()));
+        assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c0"));
+    }
+
+    #[tokio::test]
+    async fn the_merge_limit_pauses_while_keeping_the_lock_which_blocks_a_second_instance() {
+        let a = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&a, &[BLOCKED, BLOCKED, BLOCKED], &[]).await;
+        let b = fixture_for(WorkItem::Ticket(ticket()), 5, "t32", Some(&a));
+        ready_to_merge(&b, &[MERGED], &[]).await;
+
+        assert_eq!(
+            a.drive_through().await.unwrap(),
+            ImplementationState::Paused {
+                reason: PauseReason::LimitExhausted,
+                resume_at: Box::new(ImplementationState::Merging { attempt: 4 }),
+            }
+        );
+
+        assert_eq!(holder(&a), Some("t31".into()));
+        // The pause is this instance's only.
+        assert_eq!(a.policy.check_start(), Ok(()));
+        let blocked = tokio::time::timeout(Duration::from_millis(50), b.drive_through()).await;
+        assert!(blocked.is_err(), "the second instance must keep waiting");
+        assert_eq!(holder(&b), Some("t31".into()));
+        assert_eq!(b.pipeline.lock.waiting(), ["t32"]);
+    }
+
+    #[tokio::test]
+    async fn instances_merge_in_the_order_they_queued() {
+        let a = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&a, &[MERGED], &[]).await;
+        let b = fixture_for(WorkItem::Ticket(ticket()), 5, "t32", Some(&a));
+        let merged_c2 = r#"{"MergeSuccessful":"pushed c2"}"#;
+        ready_to_merge(&b, &[merged_c2], &[]).await;
+        a.repository.set_remote_head(feature(), commit("c1"));
+
+        // B queues behind A, which takes the lock.
+        a.pipeline
+            .step(ImplementationState::WaitingForMerge)
+            .await
+            .unwrap();
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(20),
+            b.pipeline.step(ImplementationState::WaitingForMerge),
+        )
+        .await;
+        assert!(waiting.is_err());
+        assert_eq!(a.pipeline.lock.waiting(), ["t32"]);
+        save_state(&a, ImplementationState::Merging { attempt: 1 }).await;
+
+        assert_eq!(
+            a.drive_through().await.unwrap(),
+            ImplementationState::Done(MergedOk {
+                commit: commit("c1")
+            })
+        );
+        // Releasing hands the lock straight to B.
+        assert_eq!(holder(&a), Some("t32".into()));
+
+        b.repository.set_remote_head(feature(), commit("c2"));
+        assert_eq!(
+            b.drive_through().await.unwrap(),
+            ImplementationState::Done(MergedOk {
+                commit: commit("c2")
+            })
+        );
+        assert_eq!(holder(&b), None);
+        assert_eq!(b.pipeline.expected_head().await.unwrap(), commit("c2"));
+    }
+
+    #[tokio::test]
+    async fn restart_from_every_merge_state_keeps_the_lock_and_never_repeats_a_merge() {
+        let sequence = [
+            ImplementationState::WaitingForMerge,
+            ImplementationState::Merging { attempt: 1 },
+            ImplementationState::ConflictReview { attempt: 1 },
+            ImplementationState::Merging { attempt: 1 },
+            ImplementationState::Verifying { attempt: 1 },
+            ImplementationState::CleaningUp {
+                merged: commit("c1"),
+            },
+        ];
+        for crashed in 0..sequence.len() {
+            let f = fixture(WorkItem::Ticket(ticket()), 5);
+            ready_to_merge(&f, &[CONFLICTS, MERGED], &[APPROVED]).await;
+            f.repository.set_remote_head(feature(), commit("c1"));
+            // Every step up to `crashed` ran, but the state it returned was not saved.
+            for (state, next) in sequence[..=crashed].iter().zip(&sequence[1..]) {
+                assert_eq!(&f.pipeline.step(state.clone()).await.unwrap(), next);
+            }
+            if crashed + 1 == sequence.len() {
+                f.pipeline.step(sequence[crashed].clone()).await.unwrap();
+            }
+            save_state(&f, sequence[crashed].clone()).await;
+            let context = format!("from {:?}", sequence[crashed]);
+            if (1..=3).contains(&crashed) {
+                assert_eq!(holder(&f), Some("t31".into()), "{context}");
+            }
+
+            assert_eq!(
+                f.drive_through().await.unwrap(),
+                ImplementationState::Done(MergedOk {
+                    commit: commit("c1")
+                }),
+                "{context}"
+            );
+
+            let merger = assignments(&f.prompts(Role::Merge).await, "merger");
+            assert_eq!(merger.len(), 2, "{context}");
+            let reviewer = assignments(&f.prompts(Role::Review).await, "reviewer");
+            assert_eq!(reviewer.len(), 2, "{context}");
+            assert_eq!(holder(&f), None, "{context}");
+        }
+    }
+
+    #[test]
+    fn the_pushed_commit_ends_the_explanation() {
+        assert_eq!(pushed_commit("merged and pushed c1."), Some(commit("c1")));
+        assert_eq!(pushed_commit("pushed (abc123)"), Some(commit("abc123")));
+        assert_eq!(pushed_commit(" "), None);
+        assert_eq!(pushed_commit("..."), None);
     }
 
     #[test]
