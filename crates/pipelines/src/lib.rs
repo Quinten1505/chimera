@@ -8,6 +8,7 @@ mod driver;
 mod environment;
 mod error;
 mod feature;
+mod implementation;
 mod merge_lock;
 mod policy;
 
@@ -18,5 +19,6 @@ pub use environment::{
 };
 pub use error::{PauseReason, PipelineError};
 pub use feature::{FeaturePipeline, FeatureState};
+pub use implementation::{ImplementationPipeline, ImplementationState};
 pub use merge_lock::{MergeLock, Sequence};
 pub use policy::{Budget, Policy, PolicyState, RetryRefused};
