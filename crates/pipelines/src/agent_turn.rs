@@ -26,6 +26,13 @@ pub enum TurnError {
     CorrectionsExhausted { corrections: u32, problem: String },
     #[error(transparent)]
     Port(#[from] PortError),
+    /// A handoff's receiver turn failed and the sender's reset had failed too. The sender still
+    /// holds its old context; `sender_reset` keeps its Failed/Uncertain classification.
+    #[error("{receiver}; sender reset also failed: {sender_reset}")]
+    ReceiverFailedAfterResetFailure {
+        receiver: Box<TurnError>,
+        sender_reset: PortError,
+    },
 }
 
 impl From<TurnError> for PipelineError {
@@ -55,8 +62,9 @@ pub struct CompletedTurn {
     pub result: TurnResult,
     pub corrections: u32,
     /// Set when a handoff's receiver turn completed but the sender's reset failed. The sender
-    /// still holds its old context; the caller must reset it without re-running the receiver.
-    pub sender_reset_failed: Option<String>,
+    /// still holds its old context; the caller must reset it (or reconcile, if the error is
+    /// uncertain) without re-running the receiver.
+    pub sender_reset_failed: Option<PortError>,
 }
 
 /// Runs agent turns: prompt in, validated [`TurnResult`] out.
@@ -118,9 +126,18 @@ impl AgentTurns {
             .terminal
             .send_prompt(sender_pane, &sender_profile.reset_command)
             .await;
-        let mut completed = self.finish_turn(receiver, max_corrections).await?;
-        completed.sender_reset_failed = reset.err().map(|error| error.to_string());
-        Ok(completed)
+        let finished = self.finish_turn(receiver, max_corrections).await;
+        match (finished, reset) {
+            (Ok(mut completed), reset) => {
+                completed.sender_reset_failed = reset.err();
+                Ok(completed)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Err(receiver), Err(sender_reset)) => Err(TurnError::ReceiverFailedAfterResetFailure {
+                receiver: Box::new(receiver),
+                sender_reset,
+            }),
+        }
     }
 
     fn check_policy(&self) -> Result<(), TurnError> {
@@ -266,12 +283,13 @@ mod tests {
     use super::*;
 
     /// A [`FakeTerminal`] that answers each prompt with the next scripted output, logs every
-    /// prompt in order, and can refuse prompts to chosen panes or pause the run on the first one.
+    /// prompt in order, and can refuse prompts to chosen panes (with a chosen error) or pause the run on the first one.
     struct ScriptedTerminal {
         inner: FakeTerminal,
         replies: Mutex<VecDeque<String>>,
         log: Mutex<Vec<(PaneId, String)>>,
         refuse: Mutex<HashSet<PaneId>>,
+        refuse_with: Mutex<PortError>,
         pause_on_first_prompt: Mutex<Option<Arc<Policy>>>,
     }
 
@@ -311,7 +329,7 @@ mod tests {
 
         async fn send_prompt(&self, pane: &PaneId, prompt: &str) -> Result<(), PortError> {
             if self.refuse.lock().unwrap().contains(pane) {
-                return Err(PortError::failed("refused"));
+                return Err(self.refuse_with.lock().unwrap().clone());
             }
             self.log
                 .lock()
@@ -358,6 +376,7 @@ mod tests {
             replies: Mutex::default(),
             log: Mutex::default(),
             refuse: Mutex::default(),
+            refuse_with: Mutex::new(PortError::failed("refused")),
             pause_on_first_prompt: Mutex::default(),
         });
         let (workspace, first) = terminal.create_workspace(Path::new("/w")).await.unwrap();
@@ -664,9 +683,95 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(completed.sender_reset_failed.is_some());
+        assert_eq!(
+            completed.sender_reset_failed,
+            Some(PortError::failed("refused"))
+        );
         assert_eq!(f.store.history(&f.run), [completed.result]);
         assert_eq!(f.terminal.log().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uncertain_sender_reset_keeps_its_classification() {
+        let f = fixture().await;
+        f.all_finished();
+        f.terminal.reply_with(&["{\"ChangesRequested\":\"fix\"}"]);
+        f.terminal.refuse.lock().unwrap().insert(f.panes[0].clone());
+        *f.terminal.refuse_with.lock().unwrap() = PortError::uncertain("lost");
+        let id = agent("rev");
+
+        let completed = f
+            .turns
+            .handoff(
+                &f.panes[0],
+                &f.profile,
+                &f.request(&id, 1, Role::Review, None),
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            completed.sender_reset_failed,
+            Some(PortError::uncertain("lost"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sender_reset_failure_is_kept_when_the_receiver_exhausts_corrections() {
+        let f = fixture().await;
+        f.all_finished();
+        f.terminal.reply_with(&["nope"]);
+        f.terminal.refuse.lock().unwrap().insert(f.panes[0].clone());
+        *f.terminal.refuse_with.lock().unwrap() = PortError::uncertain("lost");
+        let id = agent("rev");
+
+        let error = f
+            .turns
+            .handoff(
+                &f.panes[0],
+                &f.profile,
+                &f.request(&id, 1, Role::Review, None),
+                0,
+            )
+            .await
+            .unwrap_err();
+
+        let TurnError::ReceiverFailedAfterResetFailure {
+            receiver,
+            sender_reset,
+        } = error
+        else {
+            panic!("expected the reset failure to be kept, got {error:?}");
+        };
+        assert!(matches!(
+            *receiver,
+            TurnError::CorrectionsExhausted { corrections: 0, .. }
+        ));
+        assert_eq!(sender_reset, PortError::uncertain("lost"));
+        assert_eq!(f.store.history(&f.run).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_failure_without_reset_failure_is_unchanged() {
+        let f = fixture().await;
+        f.terminal
+            .inner
+            .script_statuses(&f.panes[1], [TurnStatus::Gone]);
+        let id = agent("rev");
+
+        let error = f
+            .turns
+            .handoff(
+                &f.panes[0],
+                &f.profile,
+                &f.request(&id, 1, Role::Review, None),
+                0,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TurnError::AgentLost));
     }
 
     #[tokio::test(start_paused = true)]
