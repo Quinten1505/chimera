@@ -152,7 +152,7 @@ mod tests {
     use chimera_core::error::PortError;
 
     use super::*;
-    use crate::testing::TestRepo;
+    use crate::testing::{TestRepo, write_executable};
 
     fn exit(code: i32) -> ExitStatus {
         ExitStatus::from_raw(code << 8)
@@ -296,28 +296,23 @@ mod tests {
 
     #[test]
     fn real_ssh_host_key_failure_is_failed() {
-        use std::os::unix::fs::PermissionsExt;
         let repo = TestRepo::new();
         let dir = repo.work().join("../ssh-stub");
         std::fs::create_dir_all(&dir).unwrap();
         let ssh = dir.join("ssh");
-        std::fs::write(
+        write_executable(
             &ssh,
             "#!/bin/sh\necho 'Host key verification failed.' >&2\nexit 255\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         // The runner sets GIT_SSH_COMMAND to plain `ssh`, which resolves through PATH.
         let git = repo.work().join("../ssh-git.sh");
-        std::fs::write(
+        write_executable(
             &git,
-            format!(
+            &format!(
                 "#!/bin/sh\nPATH='{}':\"$PATH\" exec git \"$@\"\n",
                 dir.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let error = Runner::with_program(&git)
             .run(
                 repo.work(),
@@ -364,15 +359,12 @@ mod tests {
 
     #[test]
     fn real_killed_push_is_uncertain() {
-        use std::os::unix::fs::PermissionsExt;
         let repo = TestRepo::new();
         let script = repo.work().join("../fake-git.sh");
-        std::fs::write(
+        write_executable(
             &script,
             "#!/bin/sh\necho 'Writing objects' >&2\nkill -9 $$\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let error = Runner::with_program(&script)
             .run(repo.work(), &["push"], Effect::Remote)
             .unwrap_err();
@@ -402,11 +394,9 @@ mod tests {
 
     #[test]
     fn real_push_with_killed_receiver_is_uncertain_and_remote_updated() {
-        use std::os::unix::fs::PermissionsExt;
         let repo = TestRepo::new();
         let hook = repo.origin().join("hooks/post-receive");
-        std::fs::write(&hook, "#!/bin/sh\nkill -9 \"$PPID\"\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&hook, "#!/bin/sh\nkill -9 \"$PPID\"\n");
         repo.commit_file(repo.work(), "b.txt", "mine");
         let error = Runner::new()
             .run(repo.work(), &["push", "origin", "main"], Effect::Remote)
@@ -424,16 +414,13 @@ mod tests {
 
     #[test]
     fn environment_is_non_interactive() {
-        use std::os::unix::fs::PermissionsExt;
         let repo = TestRepo::new();
         let script = repo.work().join("../env-git.sh");
         let dump = repo.work().join("../env.txt");
-        std::fs::write(
+        write_executable(
             &script,
-            format!("#!/bin/sh\nenv > '{}'\ncat > /dev/null\n", dump.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\nenv > '{}'\ncat > /dev/null\n", dump.display()),
+        );
         Runner::with_program(&script)
             .run(repo.work(), &["push"], Effect::Remote)
             .unwrap();

@@ -65,6 +65,25 @@ impl TestRepo {
     }
 }
 
+/// Writes an executable script at `path`.
+///
+/// The file is written by a child process: a write descriptor held by this multi-threaded test
+/// process would leak into children forked concurrently by other tests, and executing the file
+/// while any of them still holds it fails with `ETXTBSY`.
+pub(crate) fn write_executable(path: &Path, content: &str) {
+    let status = Command::new("sh")
+        .args([
+            "-c",
+            "printf '%s' \"$1\" > \"$2\" && chmod 755 \"$2\"",
+            "sh",
+        ])
+        .arg(content)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "writing {} failed", path.display());
+}
+
 pub(crate) fn git(dir: &Path, args: &[&str]) {
     git_output(dir, args);
 }
