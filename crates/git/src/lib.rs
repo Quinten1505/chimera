@@ -5,6 +5,8 @@
 mod error;
 // Unused until the operation tickets build on the runner.
 #[allow(dead_code)]
+mod remote_head;
+#[allow(dead_code)]
 mod runner;
 #[cfg(test)]
 mod testing;

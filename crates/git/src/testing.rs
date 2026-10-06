@@ -65,7 +65,12 @@ impl TestRepo {
     }
 }
 
-fn git(dir: &Path, args: &[&str]) {
+pub(crate) fn git(dir: &Path, args: &[&str]) {
+    git_output(dir, args);
+}
+
+/// Runs git and returns trimmed stdout.
+pub(crate) fn git_output(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -76,4 +81,5 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
