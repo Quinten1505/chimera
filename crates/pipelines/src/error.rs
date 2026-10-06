@@ -32,6 +32,12 @@ pub enum PauseReason {
     LimitExhausted,
     /// The run-wide pause flag was set.
     GlobalPause,
+    /// The agent recovery budget was used up.
+    AgentRecoveryExhausted,
+    /// The GitHub retry budget was used up.
+    GithubRetriesExhausted,
+    /// The remote feature branch moved to a commit nobody on this run pushed.
+    UnexpectedRemoteChange,
 }
 
 #[cfg(test)]

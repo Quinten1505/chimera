@@ -5,6 +5,8 @@
 
 mod driver;
 mod error;
+mod policy;
 
 pub use driver::{Pipeline, PipelineState, drive};
 pub use error::{PauseReason, PipelineError};
+pub use policy::{Budget, Policy, PolicyState, RetryRefused};
