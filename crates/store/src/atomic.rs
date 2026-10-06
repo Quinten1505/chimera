@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
@@ -30,34 +32,36 @@ pub(crate) fn sync_directory(directory: &Path) -> io::Result<()> {
 }
 
 /// Creates `directory` and its missing ancestors like [`fs::create_dir_all`], flushing the parent
-/// of each directory it creates so that the new entries survive a crash.
+/// of each directory so that its entry survives a crash. A directory that already exists may have
+/// been left by a process that died before flushing its parent, so its parent is flushed too, once
+/// per process.
 pub(crate) fn create_dir_all_durable(directory: &Path) -> Result<(), StoreError> {
-    create_dir_all_with(directory, &mut sync_directory)
+    static CONFIRMED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    let mut confirmed = CONFIRMED.lock().unwrap_or_else(|e| e.into_inner());
+    create_dir_all_with(directory, &mut confirmed, &mut sync_directory)
 }
 
+/// `confirmed` holds the directories whose entries were flushed; `sync` flushes a directory.
 fn create_dir_all_with(
     directory: &Path,
+    confirmed: &mut BTreeSet<PathBuf>,
     sync: &mut dyn FnMut(&Path) -> io::Result<()>,
 ) -> Result<(), StoreError> {
-    let parent = directory.parent().unwrap_or(directory);
+    if confirmed.contains(directory) && directory.is_dir() {
+        return Ok(());
+    }
+    // A file system root is in no directory.
+    let Some(parent) = directory.parent() else {
+        return Ok(());
+    };
+    create_dir_all_with(parent, confirmed, sync)?;
     match fs::create_dir(directory) {
         Ok(()) => {}
-        Err(_) if directory.is_dir() => return Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound && parent != directory => {
-            create_dir_all_with(parent, sync)?;
-            match fs::create_dir(directory) {
-                Ok(()) => {}
-                Err(_) if directory.is_dir() => return Ok(()),
-                Err(e) => return Err(StoreError::io(directory, e)),
-            }
-        }
+        Err(_) if directory.is_dir() => {}
         Err(e) => return Err(StoreError::io(directory, e)),
     }
-    if let Err(e) = sync(parent) {
-        // An existing directory is assumed durable, so remove it to have a retry flush it again.
-        let _ = fs::remove_dir(directory);
-        return Err(StoreError::io(parent, e));
-    }
+    sync(parent).map_err(|e| StoreError::io(parent, e))?;
+    confirmed.insert(directory.to_path_buf());
     Ok(())
 }
 
@@ -314,49 +318,103 @@ mod tests {
         assert_eq!(synced, 0);
     }
 
+    /// Records the directories `create_dir_all_with` flushes, below `base` only.
+    fn create_recording(
+        directory: &Path,
+        confirmed: &mut BTreeSet<PathBuf>,
+        base: &Path,
+    ) -> Result<Vec<PathBuf>, StoreError> {
+        let mut synced = Vec::new();
+        create_dir_all_with(directory, confirmed, &mut |parent| {
+            if parent.starts_with(base) {
+                synced.push(parent.to_path_buf());
+            }
+            Ok(())
+        })?;
+        Ok(synced)
+    }
+
     #[test]
     fn created_directories_are_synced_into_their_parents_in_creation_order() {
         let dir = tempfile::tempdir().unwrap();
         let deepest = dir.path().join("a/b/c");
         let mut synced = Vec::new();
+        let mut confirmed = BTreeSet::new();
 
-        create_dir_all_with(&deepest, &mut |parent| {
-            let created: Vec<_> = fs::read_dir(parent).unwrap().collect();
-            assert_eq!(
-                created.len(),
-                1,
-                "the new entry exists before its parent is synced"
-            );
+        create_dir_all_with(&deepest, &mut confirmed, &mut |parent| {
+            if parent.starts_with(dir.path()) {
+                let created: Vec<_> = fs::read_dir(parent).unwrap().collect();
+                assert_eq!(
+                    created.len(),
+                    1,
+                    "the new entry exists before its parent is synced"
+                );
+            }
             synced.push(parent.to_path_buf());
             Ok(())
         })
         .unwrap();
 
         assert!(deepest.is_dir());
-        let (a, b) = (dir.path().join("a"), dir.path().join("a/b"));
-        assert_eq!(synced, [dir.path().to_path_buf(), a, b]);
+        // Every ancestor's entry is flushed too, from the file system root down.
+        let ancestors: Vec<_> = deepest.ancestors().skip(1).collect();
+        let expected: Vec<_> = ancestors.into_iter().rev().collect();
+        assert_eq!(synced, expected);
 
-        // Existing directories were persisted when they were created.
-        create_dir_all_with(&deepest, &mut |_| panic!("nothing was created")).unwrap();
+        // Directories already flushed by this process are not flushed again.
+        create_dir_all_with(&deepest, &mut confirmed, &mut |_| {
+            panic!("all are confirmed")
+        })
+        .unwrap();
         create_dir_all_durable(&deepest).unwrap();
     }
 
     #[test]
-    fn failed_directory_sync_removes_the_new_directory_so_a_retry_syncs_again() {
+    fn directories_left_unsynced_by_an_interrupted_process_are_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("a/b"));
+        // A process created `a/b` and died before flushing their parents.
+        fs::create_dir_all(&b).unwrap();
+
+        let synced = create_recording(&b, &mut BTreeSet::new(), dir.path()).unwrap();
+        assert_eq!(synced, [dir.path().to_path_buf(), a.clone()]);
+
+        let synced = create_recording(&b.join("c"), &mut BTreeSet::new(), dir.path()).unwrap();
+        assert_eq!(synced, [dir.path().to_path_buf(), a, b]);
+    }
+
+    #[test]
+    fn failed_directory_sync_is_retried_by_the_next_call() {
         let dir = tempfile::tempdir().unwrap();
         let run = dir.path().join("run-1");
+        let mut confirmed = BTreeSet::new();
 
-        let error =
-            create_dir_all_with(&run, &mut |_| Err(io::Error::other("disk on fire"))).unwrap_err();
-
-        assert!(matches!(error, StoreError::Io { .. }));
-        assert!(!run.exists());
-        let mut synced = Vec::new();
-        create_dir_all_with(&run, &mut |parent| {
-            synced.push(parent.to_path_buf());
+        let error = create_dir_all_with(&run, &mut confirmed, &mut |parent| {
+            if parent == dir.path() {
+                return Err(io::Error::other("disk on fire"));
+            }
             Ok(())
         })
-        .unwrap();
+        .unwrap_err();
+
+        assert!(matches!(error, StoreError::Io { .. }));
+        assert!(!confirmed.contains(&run));
+        let synced = create_recording(&run, &mut confirmed, dir.path()).unwrap();
+        assert_eq!(synced, [dir.path().to_path_buf()]);
+        assert!(confirmed.contains(&run));
+    }
+
+    #[test]
+    fn a_confirmed_directory_removed_since_is_created_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run-1");
+        let mut confirmed = BTreeSet::new();
+        create_recording(&run, &mut confirmed, dir.path()).unwrap();
+        fs::remove_dir(&run).unwrap();
+
+        let synced = create_recording(&run, &mut confirmed, dir.path()).unwrap();
+
+        assert!(run.is_dir());
         assert_eq!(synced, [dir.path().to_path_buf()]);
     }
 
