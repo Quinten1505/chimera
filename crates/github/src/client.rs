@@ -120,7 +120,7 @@ impl Client {
         access: Access,
     ) -> Result<Vec<u8>, GitHubError> {
         let response = request.send().await.map_err(|e| {
-            if e.is_connect() || e.is_builder() || e.is_request() && !e.is_timeout() {
+            if e.is_connect() || e.is_builder() {
                 GitHubError::Failed(format!("could not send GitHub request: {e}"))
             } else {
                 access.lost(format!("no response from GitHub: {e}"))
