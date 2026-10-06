@@ -48,31 +48,6 @@ impl HerdrClient {
         self.request("workspace.create", options, "workspace_created")
     }
 
-    /// Create a Git checkout and open it as a Herdr workspace.
-    ///
-    /// Herdr uses an existing local branch when present, or creates it from
-    /// the base (HEAD by default). Repository trust policy is left to Herdr.
-    pub fn create_worktree(
-        &self,
-        options: &WorktreeOptions,
-    ) -> Result<CreatedWorktree, HerdrError> {
-        if options.branch.trim().is_empty() {
-            return Err(HerdrError::InvalidInput("branch must not be empty"));
-        }
-        if let WorktreeSource::Directory { cwd } = &options.source {
-            require_absolute(cwd)?;
-        }
-        if let WorktreeSource::Workspace { workspace_id } = &options.source
-            && workspace_id.trim().is_empty()
-        {
-            return Err(HerdrError::InvalidInput("workspace_id must not be empty"));
-        }
-        if let Some(path) = &options.path {
-            require_absolute(path)?;
-        }
-        self.request("worktree.create", options, "worktree_created")
-    }
-
     /// Add a pane by splitting a specific existing pane.
     pub fn add_pane(&self, options: &PaneOptions) -> Result<Pane, HerdrError> {
         if options.target_pane_id.trim().is_empty() {
@@ -201,47 +176,6 @@ pub struct CreatedWorkspace {
     pub root_pane: Pane,
 }
 
-/// Explicitly select the repository without depending on Herdr's focused workspace.
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum WorktreeSource {
-    Workspace {
-        workspace_id: String,
-    },
-    /// Absolute repository directory on the Herdr server.
-    Directory {
-        cwd: PathBuf,
-    },
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct WorktreeOptions {
-    #[serde(flatten)]
-    pub source: WorktreeSource,
-    pub branch: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base: Option<String>,
-    /// Absolute checkout path; omitted to use Herdr's configured location.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    pub focus: bool,
-}
-
-impl WorktreeOptions {
-    pub fn new(source: WorktreeSource, branch: impl Into<String>) -> Self {
-        Self {
-            source,
-            branch: branch.into(),
-            base: None,
-            path: None,
-            label: None,
-            focus: false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {
@@ -267,16 +201,6 @@ impl PaneOptions {
             focus: false,
         }
     }
-}
-
-/// IDs returned by Herdr can be used as targets for subsequent operations.
-/// Unknown server fields are ignored for forward compatibility.
-#[derive(Debug, Clone, Deserialize)]
-pub struct CreatedWorktree {
-    pub workspace: Workspace,
-    pub tab: Tab,
-    pub root_pane: Pane,
-    pub worktree: Worktree,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -316,12 +240,6 @@ pub struct Pane {
     pub pane_id: String,
     pub workspace_id: String,
     pub tab_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Worktree {
-    pub path: PathBuf,
-    pub branch: Option<String>,
 }
 
 #[derive(Debug)]

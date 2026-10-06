@@ -1,8 +1,8 @@
-use crate::{Agent, HerdrClient, HerdrError, WorkspaceOptions, WorktreeOptions};
+use crate::{Agent, HerdrClient, HerdrError, WorkspaceOptions};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// A Herdr workspace and its panes, for either a repo root or a linked worktree.
+/// A Herdr workspace and its panes, for a directory, which may be a repo root or a linked worktree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspacePanes {
     /// The Herdr workspace ID, including for workspaces opened at the repo root.
@@ -30,8 +30,6 @@ pub struct Session {
 pub enum SessionTarget {
     /// Open an existing directory without creating a Git checkout.
     Workspace(WorkspaceOptions),
-    /// Create a Git checkout and open it in Herdr.
-    Worktree(WorktreeOptions),
 }
 
 impl HerdrClient {
@@ -56,15 +54,6 @@ impl HerdrClient {
                     workspace_id: created.workspace.workspace_id,
                     pane_ids: vec![created.root_pane.pane_id],
                     checkout_path: created.workspace.checkout_path,
-                }
-            }
-            SessionTarget::Worktree(options) => {
-                let created = self.create_worktree(options)?;
-                WorkspacePanes {
-                    agents: Vec::new(),
-                    workspace_id: created.workspace.workspace_id,
-                    pane_ids: vec![created.root_pane.pane_id],
-                    checkout_path: Some(created.worktree.path),
                 }
             }
         };

@@ -54,30 +54,6 @@ fn validates_inputs_before_contacting_server() {
         socket_path: "/nonexistent/chimera-herdr.sock".into(),
         timeout: Duration::from_secs(1),
     };
-    let mut worktree = WorktreeOptions::new(
-        WorktreeSource::Directory {
-            cwd: "relative".into(),
-        },
-        "feature/test",
-    );
-    assert!(matches!(
-        client.create_worktree(&worktree),
-        Err(HerdrError::InvalidInput(_))
-    ));
-    worktree.source = WorktreeSource::Workspace {
-        workspace_id: "w1".into(),
-    };
-    worktree.branch.clear();
-    assert!(matches!(
-        client.create_worktree(&worktree),
-        Err(HerdrError::InvalidInput(_))
-    ));
-    worktree.branch = "feature/test".into();
-    worktree.path = Some("relative".into());
-    assert!(matches!(
-        client.create_worktree(&worktree),
-        Err(HerdrError::InvalidInput(_))
-    ));
     let mut pane = PaneOptions::new("", SplitDirection::Down);
     assert!(matches!(
         client.add_pane(&pane),
@@ -105,7 +81,7 @@ impl Drop for SocketDirectory {
 }
 
 #[test]
-fn connects_creates_worktree_and_adds_pane_over_socket() {
+fn connects_creates_workspace_and_adds_pane_over_socket() {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = SocketDirectory(std::env::temp_dir().join(format!(
         "chimera-herdr-{}-{}",
@@ -122,17 +98,15 @@ fn connects_creates_worktree_and_adds_pane_over_socket() {
                 json!({"type":"pong","version":"0.9.3","protocol":22}),
             ),
             (
-                json!({"method":"worktree.create","params":{
-                    "cwd":"/repo with spaces","branch":"feature/test","base":"main",
-                    "path":"/worktrees/test","label":"test","focus":false
+                json!({"method":"workspace.create","params":{
+                    "cwd":"/repo with spaces","focus":false
                 }}),
                 json!({
-                    "type":"worktree_created",
+                    "type":"workspace_created",
                     "workspace":{"workspace_id":"w2","label":"test","extra":true,
                         "worktree":{"checkout_path":"/worktrees/test","is_linked_worktree":true}},
                     "tab":{"tab_id":"w2:t1","workspace_id":"w2"},
-                    "root_pane":{"pane_id":"w2:p1","workspace_id":"w2","tab_id":"w2:t1"},
-                    "worktree":{"path":"/worktrees/test","branch":"feature/test"}
+                    "root_pane":{"pane_id":"w2:p1","workspace_id":"w2","tab_id":"w2:t1"}
                 }),
             ),
             (
@@ -161,24 +135,16 @@ fn connects_creates_worktree_and_adds_pane_over_socket() {
         }
     });
     let client = HerdrClient::connect_with_timeout(&path, Duration::from_secs(2)).unwrap();
-    let mut options = WorktreeOptions::new(
-        WorktreeSource::Directory {
-            cwd: "/repo with spaces".into(),
-        },
-        "feature/test",
-    );
-    options.base = Some("main".into());
-    options.path = Some("/worktrees/test".into());
-    options.label = Some("test".into());
-    let created = client.create_worktree(&options).unwrap();
+    let created = client
+        .create_workspace(&WorkspaceOptions::new("/repo with spaces"))
+        .unwrap();
     assert_eq!(created.workspace.workspace_id, "w2");
     assert_eq!(
         created.workspace.checkout_path.as_deref(),
         Some(Path::new("/worktrees/test"))
     );
-    assert_eq!(created.worktree.path, Path::new("/worktrees/test"));
     let mut options = PaneOptions::new(created.root_pane.pane_id, SplitDirection::Right);
-    options.cwd = Some(created.worktree.path);
+    options.cwd = Some("/worktrees/test".into());
     options.focus = true;
     let pane = client.add_pane(&options).unwrap();
     assert_eq!(pane.pane_id, "w2:p2");
@@ -186,19 +152,7 @@ fn connects_creates_worktree_and_adds_pane_over_socket() {
 }
 
 #[test]
-fn serializes_workspace_source_and_down_split() {
-    let worktree = WorktreeOptions::new(
-        WorktreeSource::Workspace {
-            workspace_id: "w1".into(),
-        },
-        "feature/test",
-    );
-    assert_eq!(
-        serde_json::to_value(worktree).unwrap(),
-        json!({
-            "workspace_id":"w1","branch":"feature/test","focus":false
-        })
-    );
+fn serializes_down_split() {
     assert_eq!(
         serde_json::to_value(PaneOptions::new("w1:p1", SplitDirection::Down)).unwrap(),
         json!({"target_pane_id":"w1:p1","direction":"down","focus":false})
@@ -301,38 +255,6 @@ fn starts_session_in_existing_directory_and_saves_returned_ids() {
     assert_eq!(
         serde_json::from_str::<crate::Session>(&saved).unwrap(),
         session
-    );
-}
-
-#[test]
-fn starts_session_with_new_checkout_and_saves_actual_path() {
-    let target = crate::SessionTarget::Worktree(WorktreeOptions::new(
-        WorktreeSource::Directory {
-            cwd: "/repo".into(),
-        },
-        "feature/session",
-    ));
-    let session = run_session_start(&target,
-        json!({"method":"worktree.create","params":{"cwd":"/repo","branch":"feature/session","focus":false}}),
-        json!({"id":"chimera","result":{
-            "type":"worktree_created",
-            "workspace":{"workspace_id":"w3","label":"feature/session"},
-            "tab":{"tab_id":"w3:t1","workspace_id":"w3"},
-            "root_pane":{"pane_id":"w3:p1","workspace_id":"w3","tab_id":"w3:t1"},
-            "worktree":{"path":"/herdr/worktrees/feature-session","branch":"feature/session"}
-        }}),
-    ).unwrap();
-    assert_eq!(
-        session,
-        crate::Session {
-            session_id: "session-123".into(),
-            workspaces: vec![crate::WorkspacePanes {
-                workspace_id: "w3".into(),
-                agents: Vec::new(),
-                pane_ids: vec!["w3:p1".into()],
-                checkout_path: Some("/herdr/worktrees/feature-session".into()),
-            }],
-        }
     );
 }
 

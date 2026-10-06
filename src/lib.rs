@@ -1,7 +1,7 @@
 //! Composition helpers connecting configuration to the core modules.
 
 use chimera_configuration::CodexConfiguration;
-use chimera_core::{HerdrClient, Session};
+use chimera_herdr::{HerdrClient, Session};
 use std::path::Path;
 
 /// Load and validate YAML before starting one builder-profile Codex agent in each tracked pane.
@@ -24,7 +24,7 @@ pub fn start_session_agents(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use chimera_core::{AgentSessionReference, WorkspacePanes};
+    use chimera_herdr::{AgentSessionReference, WorkspacePanes};
     use serde_json::{Value, json};
     use std::{
         io::{BufRead, BufReader, Write},

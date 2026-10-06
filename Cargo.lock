@@ -9,6 +9,7 @@ dependencies = [
  "chimera-configuration",
  "chimera-core",
  "chimera-github",
+ "chimera-herdr",
  "chimera-workflow",
  "serde_json",
 ]
@@ -34,6 +35,15 @@ name = "chimera-github"
 version = "0.1.0"
 dependencies = [
  "chimera-core",
+]
+
+[[package]]
+name = "chimera-herdr"
+version = "0.1.0"
+dependencies = [
+ "chimera-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
