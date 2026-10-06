@@ -147,8 +147,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_request_is_draft_reads_the_flag() {
-        let (url, _) =
-            serve(r#"{"data":{"repository":{"pullRequest":{"id":"PR_1","isDraft":true}}}}"#).await;
+        let (url, _) = serve(r#"{"number":3,"draft":true}"#).await;
         let client = Client::with_base_url("tok", url).with_timeout(Duration::from_secs(2));
         let forge = GitHubForge::with_client(client, "octo", "repo");
         let pr = IssueRef::new("octo", "repo", 3).unwrap();
