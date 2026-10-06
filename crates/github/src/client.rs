@@ -10,6 +10,7 @@ pub const DEFAULT_API_URL: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = concat!("chimera/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CAUSE_BODY: usize = 300;
 
 /// Whether a request changes state on GitHub. Reads are never classified as uncertain.
@@ -46,7 +47,7 @@ impl Client {
 
     pub fn with_base_url(token: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: http_client(DEFAULT_TIMEOUT),
             token: token.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout: DEFAULT_TIMEOUT,
@@ -55,6 +56,7 @@ impl Client {
 
     /// Overall time allowed per request, from connecting to reading the response.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.http = http_client(timeout);
         self.timeout = timeout;
         self
     }
@@ -119,6 +121,8 @@ impl Client {
         request: reqwest::RequestBuilder,
         access: Access,
     ) -> Result<Vec<u8>, GitHubError> {
+        // The connect timeout is shorter than the overall one, so a timeout while connecting
+        // (including the TLS handshake) always surfaces as a connect error.
         let response = request.send().await.map_err(|e| {
             if e.is_connect() || e.is_builder() {
                 GitHubError::Failed(format!("could not send GitHub request: {e}"))
@@ -127,10 +131,17 @@ impl Client {
             }
         })?;
         let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| access.lost(format!("could not read GitHub response: {e}")))?;
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let cause = format!("GitHub returned {status} but the body could not be read: {e}");
+                return Err(if status.is_client_error() {
+                    GitHubError::Failed(cause)
+                } else {
+                    access.lost(cause)
+                });
+            }
+        };
         if status.is_success() {
             return Ok(bytes.to_vec());
         }
@@ -141,6 +152,15 @@ impl Client {
             Err(GitHubError::Failed(cause))
         }
     }
+}
+
+/// A client that never retries and bounds connection setup below the overall timeout.
+fn http_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .retry(reqwest::retry::never())
+        .connect_timeout(CONNECT_TIMEOUT.min(timeout / 2))
+        .build()
+        .expect("reqwest client builds with static configuration")
 }
 
 fn message(body: &[u8]) -> String {
@@ -167,6 +187,10 @@ mod tests {
         Hang,
         /// Promise a body longer than what is sent, then close.
         Truncated,
+        /// Send a 4xx status line promising a longer body, then close.
+        TruncatedClientError,
+        /// Send a 4xx status line promising a body, then never send it.
+        HangingClientError,
     }
 
     /// Serve one connection and return the base URL and a handle yielding the raw request.
@@ -190,6 +214,19 @@ mod tests {
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"a\"")
                     .await
                     .unwrap(),
+                Reply::TruncatedClientError => stream
+                    .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 100\r\n\r\n{\"me")
+                    .await
+                    .unwrap(),
+                Reply::HangingClientError => {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 100\r\n\r\n{\"me",
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(5)).await
+                }
                 Reply::Drop => {}
                 Reply::Hang => tokio::time::sleep(Duration::from_secs(5)).await,
             }
@@ -341,6 +378,81 @@ mod tests {
         assert_eq!(failed, PortError::failed("boom"));
         let uncertain: PortError = GitHubError::Uncertain("lost".into()).into();
         assert_eq!(uncertain, PortError::uncertain("lost"));
+    }
+
+    #[tokio::test]
+    async fn unreadable_client_error_body_is_failed_with_status() {
+        for (reply, status) in [
+            (Reply::TruncatedClientError, "403"),
+            (Reply::HangingClientError, "429"),
+        ] {
+            let error = rest(Access::Mutate, reply).await.unwrap_err();
+            assert!(matches!(error, GitHubError::Failed(_)), "{error}");
+            assert!(error.to_string().contains(status), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_before_sending_is_failed_for_mutations() {
+        // Accepts TCP but never answers the TLS handshake, so no request is ever sent.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            // Only a TLS handshake record, never plaintext HTTP.
+            assert_eq!(buf[0], 0x16);
+            assert!(!buf[..n].windows(4).any(|w| w == b"POST"));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let result = client(&url)
+            .rest(Access::Mutate, Method::POST, "/x", None)
+            .await;
+        assert!(failed(result));
+        server.abort();
+    }
+
+    /// Requests on a reused keep-alive connection are not replayed when the second is lost.
+    #[tokio::test]
+    async fn does_not_retry_on_reused_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let mut requests = 0;
+            assert!(stream.read(&mut buf).await.unwrap() > 0);
+            requests += 1;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            assert!(stream.read(&mut buf).await.unwrap() > 0);
+            requests += 1;
+            drop(stream);
+            let mut connections = 1;
+            while let Ok(Ok((mut s, _))) =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+            {
+                connections += 1;
+                while let Ok(n) = s.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    requests += 1;
+                }
+            }
+            (connections, requests)
+        });
+        let client = Client::with_base_url("tok", &url).with_timeout(Duration::from_secs(2));
+        client
+            .rest(Access::Mutate, Method::POST, "/x", None)
+            .await
+            .unwrap();
+        let second = client.rest(Access::Mutate, Method::POST, "/x", None).await;
+        assert!(uncertain(second));
+        assert_eq!(server.await.unwrap(), (1, 2));
     }
 
     #[tokio::test]
