@@ -272,7 +272,7 @@ mod tests {
     use chimera_core::forge::{FakeForge, ForgeCall};
     use chimera_core::repository::FakeRepository;
     use chimera_core::run_store::{FakeRunStore, RunStore};
-    use chimera_core::{IssueRef, Limits, RunId, TicketPlan};
+    use chimera_core::{IssueRef, IssueStatus, Limits, RunId, TicketPlan};
     use futures_executor::block_on;
 
     use super::*;
@@ -395,6 +395,10 @@ mod tests {
 
         async fn close_issue(&self, issue: &IssueRef) -> Result<(), PortError> {
             self.forge.close_issue(issue).await
+        }
+
+        async fn issue_status(&self, issue: &IssueRef) -> Result<IssueStatus, PortError> {
+            self.forge.issue_status(issue).await
         }
 
         async fn mark_pull_request_ready(&self, pull_request: &IssueRef) -> Result<(), PortError> {

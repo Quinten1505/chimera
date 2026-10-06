@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::error::PortError;
-use crate::{BranchName, IssueRef, TicketPlan};
+use crate::{BranchName, IssueRef, IssueStatus, TicketPlan};
 
 /// The GitHub issues and pull requests the run works with. Pull requests share the issue number
 /// space, so they are referenced by an [`IssueRef`].
@@ -27,6 +27,9 @@ pub trait Forge: Send + Sync {
 
     async fn close_issue(&self, issue: &IssueRef) -> Result<(), PortError>;
 
+    /// Whether `issue` is open or closed, used to reconcile an uncertain close.
+    async fn issue_status(&self, issue: &IssueRef) -> Result<IssueStatus, PortError>;
+
     async fn mark_pull_request_ready(&self, pull_request: &IssueRef) -> Result<(), PortError>;
 }
 
@@ -42,7 +45,7 @@ mod fake {
 
     use super::Forge;
     use crate::error::PortError;
-    use crate::{BranchName, IssueRef, TicketPlan};
+    use crate::{BranchName, IssueRef, IssueStatus, TicketPlan};
 
     /// One call made to a [`FakeForge`], recorded even when it fails.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +59,7 @@ mod fake {
         },
         FindOpenPullRequest(BranchName),
         CloseIssue(IssueRef),
+        IssueStatus(IssueRef),
         MarkPullRequestReady(IssueRef),
     }
 
@@ -226,6 +230,21 @@ mod fake {
             Ok(())
         }
 
+        async fn issue_status(&self, issue: &IssueRef) -> Result<IssueStatus, PortError> {
+            let mut state = self.state.lock().unwrap();
+            state.begin(ForgeCall::IssueStatus(issue.clone()))?;
+            let closed_in_plan = state.plans.values().any(|plan| {
+                plan.tickets
+                    .iter()
+                    .any(|t| &t.issue == issue && t.status == IssueStatus::Closed)
+            });
+            Ok(if closed_in_plan || state.closed.contains(issue) {
+                IssueStatus::Closed
+            } else {
+                IssueStatus::Open
+            })
+        }
+
         async fn mark_pull_request_ready(&self, pull_request: &IssueRef) -> Result<(), PortError> {
             let mut state = self.state.lock().unwrap();
             state.begin(ForgeCall::MarkPullRequestReady(pull_request.clone()))?;
@@ -340,6 +359,34 @@ mod fake {
             assert!(!fake.is_closed(&issue(11)));
             block_on(fake.close_issue(&issue(11))).unwrap();
             assert!(fake.is_closed(&issue(11)));
+        }
+
+        #[test]
+        fn reports_issue_status() {
+            let fake = forge();
+            fake.set_plan(
+                issue(2),
+                TicketPlan {
+                    tickets: vec![Ticket {
+                        issue: issue(11),
+                        status: IssueStatus::Closed,
+                        blockers: vec![],
+                    }],
+                },
+            );
+            assert_eq!(
+                block_on(fake.issue_status(&issue(11))).unwrap(),
+                IssueStatus::Closed
+            );
+            assert_eq!(
+                block_on(fake.issue_status(&issue(12))).unwrap(),
+                IssueStatus::Open
+            );
+            block_on(fake.close_issue(&issue(12))).unwrap();
+            assert_eq!(
+                block_on(fake.issue_status(&issue(12))).unwrap(),
+                IssueStatus::Closed
+            );
         }
 
         #[test]

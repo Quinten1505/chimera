@@ -170,14 +170,30 @@ where
         };
         let mut tasks = JoinSet::new();
         let mut in_flight = HashSet::new();
+        // A pause lets the active tasks finish and be saved but starts nothing new; the run
+        // then ends paused. `halted` tasks paused and are not started again by this run.
+        let mut pause = None;
+        let mut halted = HashSet::new();
+        let mut close_paused = false;
         loop {
-            self.close_merged(&mut state).await?;
-            // A global pause lets running tasks finish but starts no new ones.
-            let may_start = self.policy.check_start().is_ok();
+            if !close_paused {
+                match self.close_merged(&mut state).await {
+                    Ok(()) => {}
+                    Err(PipelineError::Paused(reason)) => {
+                        close_paused = true;
+                        pause.get_or_insert(reason);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let may_start = pause.is_none() && self.policy.check_start().is_ok();
             let mut to_start = Vec::new();
             for entry in &state.entries {
                 let issue = &entry.ticket.issue;
-                if entry.progress == TicketProgress::Running && !in_flight.contains(issue) {
+                if entry.progress == TicketProgress::Running
+                    && !in_flight.contains(issue)
+                    && !halted.contains(issue)
+                {
                     to_start.push(entry.ticket.clone());
                 }
             }
@@ -206,13 +222,25 @@ where
                 tasks.spawn(async move { (issue, task.await) });
             }
             let Some(joined) = tasks.join_next().await else {
-                return Ok(state);
+                return match pause {
+                    Some(reason) => Err(PipelineError::Paused(reason)),
+                    None => Ok(state),
+                };
             };
             let (issue, result) = joined.map_err(|error| {
                 PipelineError::Environment(format!("ticket task failed: {error}"))
             })?;
             in_flight.remove(&issue);
-            let progress = match result? {
+            let progress = match result {
+                Err(PipelineError::Paused(reason)) => {
+                    halted.insert(issue);
+                    pause.get_or_insert(reason);
+                    continue;
+                }
+                Err(error) => return Err(error),
+                Ok(end) => end,
+            };
+            let progress = match progress {
                 ImplementationState::Done(merged) => TicketProgress::Merged(merged),
                 ImplementationState::Paused { reason, .. } => TicketProgress::Paused(reason),
                 other => {
@@ -286,22 +314,19 @@ where
             if error.is_uncertain() && self.is_closed(issue).await? {
                 return Ok(());
             }
-            self.policy
-                .permit_retry(Budget::GithubRetry, &error, true)
-                .map_err(|refused| match refused {
-                    RetryRefused::Paused(reason) => PipelineError::Paused(reason),
-                    RetryRefused::NeedsReconciliation => PipelineError::from(error),
-                })?;
+            let permit = self.policy.permit_retry(Budget::GithubRetry, &error, true);
+            // The budget and pause outlive a restart, so they are saved before acting on them.
+            self.policy.save(self.store.as_ref(), &self.run).await?;
+            permit.map_err(|refused| match refused {
+                RetryRefused::Paused(reason) => PipelineError::Paused(reason),
+                RetryRefused::NeedsReconciliation => PipelineError::from(error),
+            })?;
         }
     }
 
-    /// Reads the status of `issue` for reconciliation only; the saved plan is not replaced.
+    /// Reads the current status of `issue` for reconciliation; the saved plan is not read.
     async fn is_closed(&self, issue: &IssueRef) -> Result<bool, PipelineError> {
-        let plan = self.forge.read_plan(&self.specification).await?;
-        Ok(plan
-            .tickets
-            .iter()
-            .any(|ticket| &ticket.issue == issue && ticket.status == IssueStatus::Closed))
+        Ok(self.forge.issue_status(issue).await? == IssueStatus::Closed)
     }
 }
 
@@ -361,6 +386,8 @@ mod tests {
     #[derive(Default)]
     struct Script {
         paused: Vec<u64>,
+        /// Tickets whose task fails with the global pause, after the rendezvous.
+        pause_error: Vec<u64>,
         /// Tickets that wait for each other before ending, to prove they run concurrently.
         rendezvous: Vec<u64>,
     }
@@ -417,6 +444,9 @@ mod tests {
                         if script.rendezvous.contains(&number) {
                             barrier.wait().await;
                         }
+                        if script.pause_error.contains(&number) {
+                            return Err(PipelineError::Paused(PauseReason::GlobalPause));
+                        }
                         let end = if script.paused.contains(&number) {
                             paused()
                         } else {
@@ -453,6 +483,27 @@ mod tests {
                 .iter()
                 .filter(|call| matches!(call, ForgeCall::ReadPlan(_)))
                 .count()
+        }
+
+        async fn saved_progress(&self) -> Vec<(u64, TicketProgress)> {
+            let saved = self
+                .store
+                .load_pipeline_state(&run_id(), STORE_INSTANCE)
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_value::<TicketState>(saved)
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|entry| (entry.ticket.issue.number(), entry.progress))
+                .collect()
+        }
+
+        async fn saved_policy(&self, limits: &Limits) -> Policy {
+            Policy::load_or_new(self.store.as_ref(), &run_id(), limits)
+                .await
+                .unwrap()
         }
 
         async fn save_state(&self, entries: Vec<(Ticket, TicketProgress)>) {
@@ -640,7 +691,27 @@ mod tests {
         );
         assert!(f.run(Script::default()).await.unwrap().is_complete());
         assert_eq!(f.closes(), Vec::<u64>::new());
-        assert_eq!(f.reads(), 1);
+        assert_eq!(f.reads(), 0);
+    }
+
+    #[tokio::test]
+    async fn restart_after_the_close_succeeded_but_before_its_outcome_was_recorded() {
+        let tickets = vec![ticket(1, &[])];
+        let f = Fixture::new(tickets.clone());
+        f.save_state(vec![(tickets[0].clone(), TicketProgress::Merged(merged()))])
+            .await;
+        let key = format!("close/{}", issue(1));
+        f.store
+            .record_effect_intent(&run_id(), &key, "close")
+            .await
+            .unwrap();
+        f.forge.close_issue(&issue(1)).await.unwrap();
+
+        assert!(f.run(Script::default()).await.unwrap().is_complete());
+        assert_eq!(f.closes(), [1]);
+        assert_eq!(f.reads(), 0);
+        let effects = f.store.load_effects(&run_id()).await.unwrap();
+        assert_eq!(effects[0].outcome.as_deref(), Some("closed"));
     }
 
     /// A merged ticket 1 whose first close loses its response.
@@ -670,5 +741,102 @@ mod tests {
         assert!(f.run(Script::default()).await.unwrap().is_complete());
         assert_eq!(f.closes(), [1, 1]);
         assert!(f.forge.is_closed(&issue(1)));
+    }
+
+    #[tokio::test]
+    async fn a_task_pausing_the_run_lets_the_other_active_tasks_finish_and_be_saved() {
+        let f = Fixture::new(vec![ticket(1, &[]), ticket(2, &[])]);
+        let script = Script {
+            rendezvous: vec![1, 2],
+            pause_error: vec![1],
+            ..Script::default()
+        };
+        let result = f.run(script).await;
+        assert!(matches!(
+            result,
+            Err(PipelineError::Paused(PauseReason::GlobalPause))
+        ));
+        assert_eq!(f.closes(), [2]);
+        assert_eq!(
+            f.saved_progress().await,
+            [(1, TicketProgress::Running), (2, TicketProgress::Closed)]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_close_retry_budget_pauses_after_active_tasks_are_saved() {
+        let tickets = vec![ticket(1, &[]), ticket(2, &[]), ticket(3, &[2])];
+        let mut f = Fixture::new(tickets.clone());
+        let limits = Limits {
+            github_retries: 0,
+            ..Limits::default()
+        };
+        f.policy = Arc::new(Policy::new(&limits));
+        f.save_state(vec![
+            (tickets[0].clone(), TicketProgress::Merged(merged())),
+            (tickets[1].clone(), TicketProgress::Running),
+            (tickets[2].clone(), TicketProgress::Waiting),
+        ])
+        .await;
+        f.forge.fail_next(PortError::failed("down"));
+
+        let result = f.run(Script::default()).await;
+        assert!(matches!(
+            result,
+            Err(PipelineError::Paused(PauseReason::GithubRetriesExhausted))
+        ));
+        // The running task finished and was saved; nothing new started and no close was retried.
+        assert_eq!(f.started(), [2]);
+        assert_eq!(f.closes(), [1]);
+        assert_eq!(
+            f.saved_progress().await,
+            [
+                (1, TicketProgress::Merged(merged())),
+                (2, TicketProgress::Merged(merged())),
+                (3, TicketProgress::Waiting),
+            ]
+        );
+        assert_eq!(
+            f.saved_policy(&Limits::default()).await.check_start(),
+            Err(PauseReason::GithubRetriesExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_the_remaining_close_retries() {
+        let mut f = merged_with_a_lost_close(false).await;
+        let limits = Limits {
+            github_retries: 3,
+            ..Limits::default()
+        };
+        f.policy = Arc::new(Policy::new(&limits));
+        assert!(f.run(Script::default()).await.unwrap().is_complete());
+        let restored = f.saved_policy(&Limits::default()).await.snapshot();
+        assert_eq!(restored.github_retries_remaining, 2);
+        assert_eq!(restored.paused, None);
+    }
+
+    #[tokio::test]
+    async fn restart_after_close_retries_were_exhausted_stays_paused_with_no_retries() {
+        let t = ticket(1, &[]);
+        let mut f = Fixture::new(vec![t.clone()]);
+        let limits = Limits {
+            github_retries: 1,
+            ..Limits::default()
+        };
+        f.policy = Arc::new(Policy::new(&limits));
+        f.save_state(vec![(t, TicketProgress::Merged(merged()))])
+            .await;
+        f.forge.fail_next(PortError::failed("down"));
+        f.forge.fail_next(PortError::failed("down"));
+
+        let result = f.run(Script::default()).await;
+        assert!(matches!(
+            result,
+            Err(PipelineError::Paused(PauseReason::GithubRetriesExhausted))
+        ));
+        let restored = f.saved_policy(&Limits::default()).await.snapshot();
+        assert_eq!(restored.github_retries_remaining, 0);
+        assert_eq!(restored.paused, Some(PauseReason::GithubRetriesExhausted));
     }
 }
