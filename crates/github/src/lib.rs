@@ -5,6 +5,7 @@
 mod client;
 mod close_issue;
 mod error;
+mod pulls;
 
 pub use client::{Access, Client, DEFAULT_API_URL};
 pub use error::GitHubError;

@@ -168,10 +168,25 @@ fn http_client(timeout: Duration) -> reqwest::Client {
 }
 
 fn message(body: &[u8]) -> String {
-    let text = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_owned))
-        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    let json = serde_json::from_slice::<Value>(body).ok();
+    let text = match json.as_ref().and_then(|v| v.get("message")?.as_str()) {
+        Some(message) => {
+            // Validation failures keep their reason in `errors`, e.g. "A pull request already exists".
+            let details = json
+                .as_ref()
+                .and_then(|v| v.get("errors")?.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.get("message").and_then(Value::as_str).or(e.as_str()))
+                .collect::<Vec<_>>();
+            if details.is_empty() {
+                message.to_owned()
+            } else {
+                format!("{message}: {}", details.join("; "))
+            }
+        }
+        None => String::from_utf8_lossy(body).into_owned(),
+    };
     text.chars().take(MAX_CAUSE_BODY).collect()
 }
 
