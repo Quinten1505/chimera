@@ -82,6 +82,13 @@ pub struct CompletedTurn {
     pub sender_reset_failed: Option<PortError>,
 }
 
+/// What an agent reported at the end of a turn: its output and whether that is a valid outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collected {
+    pub output: String,
+    pub parsed: Result<Outcome, String>,
+}
+
 /// Runs agent turns: prompt in, validated [`TurnResult`] out.
 pub struct AgentTurns {
     terminal: Arc<dyn Terminal>,
@@ -114,10 +121,7 @@ impl AgentTurns {
         request: &TurnRequest<'_>,
         max_corrections: u32,
     ) -> Result<CompletedTurn, TurnError> {
-        self.check_policy()?;
-        self.terminal
-            .send_prompt(request.pane, &prompt(request))
-            .await?;
+        self.send_assignment(request).await?;
         self.finish_turn(request, max_corrections).await
     }
 
@@ -167,27 +171,65 @@ impl AgentTurns {
         self.terminal.read_output(pane).await
     }
 
-    /// Picks up a turn whose prompt may already have been delivered, without sending it again.
-    /// `output_before` is what the pane showed before the prompt was sent: if the agent is idle
-    /// and still shows it, the prompt never arrived and `None` is returned so the caller can
-    /// send it. Otherwise waits for the turn and validates its output as [`Self::run_turn`]
-    /// does. The policy is not checked: the turn already started.
-    pub async fn resume_turn(
+    /// Sends the prompt of a turn without waiting for its result, unless the run is paused.
+    pub async fn send_assignment(&self, request: &TurnRequest<'_>) -> Result<(), TurnError> {
+        self.check_policy()?;
+        self.terminal
+            .send_prompt(request.pane, &prompt(request))
+            .await?;
+        Ok(())
+    }
+
+    /// Whether the agent in `pane` shows evidence of having received a prompt sent while it
+    /// showed `output_before`: it is working, or its output changed. An idle agent still showing
+    /// `output_before` proves nothing either way, as a delivered turn can end with identical
+    /// output, so the caller must not treat that as "never arrived".
+    pub async fn delivered(&self, pane: &PaneId, output_before: &str) -> Result<bool, TurnError> {
+        Ok(match self.terminal.read_status(pane).await? {
+            TurnStatus::Gone => return Err(TurnError::AgentLost),
+            TurnStatus::Running => true,
+            TurnStatus::Finished => self.terminal.read_output(pane).await? != output_before,
+        })
+    }
+
+    /// Waits for the agent's turn to end and parses what it reported, without saving it.
+    pub async fn collect(&self, request: &TurnRequest<'_>) -> Result<Collected, TurnError> {
+        self.wait_until_finished(request.pane).await?;
+        let output = self.terminal.read_output(request.pane).await?;
+        let parsed = parse_outcome(&output, request.role);
+        Ok(Collected { output, parsed })
+    }
+
+    /// Saves what [`Self::collect`] found to the history.
+    pub async fn record(
         &self,
         request: &TurnRequest<'_>,
-        max_corrections: u32,
-        output_before: &str,
-    ) -> Result<Option<CompletedTurn>, TurnError> {
-        match self.terminal.read_status(request.pane).await? {
-            TurnStatus::Gone => return Err(TurnError::AgentLost),
-            TurnStatus::Finished
-                if self.terminal.read_output(request.pane).await? == output_before =>
-            {
-                return Ok(None);
-            }
-            _ => {}
-        }
-        self.finish_turn(request, max_corrections).await.map(Some)
+        collected: &Collected,
+    ) -> Result<TurnResult, PortError> {
+        let outcome = match &collected.parsed {
+            Ok(outcome) => TurnOutcome::Valid(outcome.clone()),
+            Err(problem) => TurnOutcome::Invalid {
+                output: collected.output.clone(),
+                problem: problem.clone(),
+            },
+        };
+        let result = TurnResult {
+            agent: request.agent.clone(),
+            role: request.role,
+            outcome,
+        };
+        self.store.append_turn(request.run, result.clone()).await?;
+        Ok(result)
+    }
+
+    /// Asks the agent to correct the invalid outcome described by `problem`.
+    pub async fn send_correction(
+        &self,
+        request: &TurnRequest<'_>,
+        problem: &str,
+    ) -> Result<(), PortError> {
+        let correction = correction_prompt(request.role, problem);
+        self.terminal.send_prompt(request.pane, &correction).await
     }
 
     fn check_policy(&self) -> Result<(), TurnError> {
@@ -201,23 +243,9 @@ impl AgentTurns {
     ) -> Result<CompletedTurn, TurnError> {
         let mut corrections = 0;
         loop {
-            self.wait_until_finished(request.pane).await?;
-            let output = self.terminal.read_output(request.pane).await?;
-            let parsed = parse_outcome(&output, request.role);
-            let outcome = match &parsed {
-                Ok(outcome) => TurnOutcome::Valid(outcome.clone()),
-                Err(problem) => TurnOutcome::Invalid {
-                    output,
-                    problem: problem.clone(),
-                },
-            };
-            let result = TurnResult {
-                agent: request.agent.clone(),
-                role: request.role,
-                outcome,
-            };
-            self.store.append_turn(request.run, result.clone()).await?;
-            match parsed {
+            let collected = self.collect(request).await?;
+            let result = self.record(request, &collected).await?;
+            match collected.parsed {
                 Ok(_) => {
                     return Ok(CompletedTurn {
                         result,
@@ -233,8 +261,7 @@ impl AgentTurns {
                 }
                 Err(problem) => {
                     corrections += 1;
-                    let correction = correction_prompt(request.role, &problem);
-                    self.terminal.send_prompt(request.pane, &correction).await?;
+                    self.send_correction(request, &problem).await?;
                 }
             }
         }

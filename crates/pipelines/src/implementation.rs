@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use chimera_core::error::PortError;
 use chimera_core::run_store::RunStore;
 use chimera_core::{
     AgentConfiguration, AgentId, CommitId, IssueRef, MergedOk, Outcome, Role, RunId, TurnOutcome,
@@ -129,9 +130,143 @@ impl ImplementationPipeline {
         Ok(())
     }
 
+    /// Clears the sender whose reset is owed. Resetting twice is harmless, so an uncertain
+    /// earlier reset is simply repeated.
+    async fn reset_owed(&self, pending: &mut Pending) -> Result<(), PipelineError> {
+        let Some(sender) = pending.reset else {
+            return Ok(());
+        };
+        let environment = self.load_environment().await?;
+        let pane = environment.pane(sender).ok_or_else(|| {
+            PipelineError::Environment(format!("no {sender:?} agent in the environment"))
+        })?;
+        self.turns
+            .reset(pane, self.configuration.profile(sender))
+            .await?;
+        pending.reset = None;
+        self.save_pending(pending).await
+    }
+
+    /// Runs the turn described by `fresh` unless `pending` shows it already started, and
+    /// continues it from the phase `pending` records. What a restart cannot tell is never
+    /// repeated: a prompt that may have been delivered is reconciled instead of sent again, and
+    /// the sender is reset only once the receiver is known to have its prompt.
+    async fn execute_turn(
+        &self,
+        pending: &mut Pending,
+        request: &TurnRequest<'_>,
+        fresh: PendingTurn,
+        sender: Option<Role>,
+        max_corrections: u32,
+        reset_failed: &mut Option<PipelineError>,
+    ) -> Result<Result<Outcome, TurnError>, PipelineError> {
+        let existing = pending
+            .turn
+            .clone()
+            .filter(|turn| turn.role == fresh.role && turn.cycle == fresh.cycle);
+        let created = existing.is_none();
+        let mut turn = existing.unwrap_or(fresh);
+        if created {
+            pending.turn = Some(turn.clone());
+            self.save_pending(pending).await?;
+        }
+        if turn.phase == TurnPhase::Sending {
+            if created {
+                if let Err(error) = self.turns.send_assignment(request).await {
+                    // A definite failure means nothing was delivered.
+                    if !matches!(&error, TurnError::Port(port) if port.is_uncertain()) {
+                        pending.turn = None;
+                        self.save_pending(pending).await?;
+                    }
+                    return Ok(Err(error));
+                }
+            } else {
+                match self
+                    .turns
+                    .delivered(request.pane, &turn.output_before)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let unknown = "the assignment may or may not have been delivered";
+                        return Ok(Err(PortError::uncertain(unknown).into()));
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+            turn.phase = TurnPhase::Awaiting;
+            pending.turn = Some(turn.clone());
+            pending.reset = sender;
+            self.save_pending(pending).await?;
+            if let Err(error) = self.reset_owed(pending).await {
+                *reset_failed = Some(error);
+            }
+        }
+        loop {
+            if turn.phase == TurnPhase::Correcting {
+                // The correction was being sent: the pane shows what it showed before it.
+                match self
+                    .turns
+                    .delivered(request.pane, &turn.output_before)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let unknown = "the correction may or may not have been delivered";
+                        return Ok(Err(PortError::uncertain(unknown).into()));
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+                turn.corrections += 1;
+                turn.phase = TurnPhase::Awaiting;
+                pending.turn = Some(turn.clone());
+                self.save_pending(pending).await?;
+            }
+            let collected = match self.turns.collect(request).await {
+                Ok(collected) => collected,
+                Err(error) => return Ok(Err(error)),
+            };
+            // A crash after the result was saved but before the phase moved on leaves the
+            // result in the history: saving it again would count it twice.
+            let saved = self
+                .history()
+                .await?
+                .iter()
+                .filter(|turn| matches!(turn.outcome, TurnOutcome::Invalid { .. }))
+                .count()
+                - turn.invalid_before;
+            if collected.parsed.is_ok() || saved <= turn.corrections as usize {
+                self.turns.record(request, &collected).await?;
+            }
+            let problem = match collected.parsed {
+                Ok(outcome) => return Ok(Ok(outcome)),
+                Err(problem) => problem,
+            };
+            if turn.corrections >= max_corrections {
+                return Ok(Err(TurnError::CorrectionsExhausted {
+                    corrections: turn.corrections,
+                    problem,
+                }));
+            }
+            turn.phase = TurnPhase::Correcting;
+            turn.output_before = collected.output;
+            pending.turn = Some(turn.clone());
+            self.save_pending(pending).await?;
+            if let Err(error) = self.turns.send_correction(request, &problem).await {
+                if !error.is_uncertain() {
+                    // Not delivered: the saved result is corrected on the next attempt.
+                    turn.phase = TurnPhase::Awaiting;
+                    pending.turn = Some(turn.clone());
+                    self.save_pending(pending).await?;
+                }
+                return Ok(Err(error.into()));
+            }
+        }
+    }
+
     /// Runs the turn of `role` in `cycle` unless its result was already saved, then moves on.
-    /// A turn whose prompt may already have been delivered is reconciled with the agent instead
-    /// of being sent again, and a sender reset still owed is done before anything else.
+    /// A turn that was interrupted is reconciled with the agent instead of being sent again,
+    /// and a sender reset still owed is done before anything else.
     async fn turn_step(
         &self,
         state: ImplementationState,
@@ -139,18 +274,7 @@ impl ImplementationPipeline {
         cycle: u32,
     ) -> Result<ImplementationState, PipelineError> {
         let mut pending = self.load_pending().await?;
-        if let Some(sender) = pending.reset {
-            // Resetting twice is harmless, so an uncertain earlier reset is simply repeated.
-            let environment = self.load_environment().await?;
-            let pane = environment.pane(sender).ok_or_else(|| {
-                PipelineError::Environment(format!("no {sender:?} agent in the environment"))
-            })?;
-            self.turns
-                .reset(pane, self.configuration.profile(sender))
-                .await?;
-            pending.reset = None;
-            self.save_pending(&pending).await?;
-        }
+        self.reset_owed(&mut pending).await?;
         let history = self.history().await?;
         let valid = |role: Role| {
             history.iter().filter_map(move |turn| match &turn.outcome {
@@ -164,11 +288,17 @@ impl ImplementationPipeline {
         let outcome = match saved {
             Some(outcome) => outcome,
             None => {
-                let corrections_used = history
+                let invalid = history
                     .iter()
                     .filter(|turn| matches!(turn.outcome, TurnOutcome::Invalid { .. }))
                     .count();
-                let used = cycle as usize + corrections_used;
+                // Corrections of a turn that already started stay counted by that turn.
+                let invalid_before = pending
+                    .turn
+                    .as_ref()
+                    .filter(|turn| turn.role == role && turn.cycle == cycle)
+                    .map_or(invalid, |turn| turn.invalid_before);
+                let used = cycle as usize + invalid_before;
                 if used > self.cycle_limit as usize {
                     return Ok(paused(PauseReason::LimitExhausted, state));
                 }
@@ -202,106 +332,68 @@ impl ImplementationPipeline {
                     previous_description: description.as_deref(),
                 };
                 let max_corrections = (self.cycle_limit as usize - used) as u32;
-                let sender = environment.pane(other).filter(|_| has_previous);
-                let resumed = match pending
-                    .turn
-                    .as_ref()
-                    .filter(|turn| turn.role == role && turn.cycle == cycle)
-                {
-                    Some(turn) => {
-                        self.turns
-                            .resume_turn(&request, max_corrections, &turn.output_before)
-                            .await
-                    }
-                    None => Ok(None),
+                let fresh = PendingTurn {
+                    role,
+                    cycle,
+                    output_before: self.turns.read_output(pane).await?,
+                    invalid_before,
+                    corrections: 0,
+                    phase: TurnPhase::Sending,
                 };
-                let result = match resumed {
-                    Ok(Some(completed)) => Ok(completed),
-                    Ok(None) => {
-                        pending.turn = Some(PendingTurn {
-                            role,
-                            cycle,
-                            output_before: self.turns.read_output(pane).await?,
-                        });
-                        pending.reset = sender.map(|_| other);
-                        self.save_pending(&pending).await?;
-                        match sender {
-                            Some(sender) => {
-                                self.turns
-                                    .handoff(
-                                        sender,
-                                        self.configuration.profile(other),
-                                        &request,
-                                        max_corrections,
-                                    )
-                                    .await
-                            }
-                            None => self.turns.run_turn(&request, max_corrections).await,
-                        }
-                    }
-                    Err(error) => Err(error),
-                };
+                let mut reset_failed = None;
+                let result = self
+                    .execute_turn(
+                        &mut pending,
+                        &request,
+                        fresh,
+                        has_previous.then_some(other),
+                        max_corrections,
+                        &mut reset_failed,
+                    )
+                    .await?;
                 match result {
-                    Ok(completed) => {
+                    Ok(outcome) => {
                         // A reset that failed stays owed: it is retried before the state moves
                         // on, and the saved result of the turn is kept.
-                        let failed = completed.sender_reset_failed;
                         pending.turn = None;
-                        pending.reset = pending.reset.filter(|_| failed.is_some());
                         self.save_pending(&pending).await?;
-                        if let Some(error) = failed {
-                            return Err(error.into());
+                        if let Some(error) = reset_failed {
+                            return Err(error);
                         }
-                        match completed.result.outcome {
-                            TurnOutcome::Valid(outcome) => outcome,
-                            TurnOutcome::Invalid { .. } => {
-                                unreachable!("a completed turn is valid")
-                            }
-                        }
+                        outcome
                     }
-                    Err(error) => {
-                        // The receiver's own failure decides what happens next; a reset that
-                        // failed as well stays owed in `pending`.
-                        let cause = match &error {
-                            TurnError::ReceiverFailedAfterResetFailure { receiver, .. } => {
-                                receiver.as_ref()
-                            }
-                            other => other,
-                        };
-                        match cause {
-                            TurnError::AgentLost => {
-                                let command_line = &self
-                                    .spec
-                                    .agents
-                                    .iter()
-                                    .find(|launch| launch.role == role)
-                                    .ok_or_else(|| {
-                                        PipelineError::Environment(format!(
-                                            "no {role:?} launch in spec"
-                                        ))
-                                    })?
-                                    .command_line;
-                                self.environment
-                                    .relaunch(&environment, role, command_line)
-                                    .await?;
-                                pending.turn = None;
-                                self.save_pending(&pending).await?;
-                                return Ok(state);
-                            }
-                            TurnError::CorrectionsExhausted { .. } => {
-                                pending.turn = None;
-                                self.save_pending(&pending).await?;
-                                return Ok(paused(PauseReason::LimitExhausted, state));
-                            }
-                            TurnError::Paused(reason) => {
-                                // Nothing was sent.
-                                let reason = *reason;
-                                self.save_pending(&Pending::default()).await?;
-                                return Err(PipelineError::Paused(reason));
-                            }
-                            _ => return Err(error.into()),
+                    Err(error) => match error {
+                        TurnError::AgentLost => {
+                            let command_line = &self
+                                .spec
+                                .agents
+                                .iter()
+                                .find(|launch| launch.role == role)
+                                .ok_or_else(|| {
+                                    PipelineError::Environment(format!(
+                                        "no {role:?} launch in spec"
+                                    ))
+                                })?
+                                .command_line;
+                            self.environment
+                                .relaunch(&environment, role, command_line)
+                                .await?;
+                            pending.turn = None;
+                            self.save_pending(&pending).await?;
+                            return Ok(state);
                         }
-                    }
+                        TurnError::CorrectionsExhausted { .. } => {
+                            pending.turn = None;
+                            self.save_pending(&pending).await?;
+                            return Ok(paused(PauseReason::LimitExhausted, state));
+                        }
+                        TurnError::Paused(reason) => {
+                            // Nothing was sent.
+                            self.save_pending(&Pending::default()).await?;
+                            return Err(PipelineError::Paused(reason));
+                        }
+                        other => return Err(other.into()),
+                    },
                 }
             }
         };
@@ -317,9 +409,10 @@ impl ImplementationPipeline {
 /// What a step that was interrupted may have left half done, saved before the effect runs.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Pending {
-    /// A turn whose prompt may have been delivered.
+    /// A turn that has started.
     turn: Option<PendingTurn>,
-    /// The sender of a handoff whose context still has to be cleared.
+    /// The sender of a handoff whose context still has to be cleared. Set only once the
+    /// receiver is known to have its prompt.
     reset: Option<Role>,
 }
 
@@ -330,6 +423,24 @@ struct PendingTurn {
     /// What the agent's pane showed before the prompt was sent, to tell a new result from a
     /// stale one.
     output_before: String,
+    /// Invalid results in the history when the turn started; later ones are its corrections.
+    invalid_before: usize,
+    /// Corrections known to be delivered.
+    corrections: u32,
+    phase: TurnPhase,
+}
+
+/// How far the turn got, saved before each effect that cannot be taken back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum TurnPhase {
+    /// The assignment is being sent: it may or may not have been delivered.
+    Sending,
+    /// The assignment or a correction was delivered; the agent's result is awaited. If the
+    /// history already holds an invalid result beyond the delivered corrections, it still has
+    /// to be corrected.
+    Awaiting,
+    /// A correction is being sent: it may or may not have been delivered.
+    Correcting,
 }
 
 fn paused(reason: PauseReason, resume_at: ImplementationState) -> ImplementationState {
@@ -413,6 +524,10 @@ mod tests {
         fail_reset: Mutex<Option<PortError>>,
         /// Fails the next assignment after delivering it, as a lost connection would.
         fail_after_send: Mutex<Option<PortError>>,
+        /// Fails the next assignment without delivering it.
+        fail_send: Mutex<Option<PortError>>,
+        /// Fails the next correction after delivering it.
+        fail_correction_after_send: Mutex<Option<PortError>>,
     }
 
     #[async_trait]
@@ -441,6 +556,11 @@ mod tests {
             {
                 return Err(error);
             }
+            if prompt != "/clear"
+                && let Some(error) = self.fail_send.lock().unwrap().take()
+            {
+                return Err(error);
+            }
             let reply = if prompt == "/clear" {
                 None
             } else {
@@ -455,6 +575,11 @@ mod tests {
                 self.inner.script_statuses(pane, [TurnStatus::Finished]);
             }
             self.inner.send_prompt(pane, prompt).await?;
+            if prompt.contains("was rejected")
+                && let Some(error) = self.fail_correction_after_send.lock().unwrap().take()
+            {
+                return Err(error);
+            }
             match self.fail_after_send.lock().unwrap().take() {
                 Some(error) if prompt != "/clear" => Err(error),
                 _ => Ok(()),
@@ -507,6 +632,8 @@ mod tests {
             gone: Mutex::default(),
             fail_reset: Mutex::default(),
             fail_after_send: Mutex::default(),
+            fail_send: Mutex::default(),
+            fail_correction_after_send: Mutex::default(),
         });
         let store = Arc::new(FakeRunStore::new());
         let policy = Arc::new(Policy::new(&Limits::default()));
@@ -822,16 +949,44 @@ mod tests {
             .collect()
     }
 
-    async fn save_pending_turn(f: &Fixture, role: Role, cycle: u32, reset: Option<Role>) {
+    async fn save_pending_turn(
+        f: &Fixture,
+        role: Role,
+        phase: TurnPhase,
+        output_before: &str,
+        corrections: u32,
+    ) {
         let pending = Pending {
             turn: Some(PendingTurn {
                 role,
-                cycle,
-                output_before: String::new(),
+                cycle: 1,
+                output_before: output_before.into(),
+                invalid_before: 0,
+                corrections,
+                phase,
             }),
-            reset,
+            reset: None,
         };
         f.pipeline.save_pending(&pending).await.unwrap();
+    }
+
+    async fn show(f: &Fixture, role: Role, output: &str) {
+        let pane = f.pane(role).await;
+        f.terminal.inner.script_output(&pane, output);
+        f.terminal
+            .inner
+            .script_statuses(&pane, [TurnStatus::Finished]);
+    }
+
+    async fn save_state(f: &Fixture, state: ImplementationState) {
+        f.store
+            .save_pipeline_state(
+                &f.pipeline.run,
+                &f.pipeline.instance,
+                serde_json::to_value(state).unwrap(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -840,7 +995,7 @@ mod tests {
         f.script(Role::Implementation, &[READY]).await;
         f.script(Role::Review, &[APPROVED]).await;
         // The prompt was delivered and the agent is working when the process dies.
-        save_pending_turn(&f, Role::Implementation, 1, None).await;
+        save_pending_turn(&f, Role::Implementation, TurnPhase::Sending, "", 0).await;
         let pane = f.pane(Role::Implementation).await;
         f.terminal
             .send_prompt(&pane, "You are implementer.")
@@ -857,16 +1012,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_sends_a_turn_whose_prompt_never_arrived() {
+    async fn a_delivered_turn_that_finished_with_identical_output_is_not_resent() {
         let f = fixture(WorkItem::Ticket(ticket()), 5);
-        f.script(Role::Implementation, &[READY]).await;
+        f.script(Role::Implementation, &[]).await;
         f.script(Role::Review, &[APPROVED]).await;
-        // The intent was saved but the process died before the send.
-        save_pending_turn(&f, Role::Implementation, 1, None).await;
-        let pane = f.pane(Role::Implementation).await;
-        f.terminal
-            .inner
-            .script_statuses(&pane, [TurnStatus::Finished]);
+        // The delivery was saved; the agent finished with exactly what the pane showed before.
+        show(&f, Role::Implementation, READY).await;
+        save_pending_turn(&f, Role::Implementation, TurnPhase::Awaiting, READY, 0).await;
 
         assert_eq!(
             f.drive().await.unwrap(),
@@ -874,7 +1026,177 @@ mod tests {
         );
 
         let sent = f.prompts(Role::Implementation).await;
-        assert_eq!(assignments(&sent, "implementer").len(), 1);
+        assert!(assignments(&sent, "implementer").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unsaved_delivery_with_identical_output_stays_uncertain() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        f.script(Role::Implementation, &[]).await;
+        show(&f, Role::Implementation, READY).await;
+        save_pending_turn(&f, Role::Implementation, TurnPhase::Sending, READY, 0).await;
+
+        let error = f.drive().await.unwrap_err();
+
+        assert!(error.is_uncertain());
+        let sent = f.prompts(Role::Implementation).await;
+        assert!(assignments(&sent, "implementer").is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_before_the_handoff_send_does_not_reset_the_sender() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        f.script(Role::Implementation, &[READY]).await;
+        f.script(Role::Review, &[]).await;
+        f.pipeline
+            .step(ImplementationState::Implementing { cycle: 1 })
+            .await
+            .unwrap();
+        // The intent was saved but the process died before, or during, the send.
+        save_pending_turn(&f, Role::Review, TurnPhase::Sending, "", 0).await;
+        show(&f, Role::Review, "").await;
+        save_state(&f, ImplementationState::Reviewing { cycle: 1 }).await;
+
+        let error = f.drive().await.unwrap_err();
+
+        assert!(error.is_uncertain());
+        assert!(
+            !f.prompts(Role::Implementation)
+                .await
+                .contains(&"/clear".to_string())
+        );
+        assert!(f.prompts(Role::Review).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_handoff_send_keeps_the_sender_even_if_paused_next() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        f.script(Role::Implementation, &[READY]).await;
+        f.script(Role::Review, &[APPROVED]).await;
+        f.pipeline
+            .step(ImplementationState::Implementing { cycle: 1 })
+            .await
+            .unwrap();
+        *f.terminal.fail_send.lock().unwrap() = Some(PortError::failed("refused"));
+
+        let step = f
+            .pipeline
+            .step(ImplementationState::Reviewing { cycle: 1 })
+            .await
+            .unwrap_err();
+        assert!(step.is_failed());
+        assert_eq!(f.pipeline.load_pending().await.unwrap(), Pending::default());
+
+        f.policy.pause(PauseReason::GlobalPause);
+        save_state(&f, ImplementationState::Reviewing { cycle: 1 }).await;
+        assert!(matches!(
+            f.drive().await.unwrap_err(),
+            PipelineError::Paused(PauseReason::GlobalPause)
+        ));
+        assert!(
+            !f.prompts(Role::Implementation)
+                .await
+                .contains(&"/clear".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_before_a_correction_is_delivered_keeps_the_correction() {
+        let f = fixture(WorkItem::Ticket(ticket()), 2);
+        f.script(Role::Implementation, &[READY]).await;
+        f.script(Role::Review, &[APPROVED]).await;
+        // The first invalid result was saved; the process died before sending its correction.
+        let agent = f.pipeline.agent(Role::Implementation);
+        f.store
+            .append_turn(
+                &f.pipeline.run,
+                TurnResult {
+                    agent,
+                    role: Role::Implementation,
+                    outcome: TurnOutcome::Invalid {
+                        output: "nonsense".into(),
+                        problem: "no outcome found".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        show(&f, Role::Implementation, "nonsense").await;
+        save_pending_turn(&f, Role::Implementation, TurnPhase::Awaiting, "", 0).await;
+
+        assert_eq!(
+            f.drive().await.unwrap(),
+            ImplementationState::WaitingForMerge
+        );
+
+        let sent = f.prompts(Role::Implementation).await;
+        assert_eq!(
+            sent.iter().filter(|p| p.contains("was rejected")).count(),
+            1
+        );
+        let history = f.store.load_history(&f.pipeline.run).await.unwrap();
+        let invalid = history
+            .iter()
+            .filter(|turn| matches!(turn.outcome, TurnOutcome::Invalid { .. }))
+            .count();
+        assert_eq!(invalid, 1);
+    }
+
+    #[tokio::test]
+    async fn an_uncertain_correction_send_is_reconciled_without_resending() {
+        let f = fixture(WorkItem::Ticket(ticket()), 3);
+        f.script(Role::Implementation, &["nonsense", READY]).await;
+        f.script(Role::Review, &[APPROVED]).await;
+        *f.terminal.fail_correction_after_send.lock().unwrap() = Some(PortError::uncertain("lost"));
+
+        assert!(f.drive().await.unwrap_err().is_uncertain());
+        assert_eq!(
+            f.pipeline.load_pending().await.unwrap().turn.unwrap().phase,
+            TurnPhase::Correcting
+        );
+
+        assert_eq!(
+            f.drive().await.unwrap(),
+            ImplementationState::WaitingForMerge
+        );
+        let sent = f.prompts(Role::Implementation).await;
+        assert_eq!(
+            sent.iter().filter(|p| p.contains("was rejected")).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_correction_with_no_sign_of_delivery_stays_uncertain() {
+        let f = fixture(WorkItem::Ticket(ticket()), 3);
+        f.script(Role::Implementation, &[]).await;
+        let agent = f.pipeline.agent(Role::Implementation);
+        f.store
+            .append_turn(
+                &f.pipeline.run,
+                TurnResult {
+                    agent,
+                    role: Role::Implementation,
+                    outcome: TurnOutcome::Invalid {
+                        output: "nonsense".into(),
+                        problem: "no outcome found".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        show(&f, Role::Implementation, "nonsense").await;
+        save_pending_turn(
+            &f,
+            Role::Implementation,
+            TurnPhase::Correcting,
+            "nonsense",
+            0,
+        )
+        .await;
+
+        assert!(f.drive().await.unwrap_err().is_uncertain());
+        assert!(f.prompts(Role::Implementation).await.is_empty());
     }
 
     #[tokio::test]
