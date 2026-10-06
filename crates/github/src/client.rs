@@ -84,7 +84,7 @@ impl Client {
     }
 
     /// Run a GraphQL query or mutation and return its `data`. A response carrying `errors` is a
-    /// failure.
+    /// failure, uncertain for a mutation unless the errors prove it was not executed.
     pub async fn graphql(
         &self,
         access: Access,
@@ -98,7 +98,13 @@ impl Client {
         let mut response: Value = serde_json::from_slice(&bytes)
             .map_err(|e| access.lost(format!("unreadable GitHub response: {e}")))?;
         if let Some(errors) = response.get("errors").filter(|e| !e.is_null()) {
-            return Err(GitHubError::Failed(format!("GraphQL errors: {errors}")));
+            let cause = format!("GraphQL errors: {errors}");
+            // Execution errors may follow a mutation's effect (https://graphql.org/learn/response/).
+            return Err(if not_executed(&response, errors) {
+                GitHubError::Failed(cause)
+            } else {
+                access.lost(cause)
+            });
         }
         match response.get_mut("data").map(Value::take) {
             Some(data) if !data.is_null() => Ok(data),
@@ -166,6 +172,31 @@ fn http_client(timeout: Duration) -> reqwest::Client {
         .connect_timeout(CONNECT_TIMEOUT.min(timeout / 2))
         .build()
         .expect("reqwest client builds with static configuration")
+}
+
+/// GitHub error types that reject an operation without performing it.
+const REJECTION_TYPES: [&str; 5] = [
+    "NOT_FOUND",
+    "FORBIDDEN",
+    "INSUFFICIENT_SCOPES",
+    "UNPROCESSABLE",
+    "RATE_LIMITED",
+];
+
+/// Whether GraphQL `errors` prove the operation was not executed: a request error, which
+/// omits `data` entirely, or only rejections of known types.
+fn not_executed(response: &Value, errors: &Value) -> bool {
+    if response.get("data").is_none() {
+        return true;
+    }
+    errors.as_array().is_some_and(|errors| {
+        !errors.is_empty()
+            && errors.iter().all(|e| {
+                e.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| REJECTION_TYPES.contains(&t))
+            })
+    })
 }
 
 fn message(body: &[u8]) -> String {
@@ -352,9 +383,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graphql_errors_are_failed_even_for_mutations() {
-        let body = "{\"data\":null,\"errors\":[{\"message\":\"bad\"}]}";
+    async fn graphql_errors_are_failed_for_reads() {
+        for body in [
+            r#"{"errors":[{"message":"Field 'x' doesn't exist"}]}"#,
+            r#"{"data":null,"errors":[{"message":"Something went wrong"}]}"#,
+            r#"{"data":{"a":1},"errors":[{"message":"bad","path":["b"]}]}"#,
+        ] {
+            assert!(
+                failed(graphql(Access::Read, raw("200 OK", body)).await),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn graphql_request_errors_are_failed_for_mutations() {
+        // Parse and validation errors precede execution, so the response has no `data` key.
+        let body = r#"{"errors":[{"message":"Field 'x' doesn't exist","extensions":{"code":"undefinedField"}}]}"#;
         assert!(failed(graphql(Access::Mutate, raw("200 OK", body)).await));
+    }
+
+    #[tokio::test]
+    async fn graphql_rejections_are_failed_for_mutations() {
+        for body in [
+            r#"{"data":{"m":null},"errors":[{"type":"FORBIDDEN","message":"no access","path":["m"]}]}"#,
+            r#"{"data":null,"errors":[{"type":"NOT_FOUND","message":"gone"}]}"#,
+            r#"{"data":{"m":null},"errors":[{"type":"UNPROCESSABLE","message":"invalid"}]}"#,
+            r#"{"data":null,"errors":[{"type":"INSUFFICIENT_SCOPES","message":"scope"}]}"#,
+        ] {
+            assert!(
+                failed(graphql(Access::Mutate, raw("200 OK", body)).await),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn graphql_execution_errors_are_uncertain_for_mutations() {
+        for body in [
+            // Internal errors, with null data.
+            r#"{"data":null,"errors":[{"message":"Something went wrong while executing your query."}]}"#,
+            // Partial data with a field error after the mutation may have run.
+            r#"{"data":{"m":{"pullRequest":null}},"errors":[{"message":"bad","path":["m","pullRequest"]}]}"#,
+            // A known rejection alongside an unknown error.
+            r#"{"data":null,"errors":[{"type":"FORBIDDEN","message":"no"},{"message":"boom"}]}"#,
+            r#"{"data":null,"errors":[]}"#,
+            r#"{"data":null,"errors":"boom"}"#,
+        ] {
+            let result = graphql(Access::Mutate, raw("200 OK", body)).await;
+            assert!(uncertain(result), "{body}");
+        }
     }
 
     #[tokio::test]
