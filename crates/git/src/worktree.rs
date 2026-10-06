@@ -7,9 +7,9 @@ use crate::runner::{Effect, Runner};
 
 /// Creates the worktree for `task_branch` at `path` and returns the path.
 ///
-/// A missing `task_branch` is created from the latest `origin/<feature>` after a fetch; an
-/// existing one is reused as is. A usable worktree already at `path` on `task_branch` is left
-/// alone; anything else at `path`, including a directory replacing a deleted worktree, fails.
+/// A missing `task_branch` is created from the latest `refs/remotes/origin/<feature>` after a
+/// fetch; an existing one is reused as is. A usable worktree already at `path` on `task_branch` is
+/// left alone; anything else at `path`, including a directory replacing a deleted worktree, fails.
 pub(crate) fn create(
     runner: &Runner,
     repo: &Path,
@@ -41,9 +41,11 @@ pub(crate) fn create(
             Effect::Local,
         )?;
     } else {
-        let refspec = format!("+refs/heads/{feature}:refs/remotes/origin/{feature}");
+        let tracking = format!("refs/remotes/origin/{feature}");
+        let refspec = format!("+refs/heads/{feature}:{tracking}");
         runner.run(repo, &["fetch", "origin", &refspec], Effect::Local)?;
-        let start = format!("origin/{feature}");
+        // The full ref name, so a tag or branch named `origin/<feature>` cannot shadow it.
+        let start = tracking;
         runner.run(
             repo,
             &[
@@ -275,6 +277,22 @@ mod tests {
         let created = create(&Runner::new(), repo.work(), &path, "task/a", "feature").unwrap();
         assert_eq!(created, path);
         assert!(path.join("f.txt").exists());
+        assert_eq!(rev(&path, "HEAD"), rev(&repo.origin(), "feature"));
+        assert_eq!(rev(repo.work(), "task/a"), rev(&repo.origin(), "feature"));
+    }
+
+    #[test]
+    fn create_ignores_tag_named_like_remote_feature() {
+        let (repo, path) = repo_with_feature();
+        let runner = Runner::new();
+        runner
+            .run(
+                repo.work(),
+                &["tag", "origin/feature", "main"],
+                Effect::Local,
+            )
+            .unwrap();
+        create(&runner, repo.work(), &path, "task/a", "feature").unwrap();
         assert_eq!(rev(&path, "HEAD"), rev(&repo.origin(), "feature"));
         assert_eq!(rev(repo.work(), "task/a"), rev(&repo.origin(), "feature"));
     }
