@@ -89,6 +89,15 @@ pub trait Implement: Sync {
         cycle: u32,
         findings: &str,
     ) -> impl Future<Output = Result<ImplementationState, PipelineError>> + Send;
+
+    /// While the run is paused: advances the fix of review `cycle` by one step only if one of
+    /// its agents is working on a turn that already started, so that the turn finishes and its
+    /// result is saved. Returns the state the fix is then in, or `None` if no turn was in flight.
+    fn finish_started_turn(
+        &self,
+        cycle: u32,
+        findings: &str,
+    ) -> impl Future<Output = Result<Option<ImplementationState>, PipelineError>> + Send;
 }
 
 /// Steps the [`ImplementationPipeline`] that `build` makes for a review cycle and its findings,
@@ -128,6 +137,36 @@ where
         if state.is_terminal() {
             return Ok(state);
         }
+        self.step(&pipeline, state).await
+    }
+
+    async fn finish_started_turn(
+        &self,
+        cycle: u32,
+        findings: &str,
+    ) -> Result<Option<ImplementationState>, PipelineError> {
+        let pipeline = (self.build)(cycle, findings);
+        let Some(saved) = self
+            .store
+            .load_pipeline_state(&pipeline.run, &pipeline.instance)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let state = serde_json::from_value(saved)?;
+        if !pipeline.turn_in_flight(&state).await? {
+            return Ok(None);
+        }
+        Ok(Some(self.step(&pipeline, state).await?))
+    }
+}
+
+impl<B> DriveImplementation<B> {
+    async fn step(
+        &self,
+        pipeline: &ImplementationPipeline,
+        state: ImplementationState,
+    ) -> Result<ImplementationState, PipelineError> {
         let next = pipeline.step(state).await?;
         self.store
             .save_pipeline_state(
@@ -675,14 +714,29 @@ impl<I: Implement> Pipeline for PrReviewPipeline<I> {
 }
 
 impl<I: Implement> PrReviewPipeline<I> {
-    /// While the run is paused, a review turn that already started still finishes and its result
-    /// is saved; the pipeline then pauses at the state the result leads to, so no fix or new
-    /// review starts. Any other state pauses as it is.
-    async fn finish_started_review(
+    /// While the run is paused, a turn that already started still finishes and its result is
+    /// saved. After a review turn the pipeline pauses at the state its result leads to, so no
+    /// fix or new review starts; a turn of the fix moves the fix on, and the pipeline pauses
+    /// once no turn of it is in flight. Any other state pauses as it is.
+    async fn finish_started_turn(
         &self,
         reason: PauseReason,
         state: PrReviewState,
     ) -> Result<PrReviewState, PipelineError> {
+        if let PrReviewState::Fixing { cycle, findings } = &state {
+            return Ok(
+                match self
+                    .implementation
+                    .finish_started_turn(*cycle, findings)
+                    .await
+                {
+                    // The fix's turn went on; the next step continues it or pauses.
+                    Ok(Some(_)) => state,
+                    Ok(None) | Err(PipelineError::Paused(_)) => paused(reason, state),
+                    Err(error) => return Err(error),
+                },
+            );
+        }
         let PrReviewState::Reviewing { cycle } = state else {
             return Ok(paused(reason, state));
         };
@@ -708,7 +762,7 @@ impl<I: Implement> PrReviewPipeline<I> {
     /// first, so an uncertain one counts as reconciled.
     async fn step_effect(&self, state: PrReviewState) -> Result<PrReviewState, PipelineError> {
         if let Err(reason) = self.policy.check_start() {
-            return self.finish_started_review(reason, state).await;
+            return self.finish_started_turn(reason, state).await;
         }
         match self.advance(&state).await {
             Ok(next) => Ok(next),
@@ -866,6 +920,14 @@ mod tests {
                 .await?;
             Ok(ImplementationState::Done(MergedOk { commit: head }))
         }
+
+        async fn finish_started_turn(
+            &self,
+            _cycle: u32,
+            _findings: &str,
+        ) -> Result<Option<ImplementationState>, PipelineError> {
+            Ok(None)
+        }
     }
 
     fn branch(name: &str) -> BranchName {
@@ -937,6 +999,15 @@ mod tests {
             findings: &str,
         ) -> impl Future<Output = Result<ImplementationState, PipelineError>> + Send {
             self.0.implement(cycle, findings)
+        }
+
+        fn finish_started_turn(
+            &self,
+            cycle: u32,
+            findings: &str,
+        ) -> impl Future<Output = Result<Option<ImplementationState>, PipelineError>> + Send
+        {
+            self.0.finish_started_turn(cycle, findings)
         }
     }
 
@@ -1821,10 +1892,12 @@ mod tests {
                 worktree: "/wt/fix".into(),
                 task_branch: branch("fix-task"),
                 feature: branch("feat"),
-                agents: vec![AgentLaunch {
-                    role: Role::Implementation,
-                    command_line: "agent Implementation".into(),
-                }],
+                agents: [Role::Implementation, Role::Review, Role::Merge]
+                    .map(|role| AgentLaunch {
+                        role,
+                        command_line: format!("agent {role:?}"),
+                    })
+                    .to_vec(),
             },
             initial_remote_head: CommitId::new("c0").unwrap(),
             store: store.clone(),
@@ -1989,5 +2062,80 @@ mod tests {
         // The fix repeated no work: nothing but the review after it was asked of an agent.
         assert_eq!(f.review_prompts().len(), 1);
         assert_eq!(f.repository.worktree_branch(Path::new("/wt/fix")), None);
+    }
+
+    #[test]
+    fn a_started_turn_of_the_fix_is_collected_under_a_restored_pause() {
+        let merged = r#"{"MergeSuccessful":"c1 merged"}"#;
+        for (started, reply, after) in [
+            (
+                ImplementationState::Implementing { cycle: 1 },
+                r#"{"ImplementationReady":"done"}"#,
+                ImplementationState::Reviewing { cycle: 1 },
+            ),
+            (
+                ImplementationState::Reviewing { cycle: 1 },
+                APPROVED,
+                ImplementationState::WaitingForMerge,
+            ),
+            (
+                ImplementationState::Merging { attempt: 1 },
+                merged,
+                ImplementationState::Verifying { attempt: 1 },
+            ),
+        ] {
+            let mut f = fixture(5, &[reply]);
+            let fixing = PrReviewState::Fixing {
+                cycle: 1,
+                findings: "fix it".into(),
+            };
+            let context = format!("{started:?}");
+            let outer = drive_implementation_fixture(&f);
+            block_on(async {
+                let fix = (outer.implementation.build)(1, "fix it");
+                fix.environment
+                    .provision(
+                        f.store.as_ref(),
+                        &run(),
+                        "fix/environment",
+                        &fix.spec,
+                        &CommitId::new("c0").unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                f.store
+                    .save_pipeline_state(&run(), "fix", serde_json::to_value(&started).unwrap())
+                    .await
+                    .unwrap();
+                // The fix's turn starts; the run is paused and restarted before it ends.
+                assert_eq!(
+                    outer.implementation.implement(1, "fix it").await.unwrap(),
+                    started
+                );
+                f.policy.pause(PauseReason::GlobalPause);
+                f.policy.save(f.store.as_ref(), &run()).await.unwrap();
+                f.store
+                    .save_pipeline_state(&run(), "review", serde_json::to_value(&fixing).unwrap())
+                    .await
+                    .unwrap();
+            });
+            let prompts = f.review_prompts().len();
+            drop(outer);
+            f.policy = Arc::new(block_on(saved_policy(&f)));
+
+            let restarted = drive_implementation_fixture(&f);
+            let state = block_on(drive(f.store.as_ref(), &run(), "review", &restarted)).unwrap();
+
+            assert_eq!(state, paused(PauseReason::GlobalPause, fixing), "{context}");
+            let fix = block_on(f.store.load_pipeline_state(&run(), "fix")).unwrap();
+            assert_eq!(
+                fix,
+                Some(serde_json::to_value(&after).unwrap()),
+                "{context}"
+            );
+            assert_eq!(f.store.history(&run()).len(), 1, "{context}");
+            // Nothing new was sent while paused.
+            assert_eq!(f.review_prompts().len(), prompts, "{context}");
+        }
     }
 }

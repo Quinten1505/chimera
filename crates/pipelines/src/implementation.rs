@@ -588,6 +588,25 @@ impl ImplementationPipeline {
             .count()
     }
 
+    /// Whether an agent is working on the turn of `state` that already started: one a global
+    /// pause lets finish.
+    pub(crate) async fn turn_in_flight(
+        &self,
+        state: &ImplementationState,
+    ) -> Result<bool, PipelineError> {
+        let (role, cycle) = match *state {
+            ImplementationState::Implementing { cycle } => (Role::Implementation, cycle),
+            ImplementationState::Reviewing { cycle } => (Role::Review, cycle),
+            ImplementationState::Merging { attempt } => (Role::Merge, attempt),
+            ImplementationState::ConflictReview { attempt } => (Role::Review, attempt),
+            _ => return Ok(false),
+        };
+        let pending = self.load_pending().await?;
+        Ok(pending
+            .turn
+            .is_some_and(|turn| turn.role == role && turn.cycle == cycle))
+    }
+
     fn expected_head_key(&self) -> String {
         expected_head_key(&self.spec.feature)
     }
