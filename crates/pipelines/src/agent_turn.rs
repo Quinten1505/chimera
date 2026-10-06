@@ -408,6 +408,12 @@ mod tests {
             self.inner.create_workspace(directory).await
         }
 
+        async fn find_workspace(
+            &self,
+            directory: &Path,
+        ) -> Result<Option<(WorkspaceId, Vec<PaneId>)>, PortError> {
+            self.inner.find_workspace(directory).await
+        }
         async fn split_pane(
             &self,
             workspace: &WorkspaceId,

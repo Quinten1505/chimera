@@ -17,7 +17,8 @@ mod ticket;
 pub use agent_turn::{AgentTurns, CompletedTurn, TurnError, TurnRequest};
 pub use driver::{Pipeline, PipelineState, drive};
 pub use environment::{
-    AgentLaunch, Environment, EnvironmentAgent, EnvironmentService, ProvisionSpec,
+    AgentLaunch, Environment, EnvironmentAgent, EnvironmentEffect, EnvironmentService,
+    ProvisionSpec,
 };
 pub use error::{PauseReason, PipelineError};
 pub use feature::{FeaturePipeline, FeatureState};

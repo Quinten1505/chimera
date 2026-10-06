@@ -645,20 +645,18 @@ impl ImplementationPipeline {
         Ok(ImplementationState::CleaningUp { merged })
     }
 
-    /// Closes the workspace and removes the worktree. What was removed is saved even if a later
-    /// removal fails, so a retry continues where this one stopped.
+    /// Closes the workspace, removes the worktree and prunes, one effect per step. What was
+    /// removed is saved, so a retry continues where the last step stopped.
     async fn clean_up(&self, merged: CommitId) -> Result<ImplementationState, PipelineError> {
-        let mut environment = self.load_environment().await?;
-        let cleaned = self.environment.cleanup(&mut environment).await;
-        self.store
-            .save_pipeline_state(
-                &self.run,
-                &self.environment_key(),
-                serde_json::to_value(&environment)?,
-            )
+        let finished = self
+            .environment
+            .cleanup_step(self.store.as_ref(), &self.run, &self.environment_key())
             .await?;
-        cleaned?;
-        Ok(ImplementationState::Done(MergedOk { commit: merged }))
+        Ok(if finished {
+            ImplementationState::Done(MergedOk { commit: merged })
+        } else {
+            ImplementationState::CleaningUp { merged }
+        })
     }
 }
 
@@ -781,16 +779,25 @@ impl Pipeline for ImplementationPipeline {
 
     async fn step(&self, state: ImplementationState) -> Result<ImplementationState, PipelineError> {
         match state {
+            // One provisioning effect per step. The new worktree starts at the latest verified
+            // feature head, which earlier merges may have moved past the local feature branch.
             ImplementationState::Provisioning => {
-                self.environment
-                    .provision(
+                let base = self.expected_head().await?;
+                let environment = self
+                    .environment
+                    .provision_step(
                         self.store.as_ref(),
                         &self.run,
                         &self.environment_key(),
                         &self.spec,
+                        &base,
                     )
                     .await?;
-                Ok(ImplementationState::Implementing { cycle: 1 })
+                Ok(if environment.is_provisioned(&self.spec) {
+                    ImplementationState::Implementing { cycle: 1 }
+                } else {
+                    ImplementationState::Provisioning
+                })
             }
             ImplementationState::Implementing { cycle } => {
                 self.turn_step(state, Role::Implementation, cycle).await
@@ -869,6 +876,12 @@ mod tests {
             directory: &Path,
         ) -> Result<(WorkspaceId, PaneId), PortError> {
             self.inner.create_workspace(directory).await
+        }
+        async fn find_workspace(
+            &self,
+            directory: &Path,
+        ) -> Result<Option<(WorkspaceId, Vec<PaneId>)>, PortError> {
+            self.inner.find_workspace(directory).await
         }
         async fn split_pane(
             &self,
@@ -1117,8 +1130,10 @@ mod tests {
                 .unwrap()
                 .is_none()
             {
-                let state = self.pipeline.step(ImplementationState::Provisioning).await;
-                state.unwrap();
+                let mut state = ImplementationState::Provisioning;
+                while state == ImplementationState::Provisioning {
+                    state = self.pipeline.step(state).await.unwrap();
+                }
             }
             let pane = self.pane(role).await;
             self.terminal
@@ -1952,6 +1967,57 @@ mod tests {
             f.store.load_history(&f.pipeline.run).await.unwrap().len(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn a_task_started_after_a_merge_works_on_the_merged_head() {
+        let a = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&a, &[MERGED], &[]).await;
+        a.repository.set_remote_head(feature(), commit("c1"));
+        a.drive_through().await.unwrap();
+
+        // A dependent ticket and a findings fix start after the merge; the local feature branch
+        // is still at c0.
+        let dependent = fixture_for(WorkItem::Ticket(ticket()), 5, "t32", Some(&a));
+        let fix = fixture_for(WorkItem::Findings("f".into()), 5, "fix", Some(&a));
+        for f in [&dependent, &fix] {
+            f.script(Role::Implementation, &[]).await;
+            assert_eq!(
+                f.repository.worktree_head(&f.pipeline.spec.worktree),
+                Some(commit("c1")),
+                "{}",
+                f.pipeline.instance
+            );
+            // Nothing is moved once the agents may have worked in it.
+            f.repository
+                .update_worktree(&f.pipeline.spec.worktree, &commit("w1"))
+                .await
+                .unwrap();
+            f.pipeline
+                .step(ImplementationState::Provisioning)
+                .await
+                .unwrap();
+            assert_eq!(
+                f.repository.worktree_head(&f.pipeline.spec.worktree),
+                Some(commit("w1"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn each_provisioning_step_performs_one_effect() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        let mut state = ImplementationState::Provisioning;
+        let mut steps = 0;
+        while state == ImplementationState::Provisioning {
+            let launches = *f.terminal.launches.lock().unwrap();
+            state = f.pipeline.step(state).await.unwrap();
+            assert!(*f.terminal.launches.lock().unwrap() - launches <= 1);
+            steps += 1;
+        }
+        // Worktree, its move onto the verified head, workspace, two splits, three launches.
+        assert_eq!(steps, 8);
+        assert_eq!(state, ImplementationState::Implementing { cycle: 1 });
     }
 
     #[tokio::test]

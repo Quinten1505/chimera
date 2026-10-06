@@ -357,6 +357,10 @@ mod tests {
                 .await
         }
 
+        async fn worktree_exists(&self, path: &Path) -> Result<bool, PortError> {
+            self.repository.worktree_exists(path).await
+        }
+
         async fn remove_worktree(
             &self,
             path: &Path,

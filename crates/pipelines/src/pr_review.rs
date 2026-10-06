@@ -6,8 +6,8 @@ use chimera_core::forge::Forge;
 use chimera_core::repository::Repository;
 use chimera_core::run_store::RunStore;
 use chimera_core::{
-    AgentConfiguration, AgentId, Feature, IssueRef, IssueStatus, Outcome, Role, RunId, TurnOutcome,
-    TurnResult,
+    AgentConfiguration, AgentId, CommitId, Feature, IssueRef, IssueStatus, Outcome, Role, RunId,
+    TurnOutcome, TurnResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -246,17 +246,34 @@ impl<I: Implement> PrReviewPipeline<I> {
         Ok(())
     }
 
-    /// Makes sure the review starts from the latest verified feature head: the head Chimera last
-    /// verified must still be the remote one, and the review worktree is moved onto it.
+    /// The feature head Chimera last verified.
+    async fn expected_head(&self) -> Result<CommitId, PipelineError> {
+        Ok(
+            match self
+                .store
+                .load_pipeline_state(&self.run, &expected_head_key(&self.feature.feature_branch))
+                .await?
+            {
+                Some(saved) => serde_json::from_value(saved)?,
+                None => self.feature.expected_remote_head.clone(),
+            },
+        )
+    }
+
+    /// Provisions the review environment one effect per step, its worktree moved onto the latest
+    /// verified feature head. Once it is ready, the review starts only if that head is still the
+    /// remote one.
     async fn provision(&self, cycle: u32) -> Result<PrReviewState, PipelineError> {
-        let expected = match self
-            .store
-            .load_pipeline_state(&self.run, &expected_head_key(&self.feature.feature_branch))
-            .await?
-        {
-            Some(saved) => serde_json::from_value(saved)?,
-            None => self.feature.expected_remote_head.clone(),
-        };
+        let key = self.environment_key(cycle);
+        let environment =
+            EnvironmentService::load(self.store.as_ref(), &self.run, &key, &self.spec).await?;
+        let expected = self.expected_head().await?;
+        if !environment.is_provisioned(&self.spec) {
+            self.environment
+                .provision_step(self.store.as_ref(), &self.run, &key, &self.spec, &expected)
+                .await?;
+            return Ok(PrReviewState::Provisioning { cycle });
+        }
         let actual = self
             .repository
             .remote_head(&self.feature.feature_branch)
@@ -268,23 +285,10 @@ impl<I: Implement> PrReviewPipeline<I> {
                 Some(PauseReason::UnexpectedRemoteChange)
             }
         };
-        if let Some(reason) = reason {
-            return Ok(paused(reason, PrReviewState::Provisioning { cycle }));
-        }
-        self.environment
-            .provision(
-                self.store.as_ref(),
-                &self.run,
-                &self.environment_key(cycle),
-                &self.spec,
-            )
-            .await?;
-        // The worktree is created from the local feature branch, which may be behind the
-        // verified remote head; moving it is safe to repeat after a restart.
-        self.repository
-            .update_worktree(&self.spec.worktree, &expected)
-            .await?;
-        Ok(PrReviewState::Reviewing { cycle })
+        Ok(match reason {
+            Some(reason) => paused(reason, PrReviewState::Provisioning { cycle }),
+            None => PrReviewState::Reviewing { cycle },
+        })
     }
 
     /// Runs the review of `cycle` unless its result was already saved. A turn that was
@@ -537,19 +541,12 @@ impl<I: Implement> PrReviewPipeline<I> {
         )
     }
 
-    /// Closes the workspace and removes the worktree of `cycle`. What was removed is saved even
-    /// if a later removal fails, so a retry continues where this one stopped.
-    async fn clean_up(&self, cycle: u32) -> Result<(), PipelineError> {
-        let mut environment = self.load_environment(cycle).await?;
-        let cleaned = self.environment.cleanup(&mut environment).await;
-        self.store
-            .save_pipeline_state(
-                &self.run,
-                &self.environment_key(cycle),
-                serde_json::to_value(&environment)?,
-            )
-            .await?;
-        cleaned
+    /// Performs the next cleanup effect of the environment of `cycle`; `true` once it is all
+    /// removed. What was removed is saved, so a retry continues where the last step stopped.
+    async fn clean_up(&self, cycle: u32) -> Result<bool, PipelineError> {
+        self.environment
+            .cleanup_step(self.store.as_ref(), &self.run, &self.environment_key(cycle))
+            .await
     }
 
     /// Performs a forge effect once per run: an effect that is recorded as done is skipped. One
@@ -590,10 +587,11 @@ impl<I: Implement> PrReviewPipeline<I> {
             PrReviewState::Provisioning { cycle } => self.provision(*cycle).await,
             PrReviewState::Reviewing { cycle } => self.review(state.clone(), *cycle).await,
             PrReviewState::Fixing { cycle, findings } => self.fix(state, *cycle, findings).await,
-            PrReviewState::Refreshing { cycle } => {
-                self.clean_up(*cycle).await?;
-                Ok(PrReviewState::Provisioning { cycle: cycle + 1 })
-            }
+            PrReviewState::Refreshing { cycle } => Ok(if self.clean_up(*cycle).await? {
+                PrReviewState::Provisioning { cycle: cycle + 1 }
+            } else {
+                state.clone()
+            }),
             PrReviewState::ClosingSpecification { cycle } => {
                 self.once(
                     "close-specification",
@@ -622,12 +620,13 @@ impl<I: Implement> PrReviewPipeline<I> {
                 .await?;
                 Ok(PrReviewState::CleaningUp { cycle: *cycle })
             }
-            PrReviewState::CleaningUp { cycle } => {
-                self.clean_up(*cycle).await?;
-                Ok(PrReviewState::Done(PrReady {
+            PrReviewState::CleaningUp { cycle } => Ok(if self.clean_up(*cycle).await? {
+                PrReviewState::Done(PrReady {
                     pull_request: self.feature.draft_pull_request.clone(),
-                }))
-            }
+                })
+            } else {
+                state.clone()
+            }),
             PrReviewState::Done(_) | PrReviewState::Paused { .. } => Ok(state.clone()),
         }
     }
@@ -722,6 +721,12 @@ mod tests {
             directory: &Path,
         ) -> Result<(WorkspaceId, PaneId), PortError> {
             self.inner.create_workspace(directory).await
+        }
+        async fn find_workspace(
+            &self,
+            directory: &Path,
+        ) -> Result<Option<(WorkspaceId, Vec<PaneId>)>, PortError> {
+            self.inner.find_workspace(directory).await
         }
         async fn split_pane(
             &self,
@@ -973,7 +978,7 @@ mod tests {
     fn a_consumed_recovery_is_saved_before_the_relaunch() {
         let f = fixture(5, &[]);
         let pipeline = f.pipeline();
-        let reviewing = block_on(pipeline.step(pipeline.initial_state())).unwrap();
+        let reviewing = block_on(next_state(&pipeline, pipeline.initial_state()));
         assert_eq!(reviewing, PrReviewState::Reviewing { cycle: 1 });
         let environment = block_on(pipeline.load_environment(1)).unwrap();
         let pane = environment.pane(Role::Review).unwrap();
@@ -1139,13 +1144,13 @@ mod tests {
         let f = fixture(5, &[APPROVED]);
         // The close succeeds; the mark-ready fails once and is retried.
         let pipeline = f.pipeline();
-        let drive_to = |state: PrReviewState| block_on(pipeline.step(state)).unwrap();
+        let drive_to = |state: PrReviewState| block_on(next_state(&pipeline, state));
         let state = drive_to(drive_to(PrReviewState::Provisioning { cycle: 1 }));
         assert_eq!(state, PrReviewState::ClosingSpecification { cycle: 1 });
         let state = drive_to(state);
         assert_eq!(state, PrReviewState::MarkingReady { cycle: 1 });
         f.forge.fail_next(PortError::failed("rate limited"));
-        assert_eq!(drive_to(state.clone()), state);
+        assert_eq!(block_on(pipeline.step(state.clone())).unwrap(), state);
 
         assert_eq!(block_on(f.drive_resumed(state)), ready());
 
@@ -1195,16 +1200,7 @@ mod tests {
                 .record_effect_outcome(&run(), "review/close-specification", "done")
                 .await
                 .unwrap();
-            f.pipeline()
-                .environment
-                .provision(
-                    f.store.as_ref(),
-                    &run(),
-                    "review/environment/1",
-                    &f.pipeline().spec,
-                )
-                .await
-                .unwrap();
+            provision_first_review(&f).await;
         });
 
         assert_eq!(block_on(f.drive_resumed(state)), ready());
@@ -1220,10 +1216,7 @@ mod tests {
         let f = fixture(5, &[APPROVED]);
         let pipeline = f.pipeline();
         block_on(async {
-            let state = pipeline
-                .step(PrReviewState::Provisioning { cycle: 1 })
-                .await
-                .unwrap();
+            let state = next_state(&pipeline, PrReviewState::Provisioning { cycle: 1 }).await;
             assert_eq!(state, PrReviewState::Reviewing { cycle: 1 });
             let environment = pipeline.load_environment(1).await.unwrap();
             let pane = environment.pane(Role::Review).unwrap().clone();
@@ -1277,9 +1270,23 @@ mod tests {
                 &run(),
                 "review/environment/1",
                 &pipeline.spec,
+                &CommitId::new("c0").unwrap(),
             )
             .await
             .unwrap();
+    }
+
+    /// Steps until the state changes: provisioning and cleanup take one step per effect.
+    async fn next_state<I: Implement>(
+        pipeline: &PrReviewPipeline<I>,
+        state: PrReviewState,
+    ) -> PrReviewState {
+        loop {
+            let next = pipeline.step(state.clone()).await.unwrap();
+            if next != state {
+                return next;
+            }
+        }
     }
 
     #[test]
@@ -1298,12 +1305,17 @@ mod tests {
         let c1 = Some(CommitId::new("c1").unwrap());
 
         // A crash after the worktree was created and before it was moved.
-        block_on(provision_first_review(&f));
+        let created = block_on(f.pipeline().step(PrReviewState::Provisioning { cycle: 1 }));
+        assert_eq!(created.unwrap(), PrReviewState::Provisioning { cycle: 1 });
         assert_eq!(
             f.repository.worktree_head(worktree),
             Some(CommitId::new("c0").unwrap())
         );
-        let state = block_on(f.pipeline().step(PrReviewState::Provisioning { cycle: 1 })).unwrap();
+        let pipeline = f.pipeline();
+        let state = block_on(next_state(
+            &pipeline,
+            PrReviewState::Provisioning { cycle: 1 },
+        ));
         assert_eq!(state, PrReviewState::Reviewing { cycle: 1 });
         assert_eq!(f.repository.worktree_head(worktree), c1);
 
@@ -1316,7 +1328,7 @@ mod tests {
     fn a_fix_moves_the_next_review_worktree_to_the_new_head() {
         let f = fixture(5, &[FINDINGS, APPROVED]);
         let pipeline = f.pipeline();
-        let step = |state: PrReviewState| block_on(pipeline.step(state)).unwrap();
+        let step = |state: PrReviewState| block_on(next_state(&pipeline, state));
         let state = step(step(step(PrReviewState::Provisioning { cycle: 1 })));
         let state = step(step(state));
         assert_eq!(state, PrReviewState::Reviewing { cycle: 2 });
@@ -1549,7 +1561,13 @@ mod tests {
                 .await
                 .unwrap();
             fix.environment
-                .provision(f.store.as_ref(), &run(), "fix/environment", &fix.spec)
+                .provision(
+                    f.store.as_ref(),
+                    &run(),
+                    "fix/environment",
+                    &fix.spec,
+                    &CommitId::new("c0").unwrap(),
+                )
                 .await
                 .unwrap();
             f.store
