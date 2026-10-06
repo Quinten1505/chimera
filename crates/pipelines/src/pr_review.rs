@@ -44,11 +44,18 @@ pub enum PrReviewState {
     Refreshing {
         cycle: u32,
     },
+    /// Attempt `attempt` of closing the specification is recorded as the effect
+    /// `<instance>/close-specification/<attempt>`, so a restart knows whether it ran and how it
+    /// ended.
     ClosingSpecification {
         cycle: u32,
+        attempt: u32,
     },
+    /// Attempt `attempt` of marking the pull request ready is recorded as the effect
+    /// `<instance>/mark-ready/<attempt>`.
     MarkingReady {
         cycle: u32,
+        attempt: u32,
     },
     CleaningUp {
         cycle: u32,
@@ -231,6 +238,18 @@ enum TurnPhase {
     Relaunching,
 }
 
+/// Where a step of a forge effect left it.
+enum EffectStep {
+    Done,
+    /// The effect is to be continued with this attempt.
+    Attempt(u32),
+    Paused(PauseReason),
+}
+
+/// Outcomes of a forge effect's record.
+const DONE: &str = "done";
+const NOT_DONE: &str = "not done";
+
 fn paused(reason: PauseReason, resume_at: PrReviewState) -> PrReviewState {
     PrReviewState::Paused {
         reason,
@@ -367,7 +386,7 @@ impl<I: Implement> PrReviewPipeline<I> {
             }
         };
         Ok(match outcome {
-            Outcome::ReviewApproved(_) => PrReviewState::ClosingSpecification { cycle },
+            Outcome::ReviewApproved(_) => PrReviewState::ClosingSpecification { cycle, attempt: 1 },
             // The next review would exceed the limit, so the fix is not started.
             Outcome::ChangesRequested(findings) => {
                 let fixing = PrReviewState::Fixing { cycle, findings };
@@ -611,37 +630,70 @@ impl<I: Implement> PrReviewPipeline<I> {
             .await
     }
 
-    /// Performs a forge effect once per run: an effect that is recorded as done is skipped. One
-    /// whose outcome was not recorded may have been performed, so `reconcile` reads whether it
-    /// was before the effect is repeated.
-    async fn once(
+    /// Takes one step of forge effect `name` with attempt `attempt`. The attempt's intent is
+    /// recorded before the effect and its outcome after, so a completed effect is never
+    /// repeated: one that may have run is reconciled with `reconcile` first, and one that did
+    /// not happen is attempted again only with the policy's permission.
+    async fn effect_step(
         &self,
         name: &str,
+        attempt: u32,
         reconcile: impl Future<Output = Result<bool, PortError>>,
         effect: impl Future<Output = Result<(), PortError>>,
-    ) -> Result<(), PortError> {
-        let key = format!("{}/{name}", self.instance);
-        let effects = self.store.load_effects(&self.run).await?;
-        match effects.iter().find(|record| record.key == key) {
-            Some(record) if record.outcome.is_some() => return Ok(()),
-            Some(_) => {
-                if reconcile.await? {
-                    return self
-                        .store
-                        .record_effect_outcome(&self.run, &key, "done")
-                        .await;
+    ) -> Result<EffectStep, PipelineError> {
+        let key = format!("{}/{name}/{attempt}", self.instance);
+        let record = self
+            .store
+            .load_effects(&self.run)
+            .await?
+            .into_iter()
+            .find(|record| record.key == key);
+        let outcome = match record {
+            Some(record) => match record.outcome.as_deref() {
+                Some(DONE) => return Ok(EffectStep::Done),
+                Some(_) => {
+                    let failed = PortError::failed(format!("{name} did not happen"));
+                    return Ok(self.permit_github_retry(&failed, attempt + 1));
                 }
-            }
+                // The effect may have run: its outcome is read from the forge.
+                None => match reconcile.await {
+                    Ok(true) => DONE,
+                    Ok(false) => NOT_DONE,
+                    // A lookup has no effect; the next step repeats it.
+                    Err(error) => return Ok(self.permit_github_retry(&error, attempt)),
+                },
+            },
             None => {
                 self.store
                     .record_effect_intent(&self.run, &key, name)
-                    .await?
+                    .await?;
+                match effect.await {
+                    Ok(()) => DONE,
+                    Err(error) if error.is_failed() => NOT_DONE,
+                    // Reconciled by the next step.
+                    Err(_) => return Ok(EffectStep::Attempt(attempt)),
+                }
             }
-        }
-        effect.await?;
+        };
         self.store
-            .record_effect_outcome(&self.run, &key, "done")
-            .await
+            .record_effect_outcome(&self.run, &key, outcome)
+            .await?;
+        Ok(if outcome == DONE {
+            EffectStep::Done
+        } else {
+            EffectStep::Attempt(attempt)
+        })
+    }
+
+    /// Asks permission to repeat a GitHub call that failed with `error`, which is reconciled or
+    /// has no effect; once permitted, the call is made as attempt `attempt`. The policy is saved
+    /// by [`Pipeline::step`] before the state that carries the attempt.
+    fn permit_github_retry(&self, error: &PortError, attempt: u32) -> EffectStep {
+        match self.policy.permit_retry(Budget::GithubRetry, error, true) {
+            Ok(()) => EffectStep::Attempt(attempt),
+            Err(RetryRefused::Paused(reason)) => EffectStep::Paused(reason),
+            Err(RetryRefused::NeedsReconciliation) => unreachable!("the call is reconciled"),
+        }
     }
 
     async fn advance(&self, state: &PrReviewState) -> Result<PrReviewState, PipelineError> {
@@ -654,33 +706,55 @@ impl<I: Implement> PrReviewPipeline<I> {
             } else {
                 state.clone()
             }),
-            PrReviewState::ClosingSpecification { cycle } => {
-                self.once(
-                    "close-specification",
-                    async {
-                        let status = self.forge.issue_status(&self.feature.specification).await?;
-                        Ok(status == IssueStatus::Closed)
+            PrReviewState::ClosingSpecification { cycle, attempt } => {
+                let step = self
+                    .effect_step(
+                        "close-specification",
+                        *attempt,
+                        async {
+                            let status =
+                                self.forge.issue_status(&self.feature.specification).await?;
+                            Ok(status == IssueStatus::Closed)
+                        },
+                        self.forge.close_issue(&self.feature.specification),
+                    )
+                    .await?;
+                Ok(match step {
+                    EffectStep::Done => PrReviewState::MarkingReady {
+                        cycle: *cycle,
+                        attempt: 1,
                     },
-                    self.forge.close_issue(&self.feature.specification),
-                )
-                .await?;
-                Ok(PrReviewState::MarkingReady { cycle: *cycle })
+                    EffectStep::Attempt(attempt) => PrReviewState::ClosingSpecification {
+                        cycle: *cycle,
+                        attempt,
+                    },
+                    EffectStep::Paused(reason) => paused(reason, state.clone()),
+                })
             }
-            PrReviewState::MarkingReady { cycle } => {
-                self.once(
-                    "mark-ready",
-                    async {
-                        let draft = self
-                            .forge
-                            .pull_request_is_draft(&self.feature.draft_pull_request)
-                            .await?;
-                        Ok(!draft)
+            PrReviewState::MarkingReady { cycle, attempt } => {
+                let step = self
+                    .effect_step(
+                        "mark-ready",
+                        *attempt,
+                        async {
+                            let draft = self
+                                .forge
+                                .pull_request_is_draft(&self.feature.draft_pull_request)
+                                .await?;
+                            Ok(!draft)
+                        },
+                        self.forge
+                            .mark_pull_request_ready(&self.feature.draft_pull_request),
+                    )
+                    .await?;
+                Ok(match step {
+                    EffectStep::Done => PrReviewState::CleaningUp { cycle: *cycle },
+                    EffectStep::Attempt(attempt) => PrReviewState::MarkingReady {
+                        cycle: *cycle,
+                        attempt,
                     },
-                    self.forge
-                        .mark_pull_request_ready(&self.feature.draft_pull_request),
-                )
-                .await?;
-                Ok(PrReviewState::CleaningUp { cycle: *cycle })
+                    EffectStep::Paused(reason) => paused(reason, state.clone()),
+                })
             }
             PrReviewState::CleaningUp { cycle } => Ok(if self.clean_up(*cycle).await? {
                 PrReviewState::Done(PrReady {
@@ -757,9 +831,7 @@ impl<I: Implement> PrReviewPipeline<I> {
         })
     }
 
-    /// Pauses instead of acting while the run is paused. A failed forge effect is retried only
-    /// while the policy permits, otherwise the pipeline pauses; the retry reconciles the effect
-    /// first, so an uncertain one counts as reconciled.
+    /// Pauses instead of acting while the run is paused.
     async fn step_effect(&self, state: PrReviewState) -> Result<PrReviewState, PipelineError> {
         if let Err(reason) = self.policy.check_start() {
             return self.finish_started_turn(reason, state).await;
@@ -767,18 +839,6 @@ impl<I: Implement> PrReviewPipeline<I> {
         match self.advance(&state).await {
             Ok(next) => Ok(next),
             Err(PipelineError::Paused(reason)) => Ok(paused(reason, state)),
-            Err(PipelineError::Port(error))
-                if matches!(
-                    state,
-                    PrReviewState::ClosingSpecification { .. } | PrReviewState::MarkingReady { .. }
-                ) =>
-            {
-                match self.policy.permit_retry(Budget::GithubRetry, &error, true) {
-                    Ok(()) => Ok(state),
-                    Err(RetryRefused::Paused(reason)) => Ok(paused(reason, state)),
-                    Err(RetryRefused::NeedsReconciliation) => Err(error.into()),
-                }
-            }
             Err(error) => Err(error),
         }
     }
@@ -805,6 +865,7 @@ mod tests {
     use crate::driver::drive;
     use crate::environment::AgentLaunch;
     use crate::merge_lock::MergeLock;
+    use crate::test_support::CrashingStore;
 
     const APPROVED: &str = r#"{"ReviewApproved":"fine"}"#;
     const FINDINGS: &str = r#"{"ChangesRequested":"fix it"}"#;
@@ -1379,9 +1440,21 @@ mod tests {
         let pipeline = f.pipeline();
         let drive_to = |state: PrReviewState| block_on(next_state(&pipeline, state));
         let state = drive_to(drive_to(PrReviewState::Provisioning { cycle: 1 }));
-        assert_eq!(state, PrReviewState::ClosingSpecification { cycle: 1 });
+        assert_eq!(
+            state,
+            PrReviewState::ClosingSpecification {
+                cycle: 1,
+                attempt: 1
+            }
+        );
         let state = drive_to(state);
-        assert_eq!(state, PrReviewState::MarkingReady { cycle: 1 });
+        assert_eq!(
+            state,
+            PrReviewState::MarkingReady {
+                cycle: 1,
+                attempt: 1
+            }
+        );
         f.forge.fail_next(PortError::failed("rate limited"));
         assert_eq!(block_on(pipeline.step(state.clone())).unwrap(), state);
 
@@ -1422,15 +1495,22 @@ mod tests {
     #[test]
     fn restart_with_a_recorded_close_does_not_close_again() {
         let f = fixture(5, &[APPROVED]);
-        let state = PrReviewState::ClosingSpecification { cycle: 1 };
+        let state = PrReviewState::ClosingSpecification {
+            cycle: 1,
+            attempt: 1,
+        };
         // A previous process closed the issue but crashed before saving the next state.
         block_on(async {
             f.store
-                .record_effect_intent(&run(), "review/close-specification", "close-specification")
+                .record_effect_intent(
+                    &run(),
+                    "review/close-specification/1",
+                    "close-specification",
+                )
                 .await
                 .unwrap();
             f.store
-                .record_effect_outcome(&run(), "review/close-specification", "done")
+                .record_effect_outcome(&run(), "review/close-specification/1", "done")
                 .await
                 .unwrap();
             provision_first_review(&f).await;
@@ -1575,7 +1655,13 @@ mod tests {
     #[test]
     fn a_started_review_is_collected_while_paused_and_nothing_new_starts() {
         for (reply, after) in [
-            (APPROVED, PrReviewState::ClosingSpecification { cycle: 1 }),
+            (
+                APPROVED,
+                PrReviewState::ClosingSpecification {
+                    cycle: 1,
+                    attempt: 1,
+                },
+            ),
             (
                 FINDINGS,
                 PrReviewState::Fixing {
@@ -1742,12 +1828,19 @@ mod tests {
             provision_first_review(&f).await;
             f.forge.close_issue(&specification()).await.unwrap();
             f.store
-                .record_effect_intent(&run(), "review/close-specification", "close-specification")
+                .record_effect_intent(
+                    &run(),
+                    "review/close-specification/1",
+                    "close-specification",
+                )
                 .await
                 .unwrap();
         });
 
-        let state = PrReviewState::ClosingSpecification { cycle: 1 };
+        let state = PrReviewState::ClosingSpecification {
+            cycle: 1,
+            attempt: 1,
+        };
         assert_eq!(block_on(f.drive_resumed(state)), ready());
 
         assert_eq!(
@@ -1769,12 +1862,15 @@ mod tests {
                 .await
                 .unwrap();
             f.store
-                .record_effect_intent(&run(), "review/mark-ready", "mark-ready")
+                .record_effect_intent(&run(), "review/mark-ready/1", "mark-ready")
                 .await
                 .unwrap();
         });
 
-        let state = PrReviewState::MarkingReady { cycle: 1 };
+        let state = PrReviewState::MarkingReady {
+            cycle: 1,
+            attempt: 1,
+        };
         assert_eq!(block_on(f.drive_resumed(state)), ready());
 
         assert_eq!(
@@ -1789,12 +1885,19 @@ mod tests {
         block_on(async {
             provision_first_review(&f).await;
             f.store
-                .record_effect_intent(&run(), "review/close-specification", "close-specification")
+                .record_effect_intent(
+                    &run(),
+                    "review/close-specification/1",
+                    "close-specification",
+                )
                 .await
                 .unwrap();
         });
 
-        let state = PrReviewState::ClosingSpecification { cycle: 1 };
+        let state = PrReviewState::ClosingSpecification {
+            cycle: 1,
+            attempt: 1,
+        };
         assert_eq!(block_on(f.drive_resumed(state)), ready());
 
         assert_eq!(f.forge_effects().len(), 2);
@@ -1830,9 +1933,20 @@ mod tests {
         let f = fixture(5, &[APPROVED]);
         block_on(provision_first_review(&f));
         f.forge.fail_next(PortError::failed("rate limited"));
-        let state = PrReviewState::ClosingSpecification { cycle: 1 };
+        let state = PrReviewState::ClosingSpecification {
+            cycle: 1,
+            attempt: 1,
+        };
 
+        // The failure is recorded; the next step asks for the retry.
         assert_eq!(block_on(f.pipeline().step(state.clone())).unwrap(), state);
+        assert_eq!(
+            block_on(f.pipeline().step(state)).unwrap(),
+            PrReviewState::ClosingSpecification {
+                cycle: 1,
+                attempt: 2
+            }
+        );
 
         // A restart restores the budget that the retry consumed.
         assert_eq!(
@@ -1852,8 +1966,12 @@ mod tests {
         }));
         block_on(provision_first_review(&f));
         f.forge.fail_next(PortError::failed("rate limited"));
-        let state = PrReviewState::ClosingSpecification { cycle: 1 };
+        let state = PrReviewState::ClosingSpecification {
+            cycle: 1,
+            attempt: 1,
+        };
 
+        assert_eq!(block_on(f.pipeline().step(state.clone())).unwrap(), state);
         assert_eq!(
             block_on(f.pipeline().step(state.clone())).unwrap(),
             paused(PauseReason::GithubRetriesExhausted, state)
@@ -1863,6 +1981,182 @@ mod tests {
             block_on(saved_policy(&f)).check_start(),
             Err(PauseReason::GithubRetriesExhausted)
         );
+    }
+
+    fn without_github_retries(f: &mut Fixture) {
+        f.policy = Arc::new(Policy::new(&Limits {
+            github_retries: 0,
+            ..Limits::default()
+        }));
+    }
+
+    #[test]
+    fn a_close_that_happened_with_a_lost_response_is_reconciled_without_a_retry() {
+        let mut f = fixture(5, &[APPROVED]);
+        without_github_retries(&mut f);
+        block_on(async {
+            provision_first_review(&f).await;
+            // The close lands, but its response is lost.
+            f.forge.close_issue(&specification()).await.unwrap();
+        });
+        f.forge.fail_next(PortError::uncertain("lost"));
+        let state = PrReviewState::ClosingSpecification {
+            cycle: 1,
+            attempt: 1,
+        };
+
+        assert_eq!(block_on(f.drive_resumed(state)), ready());
+
+        assert_eq!(
+            f.forge_effects(),
+            vec![
+                ForgeCall::CloseIssue(specification()),
+                ForgeCall::CloseIssue(specification()),
+                ForgeCall::MarkPullRequestReady(pull_request())
+            ]
+        );
+        assert_eq!(block_on(saved_policy(&f)).check_start(), Ok(()));
+    }
+
+    #[test]
+    fn a_mark_ready_that_happened_with_a_lost_response_is_reconciled_without_a_retry() {
+        let mut f = fixture(5, &[APPROVED]);
+        without_github_retries(&mut f);
+        block_on(async {
+            provision_first_review(&f).await;
+            f.forge
+                .mark_pull_request_ready(&pull_request())
+                .await
+                .unwrap();
+        });
+        f.forge.fail_next(PortError::uncertain("lost"));
+        let state = PrReviewState::MarkingReady {
+            cycle: 1,
+            attempt: 1,
+        };
+
+        assert_eq!(block_on(f.drive_resumed(state)), ready());
+
+        assert_eq!(
+            f.forge_effects(),
+            vec![
+                ForgeCall::MarkPullRequestReady(pull_request()),
+                ForgeCall::MarkPullRequestReady(pull_request())
+            ]
+        );
+        assert_eq!(block_on(saved_policy(&f)).check_start(), Ok(()));
+    }
+
+    #[test]
+    fn an_effect_that_did_not_happen_is_repeated_only_with_a_permit() {
+        for (state, call) in [
+            (
+                PrReviewState::ClosingSpecification {
+                    cycle: 1,
+                    attempt: 1,
+                },
+                ForgeCall::CloseIssue(specification()),
+            ),
+            (
+                PrReviewState::MarkingReady {
+                    cycle: 1,
+                    attempt: 1,
+                },
+                ForgeCall::MarkPullRequestReady(pull_request()),
+            ),
+        ] {
+            // Lost before it ran.
+            let mut f = fixture(5, &[APPROVED]);
+            without_github_retries(&mut f);
+            block_on(provision_first_review(&f));
+            f.forge.fail_next(PortError::uncertain("lost"));
+
+            assert_eq!(
+                block_on(f.drive_resumed(state.clone())),
+                paused(PauseReason::GithubRetriesExhausted, state.clone())
+            );
+            assert_eq!(f.forge_effects(), vec![call.clone()]);
+
+            // A restart with only the intent recorded reads the outcome before repeating it.
+            let mut f = fixture(5, &[APPROVED]);
+            without_github_retries(&mut f);
+            let name = match &state {
+                PrReviewState::ClosingSpecification { .. } => "close-specification",
+                _ => "mark-ready",
+            };
+            block_on(async {
+                provision_first_review(&f).await;
+                f.store
+                    .record_effect_intent(&run(), &format!("review/{name}/1"), name)
+                    .await
+                    .unwrap();
+            });
+
+            assert_eq!(
+                block_on(f.drive_resumed(state.clone())),
+                paused(PauseReason::GithubRetriesExhausted, state)
+            );
+            assert!(f.forge_effects().is_empty());
+            assert_eq!(
+                block_on(saved_policy(&f)).check_start(),
+                Err(PauseReason::GithubRetriesExhausted)
+            );
+        }
+    }
+
+    /// A pipeline that keeps its effects and policy in `store`, the policy restored from it as
+    /// after a restart.
+    fn restarted_on(f: &Fixture, store: &Arc<CrashingStore>) -> PrReviewPipeline<Shared> {
+        let mut pipeline = f.pipeline();
+        let limits = Limits {
+            github_retries: 0,
+            ..Limits::default()
+        };
+        pipeline.policy =
+            Arc::new(block_on(Policy::load_or_new(store.as_ref(), &run(), &limits)).unwrap());
+        pipeline.store = store.clone();
+        pipeline
+    }
+
+    #[test]
+    fn a_crash_before_a_failure_or_its_permit_is_saved_never_repeats_the_effect_unpermitted() {
+        let state = PrReviewState::ClosingSpecification {
+            cycle: 1,
+            attempt: 1,
+        };
+        // Writes of the failing close: intent 1, outcome 2; the next step saves the policy at 3.
+        for crash_at in [2, 3] {
+            let f = fixture(5, &[APPROVED]);
+            let store = Arc::new(CrashingStore::default());
+            store.crash_at(Some(crash_at));
+            f.forge.fail_next(PortError::failed("rate limited"));
+            let mut step = |state: PrReviewState| block_on(restarted_on(&f, &store).step(state));
+            let mut state = state.clone();
+            while let Ok(next) = step(state.clone()) {
+                state = next;
+            }
+            assert_eq!(store.writes(), crash_at);
+
+            // After the restart the close is not repeated without a permit.
+            store.crash_at(None);
+            while !state.is_paused() {
+                state = step(state).unwrap();
+            }
+            assert_eq!(
+                state,
+                paused(
+                    PauseReason::GithubRetriesExhausted,
+                    PrReviewState::ClosingSpecification {
+                        cycle: 1,
+                        attempt: 1
+                    }
+                )
+            );
+            assert_eq!(
+                f.forge_effects(),
+                vec![ForgeCall::CloseIssue(specification())]
+            );
+        }
     }
 
     /// An outer pipeline whose fix is the real Implementation pipeline, saved as paused in the
