@@ -5,8 +5,10 @@
 
 mod driver;
 mod error;
+mod merge_lock;
 mod policy;
 
 pub use driver::{Pipeline, PipelineState, drive};
 pub use error::{PauseReason, PipelineError};
+pub use merge_lock::{MergeLock, Sequence};
 pub use policy::{Budget, Policy, PolicyState, RetryRefused};
