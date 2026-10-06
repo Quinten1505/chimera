@@ -197,6 +197,12 @@ impl ImplementationPipeline {
                     Err(error) => return Ok(Err(error)),
                 }
             };
+            // Only a confirmed delivery means the merge agent may have pushed. An intent to send
+            // that never arrived starts a fresh merge, so the branch must still be where Chimera
+            // left it; the turn stays saved so the step reconciles it again once resumed.
+            if !delivered && !created && request.role == Role::Merge {
+                self.check_remote_unchanged().await?;
+            }
             if !delivered && let Err(error) = self.turns.send_assignment(request).await {
                 // A definite failure means nothing was delivered.
                 if !matches!(&error, TurnError::Port(port) if port.is_uncertain()) {
@@ -528,7 +534,8 @@ impl ImplementationPipeline {
             valid.last().expect("a valid turn was saved").1.clone()
         } else {
             // A merge agent that already started may have pushed: verification judges its push.
-            // Before a fresh assignment the branch must still be where Chimera left it.
+            // Before a fresh assignment the branch must still be where Chimera left it; a started
+            // turn whose assignment never arrived is checked the same way before it is sent.
             if role == Role::Merge && started.is_none() {
                 self.check_remote_unchanged().await?;
             }
@@ -2605,6 +2612,90 @@ mod tests {
         );
         assert_eq!(f.policy.check_start(), Ok(()));
         assert!(assignments(&f.prompts(Role::Merge).await, "merger").is_empty());
+        assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c1"));
+    }
+
+    /// Holds the lock in `Merging { attempt: 1 }` with the merge assignment saved as `Sending`,
+    /// as a crash before or after its delivery leaves it.
+    async fn merge_saved_as_sending(f: &Fixture) {
+        ready_to_merge(f, &[], &[]).await;
+        f.pipeline
+            .step(ImplementationState::WaitingForMerge)
+            .await
+            .unwrap();
+        let pane = f.pane(Role::Merge).await;
+        let pending = Pending {
+            turn: Some(PendingTurn {
+                role: Role::Merge,
+                cycle: 1,
+                received_before: f.terminal.prompts_received(&pane).await.unwrap(),
+                invalid_before: 0,
+                valid_before: 2,
+                corrections: 0,
+                phase: TurnPhase::Sending,
+            }),
+            ..Pending::default()
+        };
+        f.pipeline.save_pending(&pending).await.unwrap();
+        save_state(f, ImplementationState::Merging { attempt: 1 }).await;
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_merge_assignment_is_not_sent_after_a_remote_change_while_down() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        merge_saved_as_sending(&f).await;
+        // The assignment never arrived; somebody else pushed c9 while Chimera was down.
+        f.repository.set_remote_head(feature(), commit("c9"));
+        f.push_on_merge(commit("c10"));
+
+        let error = f.drive_through().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Paused(PauseReason::UnexpectedRemoteChange)
+        ));
+        assert!(assignments(&f.prompts(Role::Merge).await, "merger").is_empty());
+        assert_eq!(holder(&f), Some("t31".into()));
+        assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c0"));
+        let restarted = Policy::load_or_new(f.store.as_ref(), &f.pipeline.run, &Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.check_start(),
+            Err(PauseReason::UnexpectedRemoteChange)
+        );
+        // The intent stays saved, so a resumed run reconciles it again before sending.
+        let pending = f.pipeline.load_pending().await.unwrap();
+        assert_eq!(
+            pending.turn.map(|turn| turn.phase),
+            Some(TurnPhase::Sending)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivered_merge_assignment_saved_as_sending_keeps_its_own_push_across_a_restart() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        merge_saved_as_sending(&f).await;
+        // The assignment arrived; the agent pushed c1 and reported it while Chimera was down.
+        let pane = f.pane(Role::Merge).await;
+        f.terminal
+            .send_prompt(&pane, "You are merger.")
+            .await
+            .unwrap();
+        show(&f, Role::Merge, MERGED).await;
+        f.repository.set_remote_head(feature(), commit("c1"));
+
+        assert_eq!(
+            f.drive_through().await.unwrap(),
+            ImplementationState::Done(MergedOk {
+                commit: commit("c1")
+            })
+        );
+        assert_eq!(f.policy.check_start(), Ok(()));
+        assert_eq!(
+            assignments(&f.prompts(Role::Merge).await, "merger").len(),
+            1
+        );
         assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c1"));
     }
 
