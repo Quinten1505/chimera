@@ -200,3 +200,58 @@ async fn pipeline_ids_with_separators_and_reserved_looking_names_do_not_collide(
     assert_eq!(store.load_effects(&id).await.unwrap().len(), 1);
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
+
+/// The bytes of the entry that appending `turn` after `before` adds to `history.md`.
+async fn entry_bytes(turn: &TurnResult, before: &[TurnResult]) -> Vec<u8> {
+    let root = tempfile::tempdir().unwrap();
+    let store = open(&root);
+    for t in before.iter().chain([turn]) {
+        store.append_turn(&run(), t.clone()).await.unwrap();
+    }
+    std::fs::read(root.path().join("run-1/history.md")).unwrap()
+}
+
+#[tokio::test]
+async fn append_interrupted_at_any_byte_is_not_loaded_and_later_appends_are() {
+    let committed = [turn("first")];
+    // Fenced output with its own backticks, and multibyte characters in every field.
+    let torn = TurnResult {
+        agent: AgentId::new("a3").unwrap(),
+        role: Role::Implementation,
+        outcome: TurnOutcome::Invalid {
+            output: "h\u{e9}llo \u{1F600}\n```\n## fake\n\u{4e2d}\u{6587}".into(),
+            problem: "pr\u{f6}blem \u{1F980}".into(),
+        },
+    };
+    let prefix = entry_bytes(&committed[0], &[]).await;
+    let full = entry_bytes(&torn, &committed).await;
+    assert!(full.starts_with(&prefix));
+    let tail = &full[prefix.len()..];
+
+    for cut in 0..tail.len() {
+        let root = tempfile::tempdir().unwrap();
+        let id = run();
+        std::fs::create_dir_all(root.path().join("run-1")).unwrap();
+        let mut bytes = prefix.clone();
+        bytes.extend_from_slice(&tail[..cut]);
+        std::fs::write(root.path().join("run-1/history.md"), bytes).unwrap();
+
+        let store = open(&root);
+        assert_eq!(
+            store.load_history(&id).await.unwrap(),
+            committed,
+            "cut {cut}"
+        );
+        // The interrupted append is retried, then another turn follows.
+        store.append_turn(&id, torn.clone()).await.unwrap();
+        store.append_turn(&id, turn("last")).await.unwrap();
+        drop(store);
+
+        let expected = [committed[0].clone(), torn.clone(), turn("last")];
+        assert_eq!(
+            open(&root).load_history(&id).await.unwrap(),
+            expected,
+            "cut {cut}"
+        );
+    }
+}

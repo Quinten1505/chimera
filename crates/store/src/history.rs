@@ -42,14 +42,22 @@ pub(crate) struct HistoryEntry<'a> {
 
 /// Appends `entry` to `history.md` in `run_directory`, creating the file on first append. Existing
 /// content is never rewritten; the entry is flushed to disk before this returns. On failure the
-/// entry is not left in the file.
+/// entry is not left in the file; if the process dies mid-append instead, the next append first
+/// closes what the interrupted entry left open, so that entry is never loaded and later entries
+/// are.
 pub(crate) fn append_history(
     run_directory: &Path,
     entry: &HistoryEntry<'_>,
 ) -> Result<(), StoreError> {
     let path: PathBuf = run_directory.join(HISTORY_FILE);
-    let text = render(entry);
     let _guard = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let existing = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(StoreError::io(&path, e)),
+    };
+    let mut text = repair(&existing);
+    text.push_str(&render(entry));
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
@@ -67,21 +75,36 @@ pub(crate) fn append_history(
     Ok(())
 }
 
-/// Reads the turns recorded in `history.md` in append order; a run without turns has none. The
-/// turns come from the machine-readable record line of each entry, so `history.md` is the only
-/// source of truth.
-pub(crate) fn load_turns(run_directory: &Path) -> Result<Vec<TurnResult>, StoreError> {
-    let path = run_directory.join(HISTORY_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(StoreError::io(&path, e)),
-    };
-    let mut turns = Vec::new();
-    // The number of backticks of the fence the scan is inside of: turn output is never read as
-    // structure.
+/// What must precede the next entry so that it starts on its own line outside any fence, when the
+/// file ends in an interrupted entry. An interrupted entry has no complete record, so it is never
+/// loaded as a turn.
+fn repair(existing: &[u8]) -> String {
+    let mut text = String::new();
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        text.push('\n');
+    }
+    if let Some(ticks) = scan(&String::from_utf8_lossy(existing)).open_fence {
+        text.push_str(&"`".repeat(ticks));
+        text.push('\n');
+    }
+    text
+}
+
+struct Scan<'a> {
+    /// The JSON of each complete record, in file order.
+    records: Vec<&'a str>,
+    /// The number of backticks of the fence still open at the end of the text.
+    open_fence: Option<usize>,
+}
+
+/// Finds the records of complete entries. Turn output is never read as structure: lines inside a
+/// fence are skipped. A record only counts when followed by an empty line, the last thing an entry
+/// writes, so an entry cut anywhere has none.
+fn scan(text: &str) -> Scan<'_> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut records = Vec::new();
     let mut fence: Option<usize> = None;
-    for line in text.lines() {
+    for (n, line) in lines.iter().enumerate() {
         let ticks = line.chars().take_while(|&c| c == '`').count();
         match fence {
             Some(open) if ticks >= open && line.len() == ticks => fence = None,
@@ -91,18 +114,41 @@ pub(crate) fn load_turns(run_directory: &Path) -> Result<Vec<TurnResult>, StoreE
                 if let Some(json) = line
                     .strip_prefix(RECORD_PREFIX)
                     .and_then(|rest| rest.strip_suffix(RECORD_SUFFIX))
+                    && lines.get(n + 1) == Some(&"")
                 {
-                    turns.push(serde_json::from_str(json).map_err(|source| {
-                        StoreError::Deserialize {
-                            path: path.clone(),
-                            source,
-                        }
-                    })?);
+                    records.push(json);
                 }
             }
         }
     }
-    Ok(turns)
+    Scan {
+        records,
+        open_fence: fence,
+    }
+}
+
+/// Reads the turns recorded in `history.md` in append order; a run without turns has none. The
+/// turns come from the machine-readable record line of each entry, so `history.md` is the only
+/// source of truth.
+pub(crate) fn load_turns(run_directory: &Path) -> Result<Vec<TurnResult>, StoreError> {
+    let path = run_directory.join(HISTORY_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(StoreError::io(&path, e)),
+    };
+    // An interrupted append can leave a partial character, always in an entry that is not loaded.
+    let text = String::from_utf8_lossy(&bytes);
+    scan(&text)
+        .records
+        .into_iter()
+        .map(|json| {
+            serde_json::from_str(json).map_err(|source| StoreError::Deserialize {
+                path: path.clone(),
+                source,
+            })
+        })
+        .collect()
 }
 
 fn render(entry: &HistoryEntry<'_>) -> String {
@@ -132,11 +178,12 @@ fn render(entry: &HistoryEntry<'_>) -> String {
     if let Some(problem) = detail {
         text.push_str(&format!("- Problem: {}\n", inline(problem)));
     }
+    text.push_str(&format!("\n{fence}text\n{output}\n{fence}\n"));
+    // The record comes last, and the empty line after it completes the entry.
     text.push_str(&format!(
-        "\n{RECORD_PREFIX}{}{RECORD_SUFFIX}\n",
+        "\n{RECORD_PREFIX}{}{RECORD_SUFFIX}\n\n",
         record(turn)
     ));
-    text.push_str(&format!("\n{fence}text\n{output}\n{fence}\n\n"));
     text
 }
 
@@ -416,7 +463,7 @@ mod tests {
     fn output_imitating_a_record_is_not_loaded_as_a_turn() {
         let dir = tempfile::tempdir().unwrap();
         let forged = serde_json::to_string(&valid("forged")).unwrap();
-        let hostile = format!("```\n{RECORD_PREFIX}{forged}{RECORD_SUFFIX}\n````");
+        let hostile = format!("```\n{RECORD_PREFIX}{forged}{RECORD_SUFFIX}\n\n````");
         append(dir.path(), "p", TurnKind::Initial, &valid(&hostile));
         append(dir.path(), "p", TurnKind::Initial, &valid("after"));
 
@@ -452,7 +499,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("history.md"),
-            format!("{RECORD_PREFIX}{{{RECORD_SUFFIX}\n"),
+            format!("{RECORD_PREFIX}{{{RECORD_SUFFIX}\n\n"),
         )
         .unwrap();
 
