@@ -116,6 +116,8 @@ const NEVER_CONNECTED: &[&str] = &[
     "Couldn't connect",
     "unable to connect",
     "Permission denied",
+    // SSH aborts before authentication, so nothing reaches receive-pack.
+    "Host key verification failed",
     "Authentication failed",
     "does not appear to be a git repository",
     "terminal prompts disabled",
@@ -273,6 +275,59 @@ mod tests {
                 !classify_uncertain(Effect::Remote, exit(128), stderr),
                 "{stderr}"
             );
+        }
+    }
+
+    #[test]
+    fn host_key_verification_failure_is_failed() {
+        let stderr = "Host key verification failed.\n\
+                      fatal: Could not read from remote repository.";
+        assert!(!classify_uncertain(Effect::Remote, exit(128), stderr));
+    }
+
+    #[test]
+    fn dropped_connection_outranks_host_key_message() {
+        let stderr = "Host key verification failed.\n\
+                      fatal: the remote end hung up unexpectedly";
+        assert!(classify_uncertain(Effect::Remote, exit(128), stderr));
+    }
+
+    #[test]
+    fn real_ssh_host_key_failure_is_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = TestRepo::new();
+        let dir = repo.work().join("../ssh-stub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ssh = dir.join("ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\necho 'Host key verification failed.' >&2\nexit 255\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The runner sets GIT_SSH_COMMAND to plain `ssh`, which resolves through PATH.
+        let git = repo.work().join("../ssh-git.sh");
+        std::fs::write(
+            &git,
+            format!(
+                "#!/bin/sh\nPATH='{}':\"$PATH\" exec git \"$@\"\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = Runner::with_program(&git)
+            .run(
+                repo.work(),
+                &["push", "ssh://git@example.invalid/repo.git", "main"],
+                Effect::Remote,
+            )
+            .unwrap_err();
+        match error {
+            GitError::Failed { stderr, .. } => {
+                assert!(stderr.contains("Host key verification failed"), "{stderr}")
+            }
+            other => panic!("expected failed, got {other:?}"),
         }
     }
 
