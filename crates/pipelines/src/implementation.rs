@@ -502,6 +502,11 @@ impl ImplementationPipeline {
             }
             valid.last().expect("a valid turn was saved").1.clone()
         } else {
+            // A merge agent that already started may have pushed: verification judges its push.
+            // Before a fresh assignment the branch must still be where Chimera left it.
+            if role == Role::Merge && started.is_none() {
+                self.check_remote_unchanged().await?;
+            }
             let total_invalid = history
                 .iter()
                 .filter(|turn| matches!(turn.outcome, TurnOutcome::Invalid { .. }))
@@ -574,6 +579,20 @@ impl ImplementationPipeline {
                 None => self.initial_remote_head.clone(),
             },
         )
+    }
+
+    /// Fails unless the remote feature branch is still at the expected head. A change nobody on
+    /// this run pushed, or the branch being gone, pauses the whole run; the pause is saved here,
+    /// as the driver saves no policy, and the step is repeated once the run is resumed.
+    async fn check_remote_unchanged(&self) -> Result<(), PipelineError> {
+        let expected = self.expected_head().await?;
+        let actual = self.repository.remote_head(&self.spec.feature).await?;
+        if actual.as_ref() == Some(&expected) {
+            return Ok(());
+        }
+        self.policy.pause(PauseReason::UnexpectedRemoteChange);
+        self.policy.save(self.store.as_ref(), &self.run).await?;
+        Err(PipelineError::Paused(PauseReason::UnexpectedRemoteChange))
     }
 
     /// Checks the pushed commit through the repository instead of trusting the merge agent, then
@@ -867,6 +886,8 @@ mod tests {
         sent: Mutex<HashMap<PaneId, Vec<String>>>,
         /// Fails the next launch, as a lost connection would.
         fail_launch: Mutex<Option<PortError>>,
+        /// Moves the remote feature branch when the merge agent next reports a push.
+        push: Mutex<Option<(Arc<FakeRepository>, CommitId)>>,
     }
 
     #[async_trait]
@@ -919,6 +940,11 @@ mod tests {
                     .and_then(VecDeque::pop_front)
             };
             if let Some(reply) = reply {
+                if reply.contains("MergeSuccessful")
+                    && let Some((repository, commit)) = self.push.lock().unwrap().take()
+                {
+                    repository.set_remote_head(BranchName::new("feat").unwrap(), commit);
+                }
                 self.inner.script_output(pane, reply);
                 self.inner.script_statuses(pane, [TurnStatus::Finished]);
             }
@@ -1008,6 +1034,7 @@ mod tests {
             fail_correction_after_send: Mutex::default(),
             sent: Mutex::default(),
             fail_launch: Mutex::default(),
+            push: Mutex::default(),
         });
         let store = other.map_or_else(|| Arc::new(FakeRunStore::new()), |f| f.store.clone());
         let policy = other.map_or_else(
@@ -1143,6 +1170,11 @@ mod tests {
                 .entry(pane)
                 .or_default()
                 .extend(replies.iter().map(|r| r.to_string()));
+        }
+
+        /// The merge agent pushes `commit` when it next reports `MergeSuccessful`.
+        fn push_on_merge(&self, commit: CommitId) {
+            *self.terminal.push.lock().unwrap() = Some((self.repository.clone(), commit));
         }
 
         async fn prompts(&self, role: Role) -> Vec<String> {
@@ -1933,7 +1965,7 @@ mod tests {
     async fn a_clean_merge_is_verified_without_another_review() {
         let f = fixture(WorkItem::Ticket(ticket()), 5);
         ready_to_merge(&f, &[MERGED], &[]).await;
-        f.repository.set_remote_head(feature(), commit("c1"));
+        f.push_on_merge(commit("c1"));
 
         assert_eq!(
             f.drive_through().await.unwrap(),
@@ -1973,7 +2005,7 @@ mod tests {
     async fn a_task_started_after_a_merge_works_on_the_merged_head() {
         let a = fixture(WorkItem::Ticket(ticket()), 5);
         ready_to_merge(&a, &[MERGED], &[]).await;
-        a.repository.set_remote_head(feature(), commit("c1"));
+        a.push_on_merge(commit("c1"));
         a.drive_through().await.unwrap();
 
         // A dependent ticket and a findings fix start after the merge; the local feature branch
@@ -2058,7 +2090,7 @@ mod tests {
     async fn conflict_review_corrections_return_to_the_merge_agent_which_keeps_the_lock() {
         let f = fixture(WorkItem::Ticket(ticket()), 5);
         ready_to_merge(&f, &[CONFLICTS, MERGED], &[CHANGES]).await;
-        f.repository.set_remote_head(feature(), commit("c1"));
+        f.push_on_merge(commit("c1"));
 
         let mut state = f
             .pipeline
@@ -2115,7 +2147,7 @@ mod tests {
         assert_eq!(holder(&f), Some("t31".into()));
         assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c0"));
 
-        f.repository.set_remote_head(feature(), commit("c1"));
+        f.push_on_merge(commit("c1"));
         state = f.pipeline.step(state).await.unwrap();
         assert_eq!(state, ImplementationState::Verifying { attempt: 2 });
         state = f.pipeline.step(state).await.unwrap();
@@ -2151,7 +2183,7 @@ mod tests {
         let f = fixture(WorkItem::Ticket(ticket()), 5);
         ready_to_merge(&f, &[MERGED], &[]).await;
         // Somebody else moved the branch; it is not the commit the agent reported.
-        f.repository.set_remote_head(feature(), commit("c9"));
+        f.push_on_merge(commit("c9"));
 
         let error = f.drive_through().await.unwrap_err();
 
@@ -2165,6 +2197,80 @@ mod tests {
         );
         assert_eq!(holder(&f), Some("t31".into()));
         assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c0"));
+    }
+
+    #[tokio::test]
+    async fn a_remote_change_before_the_merge_assignment_pauses_the_run_and_keeps_the_lock() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[r#"{"MergeSuccessful":"c2 pushed"}"#], &[]).await;
+        f.push_on_merge(commit("c2"));
+        // Somebody else pushed c9 before this task got the lock.
+        f.repository.set_remote_head(feature(), commit("c9"));
+
+        let error = f.drive_through().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Paused(PauseReason::UnexpectedRemoteChange)
+        ));
+        assert!(assignments(&f.prompts(Role::Merge).await, "merger").is_empty());
+        assert_eq!(holder(&f), Some("t31".into()));
+        assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c0"));
+        let restarted = Policy::load_or_new(f.store.as_ref(), &f.pipeline.run, &Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.check_start(),
+            Err(PauseReason::UnexpectedRemoteChange)
+        );
+        // The task resumes from the merge it has not started.
+        let saved = f
+            .store
+            .load_pipeline_state(&f.pipeline.run, &f.pipeline.instance)
+            .await
+            .unwrap();
+        assert_eq!(
+            saved,
+            Some(serde_json::to_value(ImplementationState::Merging { attempt: 1 }).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_started_merge_keeps_its_own_push_across_a_restart() {
+        let f = fixture(WorkItem::Ticket(ticket()), 5);
+        ready_to_merge(&f, &[], &[]).await;
+        f.pipeline
+            .step(ImplementationState::WaitingForMerge)
+            .await
+            .unwrap();
+        // The assignment was delivered; the agent pushed c1 and reported it while Chimera was
+        // down.
+        let pending = Pending {
+            turn: Some(PendingTurn {
+                role: Role::Merge,
+                cycle: 1,
+                output_before: String::new(),
+                invalid_before: 0,
+                valid_before: 2,
+                corrections: 0,
+                phase: TurnPhase::Awaiting,
+            }),
+            ..Pending::default()
+        };
+        f.pipeline.save_pending(&pending).await.unwrap();
+        show(&f, Role::Merge, MERGED).await;
+        f.repository.set_remote_head(feature(), commit("c1"));
+        save_state(&f, ImplementationState::Merging { attempt: 1 }).await;
+
+        assert_eq!(
+            f.drive_through().await.unwrap(),
+            ImplementationState::Done(MergedOk {
+                commit: commit("c1")
+            })
+        );
+        assert_eq!(f.policy.check_start(), Ok(()));
+        assert!(assignments(&f.prompts(Role::Merge).await, "merger").is_empty());
+        assert_eq!(f.pipeline.expected_head().await.unwrap(), commit("c1"));
     }
 
     #[tokio::test]
@@ -2198,7 +2304,7 @@ mod tests {
         let b = fixture_for(WorkItem::Ticket(ticket()), 5, "t32", Some(&a));
         let merged_c2 = r#"{"MergeSuccessful":"c2 pushed"}"#;
         ready_to_merge(&b, &[merged_c2], &[]).await;
-        a.repository.set_remote_head(feature(), commit("c1"));
+        a.push_on_merge(commit("c1"));
 
         // B queues behind A, which takes the lock.
         a.pipeline
@@ -2223,7 +2329,7 @@ mod tests {
         // Releasing hands the lock straight to B.
         assert_eq!(holder(&a), Some("t32".into()));
 
-        b.repository.set_remote_head(feature(), commit("c2"));
+        b.push_on_merge(commit("c2"));
         assert_eq!(
             b.drive_through().await.unwrap(),
             ImplementationState::Done(MergedOk {
@@ -2249,7 +2355,7 @@ mod tests {
         for crashed in 0..sequence.len() {
             let f = fixture(WorkItem::Ticket(ticket()), 5);
             ready_to_merge(&f, &[CONFLICTS, MERGED], &[APPROVED]).await;
-            f.repository.set_remote_head(feature(), commit("c1"));
+            f.push_on_merge(commit("c1"));
             // Every step up to `crashed` ran, but the state it returned was not saved.
             for (state, next) in sequence[..=crashed].iter().zip(&sequence[1..]) {
                 assert_eq!(&f.pipeline.step(state.clone()).await.unwrap(), next);
@@ -2294,7 +2400,7 @@ mod tests {
     async fn an_explanation_may_continue_after_the_pushed_commit() {
         let f = fixture(WorkItem::Ticket(ticket()), 5);
         ready_to_merge(&f, &[r#"{"MergeSuccessful":"c1 tests passed"}"#], &[]).await;
-        f.repository.set_remote_head(feature(), commit("c1"));
+        f.push_on_merge(commit("c1"));
 
         assert_eq!(
             f.drive_through().await.unwrap(),
@@ -2315,7 +2421,7 @@ mod tests {
             let f = fixture(WorkItem::Ticket(ticket()), 5);
             let reply = format!(r#"{{"MergeSuccessful":"{text}"}}"#);
             ready_to_merge(&f, &[&reply], &[]).await;
-            f.repository.set_remote_head(feature(), commit("c9"));
+            f.push_on_merge(commit("c9"));
 
             let error = f.drive_through().await.unwrap_err();
 
@@ -2340,7 +2446,7 @@ mod tests {
             &[],
         )
         .await;
-        f.repository.set_remote_head(feature(), commit("c1"));
+        f.push_on_merge(commit("c1"));
 
         assert_eq!(
             f.drive_through().await.unwrap(),
@@ -2360,7 +2466,7 @@ mod tests {
             let f = fixture(WorkItem::Ticket(ticket()), 5);
             let invalid = format!(r#"{{"MergeSuccessful":"{missing}"}}"#);
             ready_to_merge(&f, &[&invalid, MERGED], &[]).await;
-            f.repository.set_remote_head(feature(), commit("c1"));
+            f.push_on_merge(commit("c1"));
 
             assert_eq!(
                 f.drive_through().await.unwrap(),
@@ -2383,7 +2489,7 @@ mod tests {
     async fn a_success_that_stays_without_a_commit_pauses_with_the_limit_and_keeps_the_lock() {
         let f = fixture(WorkItem::Ticket(ticket()), 5);
         ready_to_merge(&f, &[r#"{"MergeSuccessful":"merged"}"#; 6], &[]).await;
-        f.repository.set_remote_head(feature(), commit("c1"));
+        f.push_on_merge(commit("c1"));
 
         let state = f.drive_through().await.unwrap();
 
@@ -2405,7 +2511,7 @@ mod tests {
     async fn the_unexpected_change_pause_survives_a_restart() {
         let f = fixture(WorkItem::Ticket(ticket()), 5);
         ready_to_merge(&f, &[MERGED], &[]).await;
-        f.repository.set_remote_head(feature(), commit("c9"));
+        f.push_on_merge(commit("c9"));
 
         f.drive_through().await.unwrap_err();
 
@@ -2444,7 +2550,7 @@ mod tests {
         ready_to_merge(&a, &[MERGED], &[]).await;
         let b = fixture_for(WorkItem::Ticket(ticket()), 5, "t32", Some(&a));
         ready_to_merge(&b, &[r#"{"MergeSuccessful":"c2 pushed"}"#], &[]).await;
-        a.repository.set_remote_head(feature(), commit("c1"));
+        a.push_on_merge(commit("c1"));
         a.pipeline
             .step(ImplementationState::WaitingForMerge)
             .await
@@ -2464,7 +2570,7 @@ mod tests {
 
         // B merges c2 while A is down.
         save_state(&b, merging).await;
-        b.repository.set_remote_head(feature(), commit("c2"));
+        b.push_on_merge(commit("c2"));
         b.drive_through().await.unwrap();
         assert_eq!(b.pipeline.expected_head().await.unwrap(), commit("c2"));
 
