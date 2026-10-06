@@ -222,6 +222,65 @@ impl fmt::Display for IssueRef {
     }
 }
 
+/// Whether a GitHub issue is open or closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IssueStatus {
+    Open,
+    Closed,
+}
+
+/// A GitHub issue describing one feature; maps to one feature branch and one draft PR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Specification {
+    pub issue: IssueRef,
+}
+
+/// The specification's feature branch and draft PR. The PR shares the issue number space,
+/// so it is referenced by an [`IssueRef`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feature {
+    pub specification: IssueRef,
+    pub base_branch: BranchName,
+    pub feature_branch: BranchName,
+    pub expected_remote_head: CommitId,
+    pub draft_pull_request: IssueRef,
+}
+
+/// An issue blocking a ticket, with its status as read. It may lie outside the [`TicketPlan`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Blocker {
+    pub issue: IssueRef,
+    pub status: IssueStatus,
+}
+
+/// A sub-issue of a specification, with the issues blocking it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ticket {
+    pub issue: IssueRef,
+    pub status: IssueStatus,
+    pub blockers: Vec<Blocker>,
+}
+
+/// The tickets of a run and their blocked-by relationships, fixed for the run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketPlan {
+    pub tickets: Vec<Ticket>,
+}
+
+/// A unit of work for an implementation/review/merge triplet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkItem {
+    Ticket(Ticket),
+    /// Findings from the final review, carrying its explanation.
+    Findings(String),
+}
+
+/// A verified pushed commit on the feature branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergedOk {
+    pub commit: CommitId,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +376,56 @@ mod tests {
             serde_json::from_str::<IssueRef>(r#"{"owner":"","repository":"r","number":1}"#)
                 .is_err()
         );
+    }
+
+    fn issue(number: u64) -> IssueRef {
+        IssueRef::new("octo", "repo", number).unwrap()
+    }
+
+    fn ticket() -> Ticket {
+        Ticket {
+            issue: issue(11),
+            status: IssueStatus::Open,
+            blockers: vec![
+                Blocker {
+                    issue: issue(9),
+                    status: IssueStatus::Closed,
+                },
+                Blocker {
+                    issue: issue(500),
+                    status: IssueStatus::Open,
+                },
+            ],
+        }
+    }
+
+    fn assert_round_trip<T>(value: T)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + fmt::Debug,
+    {
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(serde_json::from_str::<T>(&json).unwrap(), value);
+    }
+
+    #[test]
+    fn domain_types_round_trip() {
+        assert_round_trip(IssueStatus::Closed);
+        assert_round_trip(Specification { issue: issue(2) });
+        assert_round_trip(Feature {
+            specification: issue(2),
+            base_branch: BranchName::new("main").unwrap(),
+            feature_branch: BranchName::new("spec/2-core").unwrap(),
+            expected_remote_head: CommitId::new("abc123").unwrap(),
+            draft_pull_request: issue(3),
+        });
+        assert_round_trip(ticket());
+        assert_round_trip(TicketPlan {
+            tickets: vec![ticket()],
+        });
+        assert_round_trip(WorkItem::Ticket(ticket()));
+        assert_round_trip(WorkItem::Findings("fix the thing".into()));
+        assert_round_trip(MergedOk {
+            commit: CommitId::new("def456").unwrap(),
+        });
     }
 }
