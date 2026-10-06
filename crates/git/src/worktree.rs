@@ -151,7 +151,19 @@ pub(crate) fn update(
             .run(repo, &["fetch", "origin", commit], Effect::Local)
             .is_err()
     {
-        runner.run(repo, &["fetch", "--prune", "origin"], Effect::Local)?;
+        // Servers may refuse unadvertised ids, so fetch every branch explicitly, independent of
+        // the configured refspecs, then check the commit arrived.
+        runner.run(
+            repo,
+            &[
+                "fetch",
+                "--prune",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+            Effect::Local,
+        )?;
+        runner.run(repo, &["cat-file", "-e", &object], Effect::Read)?;
     }
     runner.run(path, &["reset", "--hard", &object], Effect::Local)?;
     Ok(())

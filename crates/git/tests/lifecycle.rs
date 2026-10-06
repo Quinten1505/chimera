@@ -244,3 +244,64 @@ async fn update_worktree_fetches_commit_outside_configured_refspec() {
         .unwrap();
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), target.as_str());
 }
+
+#[tokio::test]
+async fn update_worktree_to_ancestor_commit_when_server_refuses_unadvertised_ids() {
+    let (dir, work) = setup();
+    let repository: Arc<dyn Repository> = Arc::new(GitRepository::new(&work));
+    let feature = branch("feature/x");
+    let task = branch("task/1");
+    let worktree = dir.path().join("wt-1");
+    git(&work, &["config", "protocol.version", "0"]);
+    git(
+        &work,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+    repository
+        .create_feature_branch(&feature, &branch("main"))
+        .await
+        .unwrap();
+    repository
+        .create_worktree(&worktree, &task, &feature)
+        .await
+        .unwrap();
+    let before = git(&worktree, &["rev-parse", "HEAD"]);
+
+    let other = dir.path().join("other");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            dir.path().join("origin.git").to_str().unwrap(),
+            "other",
+        ],
+    );
+    configure(&other);
+    git(&other, &["checkout", "feature/x"]);
+    let mut commits = Vec::new();
+    for name in ["a.txt", "b.txt"] {
+        std::fs::write(other.join(name), name).unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-m", name]);
+        commits.push(git(&other, &["rev-parse", "HEAD"]));
+        git(&other, &["push", "origin", "feature/x"]);
+    }
+    // The origin now advertises only B for feature/x; A is merely reachable.
+    let a = CommitId::new(commits[0].clone()).unwrap();
+
+    // A failed fetch or an unknown commit leaves the task branch where it was.
+    let error = repository
+        .update_worktree(&worktree, &CommitId::new("1".repeat(40)).unwrap())
+        .await
+        .unwrap_err();
+    assert!(error.is_failed(), "{error:?}");
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), before);
+
+    repository.update_worktree(&worktree, &a).await.unwrap();
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), a.as_str());
+    assert_eq!(git(&work, &["rev-parse", "task/1"]), a.as_str());
+}

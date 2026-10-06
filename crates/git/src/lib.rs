@@ -11,5 +11,4 @@ mod runner;
 mod testing;
 mod worktree;
 
-pub use error::GitError;
 pub use repository::GitRepository;
