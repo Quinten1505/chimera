@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::task::{Poll, Waker};
 
 use chimera_core::error::PortError;
@@ -34,12 +34,21 @@ struct Shared {
     wakers: Vec<Waker>,
 }
 
+/// Live locks by store (address), run and instance, so every open of the same branch shares one
+/// lock. A live lock keeps its store alive, so an address cannot be reused while it is listed.
+type Registry = HashMap<(usize, RunId, String), Weak<MergeLock>>;
+
+static REGISTRY: LazyLock<AsyncMutex<Registry>> = LazyLock::new(Default::default);
+
 /// Fair FIFO async lock for one feature branch.
 ///
 /// Owners are identified by a stable key (e.g. the implementation pipeline instance) so the
 /// holder and the waiting order survive a restart. The lock is only ever released by
 /// [`MergeLock::release`]; dropping or pausing the task of the holder leaves it held, and
 /// dropping a pending [`MergeLock::acquire`] leaves its place in the queue.
+///
+/// There is one live lock per store, run and branch: [`MergeLock::open`] hands out the same
+/// instance while any handle to it exists.
 pub struct MergeLock {
     store: Arc<dyn RunStore>,
     run: RunId,
@@ -50,18 +59,29 @@ pub struct MergeLock {
 }
 
 impl MergeLock {
-    /// Opens the lock of `branch`, restoring holder and queue if they were saved.
+    /// Opens the lock of `branch`, restoring holder and queue if they were saved. Returns the
+    /// already open lock if there is one.
     pub async fn open(
         store: Arc<dyn RunStore>,
         run: RunId,
         branch: &BranchName,
-    ) -> Result<Self, PipelineError> {
+    ) -> Result<Arc<Self>, PipelineError> {
         let instance = format!("merge_lock:{branch}");
+        let key = (
+            Arc::as_ptr(&store).cast::<()>() as usize,
+            run.clone(),
+            instance.clone(),
+        );
+        // Held across the load so concurrent opens cannot create two locks.
+        let mut registry = REGISTRY.lock().await;
+        if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
         let state = match store.load_pipeline_state(&run, &instance).await? {
             Some(saved) => serde_json::from_value(saved)?,
             None => LockState::default(),
         };
-        Ok(Self {
+        let lock = Arc::new(Self {
             store,
             run,
             instance,
@@ -70,7 +90,10 @@ impl MergeLock {
                 wakers: Vec::new(),
             }),
             writes: AsyncMutex::new(()),
-        })
+        });
+        registry.retain(|_, weak| weak.strong_count() > 0);
+        registry.insert(key, Arc::downgrade(&lock));
+        Ok(lock)
     }
 
     /// Takes a place in the queue, or the lock itself if it is free. Idempotent: an owner that
@@ -194,7 +217,7 @@ mod tests {
         BranchName::new("spec/4-pipelines").unwrap()
     }
 
-    async fn open(store: &Arc<dyn RunStore>) -> MergeLock {
+    async fn open(store: &Arc<dyn RunStore>) -> Arc<MergeLock> {
         MergeLock::open(store.clone(), run(), &branch())
             .await
             .unwrap()
@@ -207,7 +230,7 @@ mod tests {
     #[test]
     fn waiters_are_granted_in_fifo_order() {
         let store = store();
-        let lock = Arc::new(block_on(open(&store)));
+        let lock = block_on(open(&store));
         let granted = Arc::new(Mutex::new(Vec::new()));
         let mut pool = LocalPool::new();
         let spawner = pool.spawner();
@@ -309,5 +332,28 @@ mod tests {
         block_on(other.enqueue("b")).unwrap();
         assert_eq!(first.holder().as_deref(), Some("a"));
         assert_eq!(other.holder().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn handles_of_the_same_branch_share_one_lock() {
+        let store = store();
+        let first = block_on(open(&store));
+        let second = block_on(open(&store));
+        assert!(Arc::ptr_eq(&first, &second));
+
+        assert_eq!(block_on(first.acquire("a")).unwrap(), 0);
+        let mut waiting = Box::pin(second.acquire("b"));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        assert_eq!(first.holder().as_deref(), Some("a"));
+        assert_eq!(second.holder().as_deref(), Some("a"));
+        assert_eq!(first.waiting(), ["b"]);
+
+        // The persisted state keeps both owners, in order.
+        drop(waiting);
+        drop((first, second));
+        let restored = block_on(open(&store));
+        assert_eq!(restored.holder().as_deref(), Some("a"));
+        assert_eq!(restored.waiting(), ["b"]);
     }
 }
