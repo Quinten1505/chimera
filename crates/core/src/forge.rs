@@ -138,6 +138,31 @@ mod fake {
             self.failures.pop_front().map_or(Ok(()), Err)
         }
 
+        /// The lowest unused reference from 1000, skipping pull requests, plan issues and closed
+        /// issues already known to the fake.
+        fn next_pull_request_number(
+            &self,
+            owner: &str,
+            repository: &str,
+        ) -> Result<IssueRef, PortError> {
+            (1000..)
+                .map(|n| IssueRef::new(owner, repository, n))
+                .find_map(|candidate| match candidate {
+                    Ok(c) if !self.is_taken(&c) => Some(Ok(c)),
+                    Ok(_) => None,
+                    Err(e) => Some(Err(PortError::failed(e.to_string()))),
+                })
+                .expect("unbounded range")
+        }
+
+        fn is_taken(&self, issue: &IssueRef) -> bool {
+            self.pull_requests.iter().any(|pr| &pr.number == issue)
+                || self.closed.contains(issue)
+                || self.plans.iter().any(|(spec, plan)| {
+                    spec == issue || plan.tickets.iter().any(|t| &t.issue == issue)
+                })
+        }
+
         fn pull_request_mut(&mut self, number: &IssueRef) -> Result<&mut PullRequest, PortError> {
             self.pull_requests
                 .iter_mut()
@@ -172,12 +197,7 @@ mod fake {
                 title: title.to_string(),
                 body: body.to_string(),
             })?;
-            let number = IssueRef::new(
-                self.owner.clone(),
-                self.repository.clone(),
-                1000 + state.pull_requests.len() as u64,
-            )
-            .map_err(|e| PortError::failed(e.to_string()))?;
+            let number = state.next_pull_request_number(&self.owner, &self.repository)?;
             state.pull_requests.push(PullRequest {
                 number: number.clone(),
                 head: head.clone(),
@@ -353,6 +373,34 @@ mod fake {
             assert!(!fake.is_closed(&issue(11)));
             block_on(fake.close_issue(&issue(11))).unwrap();
             assert!(fake.is_closed(&issue(11)));
+        }
+
+        #[test]
+        fn created_pull_request_does_not_collide_with_seeded_one() {
+            let fake = forge();
+            fake.add_open_pull_request(issue(1001), branch("seeded"));
+            let created = block_on(fake.create_draft_pull_request(
+                &branch("feat"),
+                &branch("main"),
+                "t",
+                "b",
+            ))
+            .unwrap();
+            assert_ne!(created, issue(1001));
+
+            block_on(fake.mark_pull_request_ready(&created)).unwrap();
+            assert_eq!(fake.is_draft(&created), Some(false));
+            assert_eq!(fake.is_draft(&issue(1001)), Some(true));
+
+            block_on(fake.close_issue(&created)).unwrap();
+            assert_eq!(
+                block_on(fake.find_open_pull_request(&branch("feat"))).unwrap(),
+                None
+            );
+            assert_eq!(
+                block_on(fake.find_open_pull_request(&branch("seeded"))).unwrap(),
+                Some(issue(1001))
+            );
         }
 
         #[test]
