@@ -24,7 +24,7 @@ impl CodexConfiguration {
             });
         }
         for (name, options) in &configuration.agents {
-            if name.trim().is_empty() || name.chars().any(char::is_control) {
+            if !is_plain_text(name) {
                 return Err(ConfigurationError::Invalid {
                     field: format!("agents.{name}"),
                 });
@@ -66,7 +66,7 @@ impl CodexOptions {
             ("reasoning_effort", &self.reasoning_effort),
             ("service_tier", &self.service_tier),
         ] {
-            if value.trim().is_empty() || value.chars().any(char::is_control) {
+            if !is_plain_text(value) {
                 return Err(ConfigurationError::Invalid {
                     field: format!("{prefix}{field}"),
                 });
@@ -94,6 +94,11 @@ impl CodexOptions {
         }
         Ok(args)
     }
+}
+
+/// A nonempty string free of every control character (including LF, CR, tab and NUL).
+pub(crate) fn is_plain_text(text: &str) -> bool {
+    !text.trim().is_empty() && !text.chars().any(char::is_control)
 }
 
 #[derive(Debug, Error)]

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use chimera_core::AgentProfile;
 use serde_json::Value;
 
-use crate::ConfigurationError;
+use crate::{ConfigurationError, codex::is_plain_text};
 
 pub const CODEX_PROVIDER: &str = "codex";
 
@@ -42,9 +42,7 @@ impl CodexSettings {
 
 fn string(value: &Value, field: String) -> Result<String, ConfigurationError> {
     match value.as_str() {
-        Some(text) if !text.trim().is_empty() && !text.chars().any(char::is_control) => {
-            Ok(text.to_string())
-        }
+        Some(text) if is_plain_text(text) => Ok(text.to_string()),
         _ => Err(ConfigurationError::InvalidSetting {
             field,
             expected: "a nonempty string without control characters",

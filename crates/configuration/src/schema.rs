@@ -6,7 +6,11 @@ use std::{fs, path::Path};
 use chimera_core::{AgentConfiguration, AgentProfile, Limits};
 use serde::Deserialize;
 
-use crate::{ConfigurationError, codex_args::{CODEX_PROVIDER, validate_settings}};
+use crate::{
+    ConfigurationError,
+    codex::is_plain_text,
+    codex_args::{CODEX_PROVIDER, validate_settings},
+};
 
 const DEFAULT_RESET_COMMAND: &str = "/clear";
 
@@ -120,10 +124,28 @@ fn missing(field: &str) -> ConfigurationError {
 /// A required single-line string: nonempty and free of control characters.
 fn plain_string(value: Option<String>, field: &str) -> Result<String, ConfigurationError> {
     let value = value.ok_or_else(|| missing(field))?;
-    if value.trim().is_empty() || value.chars().any(char::is_control) {
+    if !is_plain_text(&value) {
         return Err(invalid(field));
     }
     Ok(value)
+}
+
+/// Every string inside a settings value, at any depth, must be plain text; `field` is the value's path.
+fn validate_setting_strings(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<(), ConfigurationError> {
+    use serde_json::Value;
+    match value {
+        Value::String(text) if !is_plain_text(text) => Err(invalid(field)),
+        Value::Array(items) => items.iter().enumerate().try_for_each(|(index, item)| {
+            validate_setting_strings(item, &format!("{field}[{index}]"))
+        }),
+        Value::Object(map) => map
+            .iter()
+            .try_for_each(|(key, item)| validate_setting_strings(item, &format!("{field}.{key}"))),
+        _ => Ok(()),
+    }
 }
 
 /// A required prompt template: nonempty, and free of control characters except
@@ -217,6 +239,9 @@ impl ProfileSection {
             .get(&provider)
             .cloned()
             .unwrap_or_else(|| DEFAULT_RESET_COMMAND.to_string());
+        for (key, value) in &self.settings {
+            validate_setting_strings(value, &format!("{field}.settings.{key}"))?;
+        }
         Ok(AgentProfile {
             model: plain_string(self.model, &format!("{field}.model"))?,
             settings: self.settings,
@@ -316,7 +341,10 @@ limits:
   github_retries: 6
 {MINIMAL}"
         )
-        .replace("model: m3,", "model: m3, settings: {reasoning_effort: high, approve_for_me: true},");
+        .replace(
+            "model: m3,",
+            "model: m3, settings: {reasoning_effort: high, approve_for_me: true},",
+        );
         let configuration = Configuration::from_yaml(&yaml).unwrap();
         let profile = &configuration.final_review.merge;
         assert_eq!(profile.reset_command, "/new");
@@ -489,5 +517,58 @@ limits:
             1,
         );
         assert!(Configuration::from_yaml(&yaml).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_strings_in_settings_with_field_path() {
+        for (settings, path) in [
+            ("{service_tier: ''}", "ticket.review.settings.service_tier"),
+            (
+                "{service_tier: '  '}",
+                "ticket.review.settings.service_tier",
+            ),
+            (
+                r#"{service_tier: "a\nb"}"#,
+                "ticket.review.settings.service_tier",
+            ),
+            (
+                r#"{service_tier: "a\rb"}"#,
+                "ticket.review.settings.service_tier",
+            ),
+            (
+                r#"{service_tier: "a\tb"}"#,
+                "ticket.review.settings.service_tier",
+            ),
+            (
+                r#"{service_tier: "a\0b"}"#,
+                "ticket.review.settings.service_tier",
+            ),
+            (
+                r#"{service_tier: "a\eb"}"#,
+                "ticket.review.settings.service_tier",
+            ),
+            (
+                r#"{other: {nested: ["ok", "a\nb"]}}"#,
+                "ticket.review.settings.other.nested[1]",
+            ),
+            (
+                r#"{other: {deep: ""}}"#,
+                "ticket.review.settings.other.deep",
+            ),
+        ] {
+            let yaml = MINIMAL.replacen(
+                "model: m2,",
+                &format!("model: m2, settings: {settings},"),
+                1,
+            );
+            let message = err(&yaml);
+            assert!(message.contains(path), "{settings}: {message}");
+        }
+    }
+
+    #[test]
+    fn accepts_plain_strings_in_nested_settings() {
+        let value = serde_json::json!({"x": {"y": ["a b", 1, true, null]}});
+        assert!(validate_setting_strings(&value, "settings").is_ok());
     }
 }
