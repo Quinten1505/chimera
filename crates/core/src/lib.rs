@@ -13,14 +13,18 @@ use serde::{Deserialize, Serialize};
 
 /// The part an agent plays within a triplet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     Implementation,
     Review,
     Merge,
 }
 
+/// Reset command used when a profile does not name one.
+pub const DEFAULT_RESET_COMMAND: &str = "/clear";
+
 fn default_reset_command() -> String {
-    "/clear".to_string()
+    DEFAULT_RESET_COMMAND.to_string()
 }
 
 /// How one role's agent is launched and prompted.
@@ -74,7 +78,7 @@ impl AgentConfiguration {
 pub struct Limits {
     pub implementation_review_cycles: u32,
     pub merge_attempts: u32,
-    pub final_review_fix_cycles: u32,
+    pub final_review_cycles: u32,
     pub agent_recovery: u32,
     pub github_retries: u32,
 }
@@ -84,7 +88,7 @@ impl Default for Limits {
         Self {
             implementation_review_cycles: 100,
             merge_attempts: 100,
-            final_review_fix_cycles: 100,
+            final_review_cycles: 100,
             agent_recovery: 5,
             github_retries: 5,
         }
@@ -186,8 +190,17 @@ struct IssueRefParts {
     number: u64,
 }
 
+/// Error returned when an [`IssueRef`] is constructed from invalid parts.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidIssueRef {
+    #[error(transparent)]
+    Identifier(#[from] EmptyIdentifier),
+    #[error("IssueRef number must not be 0")]
+    ZeroNumber,
+}
+
 impl TryFrom<IssueRefParts> for IssueRef {
-    type Error = EmptyIdentifier;
+    type Error = InvalidIssueRef;
 
     fn try_from(parts: IssueRefParts) -> Result<Self, Self::Error> {
         Self::new(parts.owner, parts.repository, parts.number)
@@ -199,7 +212,10 @@ impl IssueRef {
         owner: impl Into<String>,
         repository: impl Into<String>,
         number: u64,
-    ) -> Result<Self, EmptyIdentifier> {
+    ) -> Result<Self, InvalidIssueRef> {
+        if number == 0 {
+            return Err(InvalidIssueRef::ZeroNumber);
+        }
         Ok(Self {
             owner: non_blank("IssueRef owner", owner.into())?,
             repository: non_blank("IssueRef repository", repository.into())?,
@@ -341,7 +357,7 @@ mod tests {
         let limits = Limits::default();
         assert_eq!(limits.implementation_review_cycles, 100);
         assert_eq!(limits.merge_attempts, 100);
-        assert_eq!(limits.final_review_fix_cycles, 100);
+        assert_eq!(limits.final_review_cycles, 100);
         assert_eq!(limits.agent_recovery, 5);
         assert_eq!(limits.github_retries, 5);
     }
@@ -352,6 +368,38 @@ mod tests {
         let profile: AgentProfile =
             serde_json::from_str(r#"{"provider":"p","model":"m","prompt_template":"t"}"#).unwrap();
         assert_eq!(profile.reset_command, "/clear");
+        assert_eq!(DEFAULT_RESET_COMMAND, "/clear");
+        let profile: AgentProfile = serde_json::from_str(
+            r#"{"provider":"p","model":"m","prompt_template":"t","reset_command":"/new"}"#,
+        )
+        .unwrap();
+        assert_eq!(profile.reset_command, "/new");
+    }
+
+    #[test]
+    fn role_serializes_snake_case() {
+        for (role, name) in [
+            (Role::Implementation, "implementation"),
+            (Role::Review, "review"),
+            (Role::Merge, "merge"),
+        ] {
+            let json = serde_json::to_string(&role).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<Role>(&json).unwrap(), role);
+        }
+    }
+
+    #[test]
+    fn agent_profile_round_trip_with_settings() {
+        let mut profile = AgentProfile::new("codex", "m", "t");
+        profile
+            .settings
+            .insert("reasoning_effort".into(), serde_json::json!("high"));
+        let json = serde_json::to_string(&profile).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentProfile>(&json).unwrap(),
+            profile
+        );
     }
 
     #[test]
@@ -415,6 +463,28 @@ mod tests {
         assert_eq!(serde_json::from_str::<IssueRef>(&json).unwrap(), issue);
         assert!(IssueRef::new("", "repo", 9).is_err());
         assert!(IssueRef::new("octo", "  ", 9).is_err());
+        assert!(IssueRef::new(" ", "repo", 9).is_err());
+        assert!(IssueRef::new("octo", "", 9).is_err());
+        assert_eq!(
+            IssueRef::new("octo", "repo", 0),
+            Err(InvalidIssueRef::ZeroNumber)
+        );
+        assert_eq!(
+            serde_json::to_value(&issue).unwrap(),
+            serde_json::json!({"owner":"octo","repository":"repo","number":9})
+        );
+        assert_eq!(
+            IssueRef::new("octo", "chimera", 9).unwrap().to_string(),
+            "octo/chimera#9"
+        );
+        for json in [
+            r#"{"owner":"o","repository":"","number":1}"#,
+            r#"{"owner":" ","repository":"r","number":1}"#,
+            r#"{"owner":"o","repository":"  ","number":1}"#,
+            r#"{"owner":"o","repository":"r","number":0}"#,
+        ] {
+            assert!(serde_json::from_str::<IssueRef>(json).is_err());
+        }
         assert!(
             serde_json::from_str::<IssueRef>(r#"{"owner":"","repository":"r","number":1}"#)
                 .is_err()

@@ -78,7 +78,7 @@ struct LimitsSection {
     #[serde(default, deserialize_with = "present")]
     merge_attempts: Option<serde_yaml::Value>,
     #[serde(default, deserialize_with = "present")]
-    final_review_fix_cycles: Option<serde_yaml::Value>,
+    final_review_cycles: Option<serde_yaml::Value>,
     #[serde(default, deserialize_with = "present")]
     agent_recovery: Option<serde_yaml::Value>,
     #[serde(default, deserialize_with = "present")]
@@ -283,10 +283,10 @@ impl LimitsSection {
                 d.implementation_review_cycles,
             )?,
             merge_attempts: limit(self.merge_attempts, "merge_attempts", d.merge_attempts)?,
-            final_review_fix_cycles: limit(
-                self.final_review_fix_cycles,
-                "final_review_fix_cycles",
-                d.final_review_fix_cycles,
+            final_review_cycles: limit(
+                self.final_review_cycles,
+                "final_review_cycles",
+                d.final_review_cycles,
             )?,
             agent_recovery: limit(self.agent_recovery, "agent_recovery", d.agent_recovery)?,
             github_retries: limit(self.github_retries, "github_retries", d.github_retries)?,
@@ -337,7 +337,7 @@ final:
 limits:
   implementation_review_cycles: 1
   merge_attempts: 2
-  final_review_fix_cycles: 3
+  final_review_cycles: 3
   agent_recovery: 4
   github_retries: 6
 {MINIMAL}"
@@ -358,7 +358,7 @@ limits:
             Limits {
                 implementation_review_cycles: 1,
                 merge_attempts: 2,
-                final_review_fix_cycles: 3,
+                final_review_cycles: 3,
                 agent_recovery: 4,
                 github_retries: 6,
             }
