@@ -9,7 +9,7 @@ providers:
 limits:
   implementation_review_cycles: 100
   merge_attempts: 100
-  final_review_fix_cycles: 100
+  final_review_cycles: 100
   agent_recovery: 5
   github_retries: 5
 

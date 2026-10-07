@@ -262,7 +262,7 @@ Optional values default as follows:
 | `providers.<name>.reset_command` (context reset command) | `/clear` |
 | `limits.implementation_review_cycles` | 100 |
 | `limits.merge_attempts` | 100 |
-| `limits.final_review_fix_cycles` | 100 |
+| `limits.final_review_cycles` | 100 |
 | `limits.agent_recovery` | 5 |
 | `limits.github_retries` | 5 |
 

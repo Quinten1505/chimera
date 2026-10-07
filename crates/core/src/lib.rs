@@ -74,7 +74,7 @@ impl AgentConfiguration {
 pub struct Limits {
     pub implementation_review_cycles: u32,
     pub merge_attempts: u32,
-    pub final_review_fix_cycles: u32,
+    pub final_review_cycles: u32,
     pub agent_recovery: u32,
     pub github_retries: u32,
 }
@@ -84,7 +84,7 @@ impl Default for Limits {
         Self {
             implementation_review_cycles: 100,
             merge_attempts: 100,
-            final_review_fix_cycles: 100,
+            final_review_cycles: 100,
             agent_recovery: 5,
             github_retries: 5,
         }
@@ -353,7 +353,7 @@ mod tests {
         let limits = Limits::default();
         assert_eq!(limits.implementation_review_cycles, 100);
         assert_eq!(limits.merge_attempts, 100);
-        assert_eq!(limits.final_review_fix_cycles, 100);
+        assert_eq!(limits.final_review_cycles, 100);
         assert_eq!(limits.agent_recovery, 5);
         assert_eq!(limits.github_retries, 5);
     }
