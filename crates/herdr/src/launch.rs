@@ -26,8 +26,9 @@ impl HerdrClient {
 
     /// As [`launch_agent`](Self::launch_agent), with an explicit readiness wait.
     ///
-    /// Each request is bounded by the client timeout and by the remaining wait, so the socket
-    /// timeout never cuts the wait short.
+    /// The launch requests use a socket timeout longer than `ready_timeout` (the client timeout
+    /// on top of it), and each readiness poll is also bounded by the remaining wait, so the
+    /// socket timeout never cuts the wait short.
     pub async fn launch_agent_within(
         &self,
         pane: &PaneId,
@@ -39,19 +40,21 @@ impl HerdrClient {
         }
         let line = shell_command_line(command)?;
         let deadline = Instant::now() + ready_timeout;
+        let socket_timeout = ready_timeout.saturating_add(self.timeout());
 
         let _: serde_json::Value = self
-            .request(
+            .request_within(
                 "pane.send_input",
                 &serde_json::json!({"pane_id": pane, "text": line, "keys": ["enter"]}),
                 "ok",
                 Effect::Change,
+                socket_timeout,
             )
             .await?;
 
         // The command is on its way: every outcome from here on is uncertain.
         loop {
-            if self.agent_present(pane, deadline).await? {
+            if self.agent_present(pane, deadline, socket_timeout).await? {
                 return Ok(());
             }
             if Instant::now() + POLL_INTERVAL >= deadline {
@@ -61,7 +64,12 @@ impl HerdrClient {
         }
     }
 
-    async fn agent_present(&self, pane: &PaneId, deadline: Instant) -> Result<bool, HerdrError> {
+    async fn agent_present(
+        &self,
+        pane: &PaneId,
+        deadline: Instant,
+        socket_timeout: Duration,
+    ) -> Result<bool, HerdrError> {
         #[derive(Deserialize)]
         struct Info {
             agent: Option<String>,
@@ -71,7 +79,13 @@ impl HerdrClient {
             pane: Info,
         }
         let params = serde_json::json!({"pane_id": pane});
-        let poll = self.request::<Found>("pane.get", &params, "pane_info", Effect::Read);
+        let poll = self.request_within::<Found>(
+            "pane.get",
+            &params,
+            "pane_info",
+            Effect::Read,
+            socket_timeout,
+        );
         match timeout_at(deadline, poll).await {
             Err(_) => Err(HerdrError::Timeout { uncertain: true }),
             Ok(Ok(found)) => Ok(found.pane.agent.is_some()),

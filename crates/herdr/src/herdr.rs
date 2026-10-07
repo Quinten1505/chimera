@@ -86,7 +86,6 @@ impl HerdrClient {
         Ok(result.pane)
     }
 
-    #[cfg(unix)]
     pub(crate) async fn request<T: DeserializeOwned>(
         &self,
         method: &str,
@@ -94,8 +93,26 @@ impl HerdrClient {
         result_type: &str,
         effect: Effect,
     ) -> Result<T, HerdrError> {
+        self.request_within(method, params, result_type, effect, self.timeout)
+            .await
+    }
+
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// As `request`, bounded by `timeout` instead of the client's own.
+    #[cfg(unix)]
+    pub(crate) async fn request_within<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &impl Serialize,
+        result_type: &str,
+        effect: Effect,
+        timeout: Duration,
+    ) -> Result<T, HerdrError> {
         use tokio::net::UnixStream;
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + timeout;
         let mut stream = timeout_at(deadline, UnixStream::connect(&self.socket_path))
             .await
             .map_err(|_| {
@@ -106,12 +123,13 @@ impl HerdrClient {
     }
 
     #[cfg(not(unix))]
-    pub(crate) async fn request<T: DeserializeOwned>(
+    pub(crate) async fn request_within<T: DeserializeOwned>(
         &self,
         _method: &str,
         _params: &impl Serialize,
         _result_type: &str,
         _effect: Effect,
+        _timeout: Duration,
     ) -> Result<T, HerdrError> {
         let _ = (&self.socket_path, self.timeout);
         Err(HerdrError::Connect(io::Error::new(

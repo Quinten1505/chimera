@@ -35,6 +35,14 @@ impl Drop for Server {
 
 /// Serves each connection with `respond(request)`; `None` closes it without replying.
 fn serve(respond: impl Fn(&Value) -> Option<Value> + Send + 'static) -> Server {
+    serve_after(Duration::ZERO, respond)
+}
+
+/// As [`serve`], waiting `delay` before answering each non-ping request.
+fn serve_after(
+    delay: Duration,
+    respond: impl Fn(&Value) -> Option<Value> + Send + 'static,
+) -> Server {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "chimera-launch-{}-{}",
@@ -57,6 +65,7 @@ fn serve(respond: impl Fn(&Value) -> Option<Value> + Send + 'static) -> Server {
                 Some(json!({"type": "pong"}))
             } else {
                 seen.lock().unwrap().push(request.clone());
+                tokio::time::sleep(delay).await;
                 respond(&request)
             };
             if let Some(result) = reply {
@@ -212,4 +221,28 @@ async fn server_rejecting_the_send_is_failed() {
         .unwrap_err();
     assert!(matches!(error, HerdrError::Server { .. }));
     assert!(error.is_failed());
+}
+
+#[tokio::test]
+async fn slow_responses_are_not_cut_short_by_a_shorter_client_timeout() {
+    let polls = Arc::new(Mutex::new(0));
+    let counter = polls.clone();
+    let server = serve_after(
+        Duration::from_millis(400),
+        move |request| match request["method"].as_str().unwrap() {
+            "pane.send_input" => Some(json!({"type": "ok"})),
+            _ => {
+                let mut polls = counter.lock().unwrap();
+                *polls += 1;
+                Some(pane_info((*polls >= 2).then_some("codex")))
+            }
+        },
+    );
+    let client = HerdrClient::connect_with_timeout(&server.socket, Duration::from_millis(200))
+        .await
+        .unwrap();
+    client
+        .launch_agent_within(&pane(), &command(&["codex"]), Duration::from_secs(5))
+        .await
+        .unwrap();
 }
