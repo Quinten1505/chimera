@@ -27,7 +27,7 @@ impl crate::HerdrClient {
     ///
     /// Stops on the first error. Previously tracked panes are skipped. A timeout may
     /// leave an untracked running agent: inspect Herdr before retrying.
-    pub fn start_codex_agents(
+    pub async fn start_codex_agents(
         &self,
         workspace: &mut crate::WorkspacePanes,
         args: &[String],
@@ -52,7 +52,9 @@ impl crate::HerdrClient {
             if workspace.agents.iter().any(|agent| agent.pane_id == *pane) {
                 continue;
             }
-            let agent = self.start_codex_agent(&format!("codex-{pane}"), pane, args)?;
+            let agent = self
+                .start_codex_agent(&format!("codex-{pane}"), pane, args)
+                .await?;
             workspace.agents.push(agent);
         }
         Ok(())

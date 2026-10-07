@@ -8,7 +8,7 @@ use std::path::Path;
 ///
 /// Records successful launches in the session's workspaces and stops on the first
 /// failure. Does not create worktrees or panes, persist state, or retry requests.
-pub fn start_session_agents(
+pub async fn start_session_agents(
     client: &HerdrClient,
     session: &mut Session,
     config_path: impl AsRef<Path>,
@@ -16,7 +16,7 @@ pub fn start_session_agents(
     let configuration = chimera_configuration::load(config_path)?;
     let args = codex_launch_args(&configuration.ticket.implementation)?;
     for workspace in &mut session.workspaces {
-        client.start_codex_agents(workspace, &args)?;
+        client.start_codex_agents(workspace, &args).await?;
     }
     Ok(())
 }
@@ -33,7 +33,7 @@ mod tests {
         time::Duration,
     };
 
-    fn run(fail_at: Option<usize>) {
+    async fn run(fail_at: Option<usize>) {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let directory = std::env::temp_dir().join(format!(
             "chimera-agents-{}-{}",
@@ -73,7 +73,7 @@ mod tests {
             }
             requests
         });
-        let client = HerdrClient::connect(&socket).unwrap();
+        let client = HerdrClient::connect(&socket).await.unwrap();
         let mut session = Session {
             session_id: "test".into(),
             workspaces: (1..=2)
@@ -86,7 +86,7 @@ mod tests {
                 .collect(),
         };
         let yaml = concat!(env!("CARGO_MANIFEST_DIR"), "/chimera.example.yaml");
-        let result = start_session_agents(&client, &mut session, yaml);
+        let result = start_session_agents(&client, &mut session, yaml).await;
         assert_eq!(result.is_err(), fail_at.is_some());
         let requests = server.join().unwrap();
         std::fs::remove_file(&socket).unwrap();
@@ -120,17 +120,19 @@ mod tests {
         assert_eq!(serde_json::from_str::<Session>(&saved).unwrap(), session);
         if fail_at.is_none() {
             // The socket has gone away: a second call must skip every tracked pane.
-            start_session_agents(&client, &mut session, yaml).unwrap();
+            start_session_agents(&client, &mut session, yaml)
+                .await
+                .unwrap();
         }
     }
 
-    #[test]
-    fn starts_four_luna_agents_from_yaml_and_records_them_by_workspace() {
-        run(None);
+    #[tokio::test]
+    async fn starts_four_luna_agents_from_yaml_and_records_them_by_workspace() {
+        run(None).await;
     }
 
-    #[test]
-    fn keeps_successful_agents_and_stops_on_first_launch_failure() {
-        run(Some(2));
+    #[tokio::test]
+    async fn keeps_successful_agents_and_stops_on_first_launch_failure() {
+        run(Some(2)).await;
     }
 }

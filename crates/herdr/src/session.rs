@@ -37,7 +37,7 @@ impl HerdrClient {
     ///
     /// The caller supplies the application session ID. State is returned in memory;
     /// callers may serialize it for persistence. This does not launch an AI agent.
-    pub fn start_session(
+    pub async fn start_session(
         &self,
         session_id: impl Into<String>,
         target: &SessionTarget,
@@ -48,7 +48,7 @@ impl HerdrClient {
         }
         let workspace = match target {
             SessionTarget::Workspace(options) => {
-                let created = self.create_workspace(options)?;
+                let created = self.create_workspace(options).await?;
                 WorkspacePanes {
                     agents: Vec::new(),
                     workspace_id: created.workspace.workspace_id,

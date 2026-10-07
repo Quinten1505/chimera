@@ -92,6 +92,7 @@ dependencies = [
  "chimera-herdr",
  "chimera-pipelines",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -148,6 +149,8 @@ dependencies = [
  "chimera-core",
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

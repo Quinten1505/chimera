@@ -1,11 +1,23 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    fmt, io,
+    io,
     path::{Path, PathBuf},
     time::Duration,
 };
+use thiserror::Error;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    time::{Instant, timeout_at},
+};
 
-/// A synchronous client for a running Herdr server.
+/// Whether an operation changes Herdr state. Only changing operations can be uncertain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Effect {
+    Read,
+    Change,
+}
+
+/// An async client for a running Herdr server.
 ///
 /// Each operation opens its own connection. Requests are never retried automatically:
 /// a timeout may occur after Herdr has already performed the operation.
@@ -18,13 +30,13 @@ pub struct HerdrClient {
 impl HerdrClient {
     /// Connect to an explicit server socket and verify it with a ping.
     ///
-    /// Uses a 30-second read/write timeout. Native Windows is unsupported; use WSL.
-    pub fn connect(socket_path: impl AsRef<Path>) -> Result<Self, HerdrError> {
-        Self::connect_with_timeout(socket_path, Duration::from_secs(30))
+    /// Uses a 30-second timeout per request. Native Windows is unsupported; use WSL.
+    pub async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, HerdrError> {
+        Self::connect_with_timeout(socket_path, Duration::from_secs(30)).await
     }
 
-    /// Connect with a nonzero read/write timeout for each operation.
-    pub fn connect_with_timeout(
+    /// Connect with a nonzero timeout for each request.
+    pub async fn connect_with_timeout(
         socket_path: impl AsRef<Path>,
         timeout: Duration,
     ) -> Result<Self, HerdrError> {
@@ -35,21 +47,29 @@ impl HerdrClient {
             socket_path: socket_path.as_ref().to_owned(),
             timeout,
         };
-        let _: serde_json::Value = client.request("ping", &serde_json::json!({}), "pong")?;
+        let _: serde_json::Value = client
+            .request("ping", &serde_json::json!({}), "pong", Effect::Read)
+            .await?;
         Ok(client)
     }
 
     /// Open an existing directory in a new Herdr workspace, without creating a Git checkout.
-    pub fn create_workspace(
+    pub async fn create_workspace(
         &self,
         options: &WorkspaceOptions,
     ) -> Result<CreatedWorkspace, HerdrError> {
         require_absolute(&options.cwd)?;
-        self.request("workspace.create", options, "workspace_created")
+        self.request(
+            "workspace.create",
+            options,
+            "workspace_created",
+            Effect::Change,
+        )
+        .await
     }
 
     /// Add a pane by splitting a specific existing pane.
-    pub fn add_pane(&self, options: &PaneOptions) -> Result<Pane, HerdrError> {
+    pub async fn add_pane(&self, options: &PaneOptions) -> Result<Pane, HerdrError> {
         if options.target_pane_id.trim().is_empty() {
             return Err(HerdrError::InvalidInput("target_pane_id must not be empty"));
         }
@@ -60,13 +80,15 @@ impl HerdrClient {
         struct PaneResult {
             pane: Pane,
         }
-        let result: PaneResult = self.request("pane.split", options, "pane_info")?;
+        let result: PaneResult = self
+            .request("pane.split", options, "pane_info", Effect::Change)
+            .await?;
         Ok(result.pane)
     }
 
     /// Launch Codex in an existing shell pane and wait for interactive readiness.
     /// No automatic retries: an error can occur after the process has started.
-    pub fn start_codex_agent(
+    pub async fn start_codex_agent(
         &self,
         name: &str,
         pane_id: &str,
@@ -97,18 +119,22 @@ impl HerdrClient {
         // Allow the server's 30-second readiness wait to finish before the socket expires.
         let mut client = self.clone();
         client.timeout = client.timeout.max(Duration::from_secs(35));
-        let started: Started = client.request(
-            "agent.start",
-            &serde_json::json!({
-                "name": name, "kind": "codex", "pane_id": pane_id,
-                "args": args, "timeout_ms": 30_000,
-            }),
-            "agent_started",
-        )?;
+        let started: Started = client
+            .request(
+                "agent.start",
+                &serde_json::json!({
+                    "name": name, "kind": "codex", "pane_id": pane_id,
+                    "args": args, "timeout_ms": 30_000,
+                }),
+                "agent_started",
+                Effect::Change,
+            )
+            .await?;
         if started.agent.pane_id != pane_id || started.agent.agent.as_deref() != Some("codex") {
-            return Err(HerdrError::Protocol(
-                "agent.start returned a different pane or agent kind".into(),
-            ));
+            return Err(HerdrError::Protocol {
+                message: "agent.start returned a different pane or agent kind".into(),
+                uncertain: true,
+            });
         }
         Ok(crate::Agent {
             name: started.agent.name.unwrap_or_else(|| name.to_owned()),
@@ -119,32 +145,37 @@ impl HerdrClient {
     }
 
     #[cfg(unix)]
-    fn request<T: DeserializeOwned>(
+    async fn request<T: DeserializeOwned>(
         &self,
         method: &str,
         params: &impl Serialize,
         result_type: &str,
+        effect: Effect,
     ) -> Result<T, HerdrError> {
-        use std::os::unix::net::UnixStream;
-        let mut stream = UnixStream::connect(&self.socket_path)?;
-        stream.set_read_timeout(Some(self.timeout))?;
-        stream.set_write_timeout(Some(self.timeout))?;
-        exchange(&mut stream, method, params, result_type)
+        use tokio::net::UnixStream;
+        let deadline = Instant::now() + self.timeout;
+        let mut stream = timeout_at(deadline, UnixStream::connect(&self.socket_path))
+            .await
+            .map_err(|_| {
+                HerdrError::Connect(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))
+            })?
+            .map_err(HerdrError::Connect)?;
+        exchange(&mut stream, method, params, result_type, effect, deadline).await
     }
 
     #[cfg(not(unix))]
-    fn request<T: DeserializeOwned>(
+    async fn request<T: DeserializeOwned>(
         &self,
         _method: &str,
         _params: &impl Serialize,
         _result_type: &str,
+        _effect: Effect,
     ) -> Result<T, HerdrError> {
         let _ = (&self.socket_path, self.timeout);
-        Err(io::Error::new(
+        Err(HerdrError::Connect(io::Error::new(
             io::ErrorKind::Unsupported,
             "Herdr Unix socket integration requires Unix or WSL",
-        )
-        .into())
+        )))
     }
 }
 
@@ -242,46 +273,69 @@ pub struct Pane {
     pub tab_id: String,
 }
 
-#[derive(Debug)]
+/// A failed Herdr operation, classified as *failed* or *uncertain*.
+///
+/// Failed means the operation is known not to have happened. Uncertain means the request was
+/// fully written to a state-changing operation and the outcome is unknown, so Herdr must be
+/// inspected before retrying. Read operations are never uncertain.
+#[derive(Debug, Error)]
 pub enum HerdrError {
-    Io(io::Error),
-    Json(serde_json::Error),
+    /// Rejected before anything was sent.
+    #[error("invalid Herdr input: {0}")]
     InvalidInput(&'static str),
-    Protocol(String),
+    /// The socket is missing, refused the connection, or did not accept it in time.
+    #[error("cannot connect to Herdr: {0}")]
+    Connect(#[source] io::Error),
+    /// The request was not completely written, so Herdr cannot have acted on it.
+    #[error("cannot send request to Herdr: {0}")]
+    Send(#[source] io::Error),
+    #[error("Herdr request timed out")]
+    Timeout { uncertain: bool },
+    /// The connection broke while reading the response.
+    #[error("Herdr connection failed: {source}")]
+    Receive {
+        #[source]
+        source: io::Error,
+        uncertain: bool,
+    },
+    #[error("Herdr protocol error: {message}")]
+    Protocol { message: String, uncertain: bool },
+    #[error("malformed Herdr response: {source}")]
+    Json {
+        #[source]
+        source: serde_json::Error,
+        uncertain: bool,
+    },
+    /// Herdr understood the request and answered with an error.
+    #[error("Herdr error ({code}): {message}")]
     Server { code: String, message: String },
 }
 
-impl fmt::Display for HerdrError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl HerdrError {
+    /// Whether the outcome of a state-changing operation is unknown.
+    pub fn is_uncertain(&self) -> bool {
         match self {
-            Self::Io(error) => write!(f, "Herdr transport error: {error}"),
-            Self::Json(error) => write!(f, "Herdr JSON error: {error}"),
-            Self::InvalidInput(message) => write!(f, "Invalid Herdr input: {message}"),
-            Self::Protocol(message) => write!(f, "Herdr protocol error: {message}"),
-            Self::Server { code, message } => write!(f, "Herdr error ({code}): {message}"),
+            Self::Timeout { uncertain }
+            | Self::Receive { uncertain, .. }
+            | Self::Protocol { uncertain, .. }
+            | Self::Json { uncertain, .. } => *uncertain,
+            Self::InvalidInput(_) | Self::Connect(_) | Self::Send(_) | Self::Server { .. } => false,
         }
     }
+
+    pub fn is_failed(&self) -> bool {
+        !self.is_uncertain()
+    }
 }
 
-impl std::error::Error for HerdrError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Json(error) => Some(error),
-            _ => None,
+impl From<HerdrError> for chimera_core::error::PortError {
+    fn from(error: HerdrError) -> Self {
+        let cause = error.to_string();
+        if error.is_uncertain() {
+            Self::uncertain(cause)
+        } else {
+            Self::failed(cause)
         }
-    }
-}
-
-impl From<io::Error> for HerdrError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl From<serde_json::Error> for HerdrError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Json(error)
     }
 }
 
@@ -292,37 +346,55 @@ fn require_absolute(path: &Path) -> Result<(), HerdrError> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn exchange<T: DeserializeOwned>(
-    stream: &mut (impl io::Read + io::Write),
+/// Largest accepted response line, to bound a malformed response.
+const MAX_RESPONSE: u64 = 1024 * 1024;
+
+async fn exchange<T: DeserializeOwned>(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     method: &str,
     params: &impl Serialize,
     result_type: &str,
+    effect: Effect,
+    deadline: Instant,
 ) -> Result<T, HerdrError> {
-    use std::io::{BufRead, BufReader, Read};
     // One request per connection, so a fixed correlation ID is sufficient.
     let request = serde_json::json!({"id": "chimera", "method": method, "params": params});
-    let mut bytes = serde_json::to_vec(&request)?;
+    let mut bytes = serde_json::to_vec(&request).map_err(|source| HerdrError::Json {
+        source,
+        uncertain: false,
+    })?;
     bytes.push(b'\n');
-    stream.write_all(&bytes)?;
-    stream.flush()?;
-
-    // Bound a malformed response instead of allocating indefinitely.
-    const MAX_RESPONSE: u64 = 1024 * 1024;
-    let mut line = String::new();
-    BufReader::new(stream)
-        .take(MAX_RESPONSE + 1)
-        .read_line(&mut line)?;
-    if line.len() as u64 > MAX_RESPONSE || !line.ends_with('\n') {
-        return Err(HerdrError::Protocol(
-            "response is oversized or incomplete".into(),
-        ));
+    // Until the newline is written Herdr cannot act on the request.
+    let sent = async {
+        stream.write_all(&bytes).await?;
+        stream.flush().await
+    };
+    match timeout_at(deadline, sent).await {
+        Err(_) => return Err(HerdrError::Timeout { uncertain: false }),
+        Ok(Err(error)) => return Err(HerdrError::Send(error)),
+        Ok(Ok(())) => {}
     }
-    let response: serde_json::Value = serde_json::from_str(&line)?;
+
+    let uncertain = effect == Effect::Change;
+    let protocol = |message: &str| HerdrError::Protocol {
+        message: message.into(),
+        uncertain,
+    };
+    let json = |source| HerdrError::Json { source, uncertain };
+    let mut line = String::new();
+    let mut reader = BufReader::new(&mut *stream).take(MAX_RESPONSE + 1);
+    let read = reader.read_line(&mut line);
+    match timeout_at(deadline, read).await {
+        Err(_) => return Err(HerdrError::Timeout { uncertain }),
+        Ok(Err(source)) => return Err(HerdrError::Receive { source, uncertain }),
+        Ok(Ok(_)) => {}
+    }
+    if line.len() as u64 > MAX_RESPONSE || !line.ends_with('\n') {
+        return Err(protocol("response is oversized or incomplete"));
+    }
+    let response: serde_json::Value = serde_json::from_str(&line).map_err(json)?;
     if response.get("id").and_then(|id| id.as_str()) != Some("chimera") {
-        return Err(HerdrError::Protocol(
-            "response ID does not match request".into(),
-        ));
+        return Err(protocol("response ID does not match request"));
     }
     if let Some(error) = response.get("error") {
         #[derive(Deserialize)]
@@ -330,7 +402,7 @@ fn exchange<T: DeserializeOwned>(
             code: String,
             message: String,
         }
-        let error: ErrorBody = serde_json::from_value(error.clone())?;
+        let error: ErrorBody = serde_json::from_value(error.clone()).map_err(json)?;
         return Err(HerdrError::Server {
             code: error.code,
             message: error.message,
@@ -338,13 +410,35 @@ fn exchange<T: DeserializeOwned>(
     }
     let result = response
         .get("result")
-        .ok_or_else(|| HerdrError::Protocol("response has no result".into()))?;
+        .ok_or_else(|| protocol("response has no result"))?;
     if result.get("type").and_then(|kind| kind.as_str()) != Some(result_type) {
-        return Err(HerdrError::Protocol(format!(
-            "expected {result_type} result"
-        )));
+        return Err(HerdrError::Protocol {
+            message: format!("expected {result_type} result"),
+            uncertain,
+        });
     }
-    Ok(serde_json::from_value(result.clone())?)
+    serde_json::from_value(result.clone()).map_err(json)
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::HerdrClient;
+
+    /// Connects to the server at `HERDR_SOCKET_PATH` for integration tests. Returns `None`, after
+    /// printing why, when it is unset or unreachable, so the calling test skips and passes.
+    pub(crate) async fn live_client() -> Option<HerdrClient> {
+        let Some(path) = std::env::var_os("HERDR_SOCKET_PATH") else {
+            eprintln!("skipping: HERDR_SOCKET_PATH is not set");
+            return None;
+        };
+        match HerdrClient::connect(&path).await {
+            Ok(client) => Some(client),
+            Err(error) => {
+                eprintln!("skipping: Herdr at {path:?} is unreachable: {error}");
+                None
+            }
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
