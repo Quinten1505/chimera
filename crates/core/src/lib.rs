@@ -186,8 +186,17 @@ struct IssueRefParts {
     number: u64,
 }
 
+/// Error returned when an [`IssueRef`] is constructed from invalid parts.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidIssueRef {
+    #[error(transparent)]
+    Identifier(#[from] EmptyIdentifier),
+    #[error("IssueRef number must not be 0")]
+    ZeroNumber,
+}
+
 impl TryFrom<IssueRefParts> for IssueRef {
-    type Error = EmptyIdentifier;
+    type Error = InvalidIssueRef;
 
     fn try_from(parts: IssueRefParts) -> Result<Self, Self::Error> {
         Self::new(parts.owner, parts.repository, parts.number)
@@ -199,7 +208,10 @@ impl IssueRef {
         owner: impl Into<String>,
         repository: impl Into<String>,
         number: u64,
-    ) -> Result<Self, EmptyIdentifier> {
+    ) -> Result<Self, InvalidIssueRef> {
+        if number == 0 {
+            return Err(InvalidIssueRef::ZeroNumber);
+        }
         Ok(Self {
             owner: non_blank("IssueRef owner", owner.into())?,
             repository: non_blank("IssueRef repository", repository.into())?,
@@ -415,6 +427,28 @@ mod tests {
         assert_eq!(serde_json::from_str::<IssueRef>(&json).unwrap(), issue);
         assert!(IssueRef::new("", "repo", 9).is_err());
         assert!(IssueRef::new("octo", "  ", 9).is_err());
+        assert!(IssueRef::new(" ", "repo", 9).is_err());
+        assert!(IssueRef::new("octo", "", 9).is_err());
+        assert_eq!(
+            IssueRef::new("octo", "repo", 0),
+            Err(InvalidIssueRef::ZeroNumber)
+        );
+        assert_eq!(
+            serde_json::to_value(&issue).unwrap(),
+            serde_json::json!({"owner":"octo","repository":"repo","number":9})
+        );
+        assert_eq!(
+            IssueRef::new("octo", "chimera", 9).unwrap().to_string(),
+            "octo/chimera#9"
+        );
+        for json in [
+            r#"{"owner":"o","repository":"","number":1}"#,
+            r#"{"owner":" ","repository":"r","number":1}"#,
+            r#"{"owner":"o","repository":"  ","number":1}"#,
+            r#"{"owner":"o","repository":"r","number":0}"#,
+        ] {
+            assert!(serde_json::from_str::<IssueRef>(json).is_err());
+        }
         assert!(
             serde_json::from_str::<IssueRef>(r#"{"owner":"","repository":"r","number":1}"#)
                 .is_err()
