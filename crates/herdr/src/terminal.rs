@@ -361,8 +361,25 @@ mod tests {
         Removals,
         /// Writes that confirm a delivery.
         Confirmations,
+        /// Writes that record a pending send.
+        Pendings,
         /// Every write.
         All,
+    }
+
+    impl Fault {
+        fn hits(self, tokens: &serde_json::Map<String, Value>) -> bool {
+            let removes = tokens.values().any(Value::is_null);
+            let confirms = tokens.values().any(|v| v == DELIVERED);
+            let pends = tokens.values().any(|v| v == PENDING);
+            match self {
+                Fault::None => false,
+                Fault::Removals => removes,
+                Fault::Confirmations => confirms,
+                Fault::Pendings => pends,
+                Fault::All => true,
+            }
+        }
     }
 
     /// The state of a fake Herdr. It outlives any `HerdrTerminal`, as Herdr outlives Chimera, and
@@ -375,6 +392,11 @@ mod tests {
         requests: Vec<Value>,
         prompt: Prompt,
         fault: Fault,
+        /// Writes that are applied and then get no reply.
+        lost: Fault,
+        /// The next pending write is applied and its reply is withheld, connection held open.
+        hang_pending: bool,
+        hung: bool,
         drop_create_reply: bool,
     }
 
@@ -397,6 +419,9 @@ mod tests {
                 requests: vec![],
                 prompt: Prompt::Accept,
                 fault: Fault::None,
+                lost: Fault::None,
+                hang_pending: false,
+                hung: false,
                 drop_create_reply: false,
             }));
             let shared = world.clone();
@@ -408,7 +433,14 @@ mod tests {
                         let mut line = String::new();
                         stream.read_line(&mut line).await.unwrap();
                         let request: Value = serde_json::from_str(&line).unwrap();
-                        let result = world.lock().unwrap().handle(&request);
+                        let (result, hung) = {
+                            let mut world = world.lock().unwrap();
+                            let result = world.handle(&request);
+                            (result, std::mem::take(&mut world.hung))
+                        };
+                        if hung {
+                            std::future::pending::<()>().await;
+                        }
                         if let Some(result) = result {
                             let reply = match result.get("code") {
                                 Some(_) => json!({"id": request["id"], "error": result}),
@@ -500,14 +532,7 @@ mod tests {
                     "pane_id":"w1:p2","workspace_id":"w1"}}),
                 "pane.report_metadata" => {
                     let tokens = params["tokens"].as_object().unwrap();
-                    let removes = tokens.values().any(Value::is_null);
-                    let confirms = tokens.values().any(|v| v == DELIVERED);
-                    let faulty = match self.fault {
-                        Fault::None => false,
-                        Fault::Removals => removes,
-                        Fault::Confirmations => confirms,
-                        Fault::All => true,
-                    };
+                    let faulty = self.fault.hits(tokens);
                     let mut merged = self.tokens.clone();
                     for (key, value) in tokens {
                         match value.as_str() {
@@ -519,6 +544,14 @@ mod tests {
                         return Some(json!({"code":"metadata_token_limit","message":"m"}));
                     }
                     self.tokens = merged;
+                    if self.lost.hits(tokens) {
+                        return None;
+                    }
+                    if self.hang_pending && tokens.values().any(|v| v == PENDING) {
+                        self.hang_pending = false;
+                        self.hung = true;
+                        return None;
+                    }
                     json!({"type":"ok"})
                 }
                 "agent.prompt" => {
@@ -712,6 +745,98 @@ mod tests {
         assert!(send(&fake, "one").await.unwrap_err().is_uncertain());
         assert_eq!(fake.delivered(), ["one"]);
         fake.with(|world| world.fault = Fault::None);
+        assert!(received(&fake).await.unwrap_err().is_uncertain());
+    }
+
+    fn pending_tokens(fake: &Fake) -> usize {
+        let world = fake.world.lock().unwrap();
+        world.tokens.values().filter(|v| *v == PENDING).count()
+    }
+
+    #[tokio::test]
+    async fn pending_write_applied_but_unanswered_is_cleaned_up_and_nothing_is_sent() {
+        let fake = Fake::start("pending-lost");
+        send(&fake, "one").await.unwrap();
+        fake.with(|world| world.lost = Fault::Pendings);
+        assert!(send(&fake, "two").await.unwrap_err().is_uncertain());
+        fake.with(|world| world.lost = Fault::None);
+        assert_eq!(fake.delivered(), ["one"]);
+        assert_eq!(pending_tokens(&fake), 0);
+        assert_eq!(received(&fake).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_write_applied_but_unanswered_with_failed_cleanup_is_uncertain() {
+        let fake = Fake::start("pending-lost-cleanup-fails");
+        send(&fake, "one").await.unwrap();
+        fake.with(|world| {
+            world.lost = Fault::Pendings;
+            world.fault = Fault::Removals;
+        });
+        assert!(send(&fake, "two").await.unwrap_err().is_uncertain());
+        fake.with(|world| {
+            world.lost = Fault::None;
+            world.fault = Fault::None;
+        });
+        assert_eq!(fake.delivered(), ["one"]);
+        assert!(received(&fake).await.unwrap_err().is_uncertain());
+    }
+
+    #[tokio::test]
+    async fn pending_and_cleanup_both_applied_but_unanswered_leave_no_receipt() {
+        let fake = Fake::start("all-lost");
+        send(&fake, "one").await.unwrap();
+        fake.with(|world| world.lost = Fault::All);
+        assert!(send(&fake, "two").await.unwrap_err().is_uncertain());
+        fake.with(|world| world.lost = Fault::None);
+        assert_eq!(fake.delivered(), ["one"]);
+        assert_eq!(received(&fake).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn confirmation_applied_but_unanswered_still_counts_the_delivery() {
+        let fake = Fake::start("confirm-lost");
+        send(&fake, "one").await.unwrap();
+        fake.with(|world| world.lost = Fault::Confirmations);
+        assert!(send(&fake, "two").await.unwrap_err().is_uncertain());
+        fake.with(|world| world.lost = Fault::None);
+        assert_eq!(fake.delivered(), ["one", "two"]);
+        assert_eq!(received(&fake).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn removal_applied_but_unanswered_after_a_rejection_does_not_count_it() {
+        let fake = Fake::start("removal-lost");
+        send(&fake, "one").await.unwrap();
+        fake.with(|world| world.lost = Fault::Removals);
+        assert!(send(&fake, "bad").await.unwrap_err().is_uncertain());
+        fake.with(|world| world.lost = Fault::None);
+        assert_eq!(fake.delivered(), ["one"]);
+        assert_eq!(received(&fake).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_cancelled_after_its_pending_receipt_but_before_the_prompt_is_uncertain() {
+        let fake = Arc::new(Fake::start("cancelled"));
+        send(&fake, "one").await.unwrap();
+        fake.with(|world| world.hang_pending = true);
+        let task = {
+            let fake = fake.clone();
+            tokio::spawn(async move { send(&fake, "two").await })
+        };
+        // The pending receipt is persisted while its reply is still outstanding.
+        while pending_tokens(&fake) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let prompts = fake
+            .methods()
+            .iter()
+            .filter(|m| *m == "agent.prompt")
+            .count();
+        assert_eq!(prompts, 1, "only the first send issued agent.prompt");
+        assert_eq!(fake.delivered(), ["one"]);
         assert!(received(&fake).await.unwrap_err().is_uncertain());
     }
 
