@@ -1,4 +1,8 @@
-use crate::{HerdrClient, HerdrError, herdr::Effect, herdr::require_absolute};
+use crate::{
+    HerdrClient, HerdrError,
+    herdr::{Effect, require_absolute},
+    terminal::{METADATA_SOURCE, ROOT_TOKEN},
+};
 use chimera_core::{PaneId, WorkspaceId};
 use serde::Deserialize;
 use serde_json::json;
@@ -23,10 +27,38 @@ impl HerdrClient {
                 Effect::Change,
             )
             .await?;
-        Ok((
-            workspace_id(created.workspace.workspace_id)?,
-            pane_id(created.root_pane.pane_id)?,
-        ))
+        let workspace = workspace_id(created.workspace.workspace_id)?;
+        let root = pane_id(created.root_pane.pane_id)?;
+        // Without its root token the workspace could not be found again, so give it up rather
+        // than leave it orphaned.
+        if let Err(error) = self.record_root(&workspace, directory).await {
+            let _ = self.close_workspace(&workspace).await;
+            return Err(HerdrError::Protocol {
+                message: format!("workspace created but its root was not recorded: {error}"),
+                uncertain: true,
+            });
+        }
+        Ok((workspace, root))
+    }
+
+    async fn record_root(
+        &self,
+        workspace: &WorkspaceId,
+        directory: &Path,
+    ) -> Result<(), HerdrError> {
+        let _: serde_json::Value = self
+            .request(
+                "workspace.report_metadata",
+                &json!({
+                    "workspace_id": workspace.as_str(),
+                    "source": METADATA_SOURCE,
+                    "tokens": {ROOT_TOKEN: root_key(directory)},
+                }),
+                "ok",
+                Effect::Change,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Split a pane and return the new pane.
@@ -63,6 +95,25 @@ impl HerdrClient {
             Err(error) => Err(error),
         }
     }
+}
+
+/// A stable key for a workspace root, short enough for a Herdr token (values are cut at about
+/// 64 characters): 128 bits of two FNV-1a hashes of the real path, or of the path as given when
+/// it cannot be resolved.
+pub(crate) fn root_key(directory: &Path) -> String {
+    let resolved = directory.canonicalize();
+    let path = resolved.as_deref().unwrap_or(directory);
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let hash = |seed: u64| {
+        bytes.iter().fold(seed, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    };
+    format!(
+        "{:016x}{:016x}",
+        hash(0xcbf2_9ce4_8422_2325),
+        hash(0x9e37_79b9_7f4a_7c15)
+    )
 }
 
 // An empty ID in a response means Herdr may have created the resource.
@@ -133,6 +184,17 @@ mod tests {
                 response.push('\n');
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
+            // Later requests (the root metadata write) get a plain acknowledgement.
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let reply = json!({"id": request["id"], "result": {"type": "ok"}});
+                    let _ = stream.write_all(format!("{reply}\n").as_bytes()).await;
+                }
+            });
             request
         });
         let client = HerdrClient {

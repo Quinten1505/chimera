@@ -383,6 +383,13 @@ async fn connects_creates_workspace_and_splits_pane_over_socket() {
                 }),
             ),
             (
+                json!({"method":"workspace.report_metadata","params":{
+                    "workspace_id":"w2","source":"chimera",
+                    "tokens":{"chimera_root": crate::workspace::root_key(Path::new("/repo with spaces"))}
+                }}),
+                json!({"type":"ok"}),
+            ),
+            (
                 json!({"method":"pane.split","params":{
                     "target_pane_id":"w2:p1","direction":"right","focus":false
                 }}),
