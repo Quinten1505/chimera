@@ -16,8 +16,8 @@ mod workspace;
 pub use agent::{Agent, AgentSessionReference};
 
 pub use herdr::{
-    CreatedWorkspace, HerdrClient, HerdrError, Pane, PaneOptions, SplitDirection, Tab, Workspace,
-    WorkspaceOptions,
+    CreatedWorkspace, HerdrClient, HerdrError, OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES, Pane,
+    PaneOptions, SplitDirection, Tab, Workspace, WorkspaceOptions,
 };
 
 pub use status::{AgentRecord, is_not_found, turn_status, turn_status_of_lookup};

@@ -441,5 +441,8 @@ pub(crate) mod test_support {
     }
 }
 
+mod turn;
+pub use turn::{OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES};
+
 #[cfg(all(test, unix))]
 mod tests;
