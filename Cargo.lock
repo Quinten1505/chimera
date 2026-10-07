@@ -146,6 +146,7 @@ dependencies = [
 name = "chimera-herdr"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chimera-core",
  "serde",
  "serde_json",

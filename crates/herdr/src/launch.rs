@@ -4,41 +4,41 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::time::{Instant, sleep, timeout_at};
 
-/// How long [`HerdrClient::launch_agent`] waits for Herdr to report an agent on the pane.
-pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long [`HerdrClient::launch_command_line`] waits for Herdr to report an agent on the pane.
+pub(crate) const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 impl HerdrClient {
     /// Launch an agent in an existing shell pane and wait until Herdr reports one there.
     ///
-    /// `command` is the program followed by its arguments. The adapter knows nothing about
-    /// providers: `agent.start` needs an agent kind, so the quoted command line is typed into the
-    /// pane's shell instead, and readiness is detected by polling `pane.get` for an agent.
+    /// `line` is a ready command line, typed into the pane's shell exactly as given; it must be
+    /// a single line. The adapter knows nothing about providers: `agent.start` needs an agent
+    /// kind, so the line is typed into the pane instead, and readiness is detected by polling
+    /// `pane.get` for an agent.
     ///
-    /// Invalid input is *failed*. Once the command has been sent, a timeout, a dropped connection
+    /// Invalid input is *failed*. Once the line has been sent, a timeout, a dropped connection
     /// or any other error is *uncertain*, because the process may already be running. Nothing is
-    /// retried.
-    pub async fn launch_agent(&self, pane: &PaneId, command: &[String]) -> Result<(), HerdrError> {
-        self.launch_agent_within(pane, command, DEFAULT_READY_TIMEOUT)
-            .await
-    }
-
-    /// As [`launch_agent`](Self::launch_agent), with an explicit readiness wait.
-    ///
-    /// The launch requests use a socket timeout longer than `ready_timeout` (the client timeout
-    /// on top of it), and each readiness poll is also bounded by the remaining wait, so the
-    /// socket timeout never cuts the wait short.
-    pub async fn launch_agent_within(
+    /// retried. The launch requests use a socket timeout longer than `ready_timeout` (the client
+    /// timeout on top of it), and each readiness poll is also bounded by the remaining wait, so
+    /// the socket timeout never cuts the wait short.
+    pub(crate) async fn launch_command_line(
         &self,
         pane: &PaneId,
-        command: &[String],
+        line: &str,
         ready_timeout: Duration,
     ) -> Result<(), HerdrError> {
         if pane.as_str().trim().is_empty() {
             return Err(HerdrError::InvalidInput("pane ID must not be empty"));
         }
-        let line = shell_command_line(command)?;
+        if line.trim().is_empty() {
+            return Err(HerdrError::InvalidInput("command line must not be empty"));
+        }
+        if line.contains(['\0', '\n', '\r']) {
+            return Err(HerdrError::InvalidInput(
+                "command line must be a single line without NUL",
+            ));
+        }
         let deadline = Instant::now() + ready_timeout;
         let socket_timeout = ready_timeout.saturating_add(self.timeout());
 
@@ -97,39 +97,6 @@ impl HerdrClient {
             }),
         }
     }
-}
-
-/// Quote each entry for a POSIX shell and join them, rejecting what cannot be typed safely.
-fn shell_command_line(command: &[String]) -> Result<String, HerdrError> {
-    let Some(program) = command.first() else {
-        return Err(HerdrError::InvalidInput("command must not be empty"));
-    };
-    if program.is_empty() {
-        return Err(HerdrError::InvalidInput("program must not be empty"));
-    }
-    if command.iter().any(|part| part.contains('\0')) {
-        return Err(HerdrError::InvalidInput("command must not contain NUL"));
-    }
-    // The program is always quoted: bare, it could parse as an assignment (`a=b`) or a reserved word (`if`).
-    let mut parts = vec![force_quote(program)];
-    parts.extend(command[1..].iter().map(|part| shell_quote(part)));
-    Ok(parts.join(" "))
-}
-
-fn shell_quote(text: &str) -> String {
-    let plain = !text.is_empty()
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-./=:,@%+".contains(&b));
-    if plain {
-        text.to_owned()
-    } else {
-        force_quote(text)
-    }
-}
-
-fn force_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 #[cfg(all(test, unix))]

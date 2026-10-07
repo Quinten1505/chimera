@@ -9,12 +9,12 @@ use super::{Effect, HerdrClient, HerdrError};
 use crate::{AgentRecord, turn_status_of_lookup};
 
 /// Most output lines requested from Herdr by [`HerdrClient::read_output`].
-pub const OUTPUT_MAX_LINES: u32 = 500;
+pub(crate) const OUTPUT_MAX_LINES: u32 = 500;
 
 /// Largest output returned by [`HerdrClient::read_output`], in bytes. When the pane's recent
 /// output is longer, the oldest part is dropped (at a character boundary) so the end, where the
 /// agent's latest answer is, is kept.
-pub const OUTPUT_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const OUTPUT_MAX_BYTES: usize = 64 * 1024;
 
 /// Herdr error codes that arrive after the prompt was already submitted: the outcome of the
 /// send is not known to have failed.

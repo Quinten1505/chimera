@@ -22,7 +22,7 @@ pub(crate) enum Effect {
 /// Each operation opens its own connection. Requests are never retried automatically:
 /// a timeout may occur after Herdr has already performed the operation.
 #[derive(Debug, Clone)]
-pub struct HerdrClient {
+pub(crate) struct HerdrClient {
     pub(crate) socket_path: PathBuf,
     pub(crate) timeout: Duration,
 }
@@ -31,12 +31,12 @@ impl HerdrClient {
     /// Connect to an explicit server socket and verify it with a ping.
     ///
     /// Uses a 30-second timeout per request. Native Windows is unsupported; use WSL.
-    pub async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, HerdrError> {
+    pub(crate) async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, HerdrError> {
         Self::connect_with_timeout(socket_path, Duration::from_secs(30)).await
     }
 
     /// Connect with a nonzero timeout for each request.
-    pub async fn connect_with_timeout(
+    pub(crate) async fn connect_with_timeout(
         socket_path: impl AsRef<Path>,
         timeout: Duration,
     ) -> Result<Self, HerdrError> {
@@ -51,39 +51,6 @@ impl HerdrClient {
             .request("ping", &serde_json::json!({}), "pong", Effect::Read)
             .await?;
         Ok(client)
-    }
-
-    /// Open an existing directory in a new Herdr workspace, without creating a Git checkout.
-    pub async fn create_workspace(
-        &self,
-        options: &WorkspaceOptions,
-    ) -> Result<CreatedWorkspace, HerdrError> {
-        require_absolute(&options.cwd)?;
-        self.request(
-            "workspace.create",
-            options,
-            "workspace_created",
-            Effect::Change,
-        )
-        .await
-    }
-
-    /// Add a pane by splitting a specific existing pane.
-    pub async fn add_pane(&self, options: &PaneOptions) -> Result<Pane, HerdrError> {
-        if options.target_pane_id.trim().is_empty() {
-            return Err(HerdrError::InvalidInput("target_pane_id must not be empty"));
-        }
-        if let Some(cwd) = &options.cwd {
-            require_absolute(cwd)?;
-        }
-        #[derive(Deserialize)]
-        struct PaneResult {
-            pane: Pane,
-        }
-        let result: PaneResult = self
-            .request("pane.split", options, "pane_info", Effect::Change)
-            .await?;
-        Ok(result.pane)
     }
 
     pub(crate) async fn request<T: DeserializeOwned>(
@@ -139,98 +106,21 @@ impl HerdrClient {
     }
 }
 
-/// Options for opening an existing directory in Herdr.
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkspaceOptions {
-    /// Absolute directory on the Herdr server.
-    pub cwd: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    pub focus: bool,
-}
-
-impl WorkspaceOptions {
-    pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        Self {
-            cwd: cwd.into(),
-            label: None,
-            focus: false,
-        }
-    }
-}
-
 /// A workspace and its initial tab and pane returned by Herdr.
 #[derive(Debug, Clone, Deserialize)]
-pub struct CreatedWorkspace {
+pub(crate) struct CreatedWorkspace {
     pub workspace: Workspace,
-    pub tab: Tab,
     pub root_pane: Pane,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SplitDirection {
-    Right,
-    Down,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PaneOptions {
-    pub target_pane_id: String,
-    pub direction: SplitDirection,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<PathBuf>,
-    pub focus: bool,
-}
-
-impl PaneOptions {
-    pub fn new(target_pane_id: impl Into<String>, direction: SplitDirection) -> Self {
-        Self {
-            target_pane_id: target_pane_id.into(),
-            direction,
-            cwd: None,
-            focus: false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
-pub struct Workspace {
-    pub workspace_id: String,
-    pub label: String,
-    /// Git checkout path from Herdr's optional worktree metadata.
-    /// None means Herdr did not report an association, even if panes run in a repo.
-    #[serde(
-        default,
-        rename = "worktree",
-        deserialize_with = "deserialize_checkout_path"
-    )]
-    pub checkout_path: Option<PathBuf>,
-}
-
-fn deserialize_checkout_path<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    struct Metadata {
-        checkout_path: PathBuf,
-    }
-
-    Ok(Option::<Metadata>::deserialize(deserializer)?.map(|metadata| metadata.checkout_path))
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Tab {
-    pub tab_id: String,
+pub(crate) struct Workspace {
     pub workspace_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Pane {
+pub(crate) struct Pane {
     pub pane_id: String,
-    pub workspace_id: String,
-    pub tab_id: String,
 }
 
 /// A failed Herdr operation, classified as *failed* or *uncertain*.
@@ -402,7 +292,6 @@ pub(crate) mod test_support {
 }
 
 mod turn;
-pub use turn::{OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES};
 
 #[cfg(all(test, unix))]
 mod tests;

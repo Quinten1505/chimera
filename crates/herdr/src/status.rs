@@ -16,6 +16,7 @@ impl AgentRecord {
     /// Decodes an `agent_info` result (`{"type":"agent_info","agent":{...}}`). The record
     /// carries the agent's name in `agent` and its state in `agent_status`; a missing or `null`
     /// record, or one whose own `agent` is `null`, means the pane hosts no agent.
+    #[cfg(test)]
     pub fn from_agent_info(result: &serde_json::Value) -> Result<Option<Self>, HerdrError> {
         match result.get("agent") {
             None | Some(serde_json::Value::Null) => Ok(None),
@@ -62,7 +63,7 @@ impl AgentRecord {
 
 /// Whether `error` says the agent, pane or workspace no longer exists
 /// (`agent_not_found`, `pane_not_found`, `workspace_not_found`).
-pub fn is_not_found(error: &HerdrError) -> bool {
+pub(crate) fn is_not_found(error: &HerdrError) -> bool {
     matches!(
         error,
         HerdrError::Server { code, .. }
@@ -80,7 +81,7 @@ pub fn is_not_found(error: &HerdrError) -> bool {
 /// - `idle`, `done` → [`TurnStatus::Finished`].
 /// - no agent → [`TurnStatus::Gone`].
 /// - any other string → [`TurnStatus::Running`]: a newer Herdr must never end a turn early.
-pub fn turn_status(agent: Option<&AgentRecord>) -> TurnStatus {
+pub(crate) fn turn_status(agent: Option<&AgentRecord>) -> TurnStatus {
     match agent.map(|agent| agent.status.as_str()) {
         None => TurnStatus::Gone,
         Some("idle" | "done") => TurnStatus::Finished,
@@ -90,7 +91,7 @@ pub fn turn_status(agent: Option<&AgentRecord>) -> TurnStatus {
 
 /// [`turn_status`] for the outcome of looking the agent up: a not-found error means the pane or
 /// workspace is gone; any other error is passed on.
-pub fn turn_status_of_lookup(
+pub(crate) fn turn_status_of_lookup(
     lookup: Result<Option<AgentRecord>, HerdrError>,
 ) -> Result<TurnStatus, HerdrError> {
     match lookup {

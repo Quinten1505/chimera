@@ -237,14 +237,10 @@ async fn validates_inputs_before_contacting_server() {
         "/nonexistent/chimera-herdr.sock".into(),
         Duration::from_secs(1),
     );
-    let mut pane = PaneOptions::new("", SplitDirection::Down);
-    assert!(matches!(
-        client.add_pane(&pane).await,
-        Err(HerdrError::InvalidInput(_))
-    ));
-    pane.target_pane_id = "w1:p1".into();
-    pane.cwd = Some("relative".into());
-    let error = client.add_pane(&pane).await.unwrap_err();
+    let error = client
+        .create_workspace_in(Path::new("relative"))
+        .await
+        .unwrap_err();
     assert!(matches!(error, HerdrError::InvalidInput(_)));
     assert!(error.is_failed());
     assert!(matches!(
@@ -258,7 +254,7 @@ async fn missing_socket_is_failed() {
     let dir = SocketDirectory::new();
     let client = client_for(dir.socket(), Duration::from_secs(1));
     let error = client
-        .add_pane(&PaneOptions::new("w1:p1", SplitDirection::Down))
+        .split_pane(&chimera_core::PaneId::new("w1:p1").unwrap())
         .await
         .unwrap_err();
     assert!(matches!(error, HerdrError::Connect(_)));
@@ -272,7 +268,7 @@ async fn refused_connection_is_failed() {
     drop(UnixListener::bind(dir.socket()).unwrap());
     let client = client_for(dir.socket(), Duration::from_secs(1));
     let error = client
-        .create_workspace(&WorkspaceOptions::new("/repo"))
+        .create_workspace_in(Path::new("/repo"))
         .await
         .unwrap_err();
     assert!(matches!(&error, HerdrError::Connect(source)
@@ -306,7 +302,7 @@ async fn silent_server_makes_a_change_uncertain() {
     .await;
     let client = client_for(dir.socket(), Duration::from_millis(50));
     let error = client
-        .create_workspace(&WorkspaceOptions::new("/repo"))
+        .create_workspace_in(Path::new("/repo"))
         .await
         .unwrap_err();
     assert!(matches!(error, HerdrError::Timeout { uncertain: true }));
@@ -319,7 +315,7 @@ async fn dropped_connection_makes_a_change_uncertain() {
     let server = serve_once(&dir.socket(), |_, stream| async move { drop(stream) }).await;
     let client = client_for(dir.socket(), Duration::from_secs(2));
     let error = client
-        .add_pane(&PaneOptions::new("w1:p1", SplitDirection::Down))
+        .split_pane(&chimera_core::PaneId::new("w1:p1").unwrap())
         .await
         .unwrap_err();
     assert!(error.is_uncertain());
@@ -364,7 +360,7 @@ fn converts_to_port_error_preserving_classification_and_cause() {
 }
 
 #[tokio::test]
-async fn connects_creates_workspace_and_adds_pane_over_socket() {
+async fn connects_creates_workspace_and_splits_pane_over_socket() {
     let dir = SocketDirectory::new();
     let path = dir.socket();
     let listener = UnixListener::bind(&path).unwrap();
@@ -388,7 +384,7 @@ async fn connects_creates_workspace_and_adds_pane_over_socket() {
             ),
             (
                 json!({"method":"pane.split","params":{
-                    "target_pane_id":"w2:p1","direction":"right","cwd":"/worktrees/test","focus":true
+                    "target_pane_id":"w2:p1","direction":"right","focus":false
                 }}),
                 json!({"type":"pane_info","pane":{
                     "pane_id":"w2:p2","workspace_id":"w2","tab_id":"w2:t1"
@@ -412,29 +408,14 @@ async fn connects_creates_workspace_and_adds_pane_over_socket() {
     let client = HerdrClient::connect_with_timeout(&path, Duration::from_secs(2))
         .await
         .unwrap();
-    let created = client
-        .create_workspace(&WorkspaceOptions::new("/repo with spaces"))
+    let (workspace, root) = client
+        .create_workspace_in(Path::new("/repo with spaces"))
         .await
         .unwrap();
-    assert_eq!(created.workspace.workspace_id, "w2");
-    assert_eq!(
-        created.workspace.checkout_path.as_deref(),
-        Some(Path::new("/worktrees/test"))
-    );
-    let mut options = PaneOptions::new(created.root_pane.pane_id, SplitDirection::Right);
-    options.cwd = Some("/worktrees/test".into());
-    options.focus = true;
-    let pane = client.add_pane(&options).await.unwrap();
-    assert_eq!(pane.pane_id, "w2:p2");
+    assert_eq!(workspace.as_str(), "w2");
+    let pane = client.split_pane(&root).await.unwrap();
+    assert_eq!(pane.as_str(), "w2:p2");
     server.await.unwrap();
-}
-
-#[test]
-fn serializes_down_split() {
-    assert_eq!(
-        serde_json::to_value(PaneOptions::new("w1:p1", SplitDirection::Down)).unwrap(),
-        json!({"target_pane_id":"w1:p1","direction":"down","focus":false})
-    );
 }
 
 #[tokio::test]
@@ -449,112 +430,4 @@ async fn skips_live_helper_when_socket_path_is_unreachable() {
     if std::env::var_os("HERDR_SOCKET_PATH").is_none() {
         assert!(super::test_support::live_client().await.is_none());
     }
-}
-
-#[test]
-fn reads_main_checkout_and_missing_workspace_metadata() {
-    let workspace: Workspace = serde_json::from_value(json!({
-        "workspace_id": "w1",
-        "label": "repo",
-        "worktree": {
-            "checkout_path": "/repo",
-            "is_linked_worktree": false,
-            "repo_root": "/repo"
-        }
-    }))
-    .unwrap();
-    assert_eq!(workspace.checkout_path.as_deref(), Some(Path::new("/repo")));
-
-    for data in [
-        json!({"workspace_id": "w4", "label": "repo"}),
-        json!({"workspace_id": "w4", "label": "repo", "worktree": null}),
-    ] {
-        let workspace: Workspace = serde_json::from_value(data).unwrap();
-        assert_eq!(workspace.checkout_path, None);
-    }
-}
-
-async fn run_session_start(
-    target: &crate::SessionTarget,
-    expected: Value,
-    response: Value,
-) -> Result<crate::Session, HerdrError> {
-    let dir = SocketDirectory::new();
-    let server = serve_once(&dir.socket(), move |request, mut stream| async move {
-        assert_eq!(request["method"], expected["method"]);
-        assert_eq!(request["params"], expected["params"]);
-        stream
-            .get_mut()
-            .write_all(format!("{response}\n").as_bytes())
-            .await
-            .unwrap();
-    })
-    .await;
-    let client = client_for(dir.socket(), Duration::from_secs(2));
-    let result = client.start_session("session-123", target).await;
-    server.await.unwrap();
-    result
-}
-
-#[tokio::test]
-async fn starts_session_in_existing_directory_and_saves_returned_ids() {
-    let target = crate::SessionTarget::Workspace(WorkspaceOptions {
-        cwd: "/repo".into(),
-        label: Some("my session".into()),
-        focus: true,
-    });
-    let session = run_session_start(&target,
-        json!({"method":"workspace.create","params":{"cwd":"/repo","label":"my session","focus":true}}),
-        json!({"id":"chimera","result":{
-            "type":"workspace_created",
-            "workspace":{"workspace_id":"w4","label":"my session"},
-            "tab":{"tab_id":"w4:t1","workspace_id":"w4"},
-            "root_pane":{"pane_id":"w4:p1","workspace_id":"w4","tab_id":"w4:t1"}
-        }}),
-    ).await.unwrap();
-    assert_eq!(
-        session,
-        crate::Session {
-            session_id: "session-123".into(),
-            workspaces: vec![crate::WorkspacePanes {
-                workspace_id: "w4".into(),
-                pane_ids: vec!["w4:p1".into()],
-                checkout_path: None,
-            }],
-        }
-    );
-    let saved = serde_json::to_string(&session).unwrap();
-    assert_eq!(
-        serde_json::from_str::<crate::Session>(&saved).unwrap(),
-        session
-    );
-}
-
-#[tokio::test]
-async fn failed_session_start_returns_server_error() {
-    let target = crate::SessionTarget::Workspace(WorkspaceOptions::new("/missing"));
-    let error = run_session_start(
-        &target,
-        json!({"method":"workspace.create","params":{"cwd":"/missing","focus":false}}),
-        json!({"id":"chimera","error":{"code":"invalid_params","message":"directory missing"}}),
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(error, HerdrError::Server { code, message }
-        if code == "invalid_params" && message == "directory missing"));
-}
-
-#[tokio::test]
-async fn session_start_rejects_invalid_input_before_creating_resources() {
-    let client = client_for("/nonexistent/chimera.sock".into(), Duration::from_secs(1));
-    let target = crate::SessionTarget::Workspace(WorkspaceOptions::new("/repo"));
-    assert!(matches!(
-        client.start_session("  ", &target).await,
-        Err(HerdrError::InvalidInput(_))
-    ));
-    let target = crate::SessionTarget::Workspace(WorkspaceOptions::new("relative"));
-    assert!(matches!(
-        client.start_session("session-123", &target).await,
-        Err(HerdrError::InvalidInput(_))
-    ));
 }

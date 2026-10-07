@@ -15,7 +15,7 @@ impl HerdrClient {
         directory: &Path,
     ) -> Result<(WorkspaceId, PaneId), HerdrError> {
         require_absolute(directory)?;
-        let created: crate::CreatedWorkspace = self
+        let created: crate::herdr::CreatedWorkspace = self
             .request(
                 "workspace.create",
                 &json!({"cwd": directory, "focus": false}),
@@ -33,7 +33,7 @@ impl HerdrClient {
     pub async fn split_pane(&self, pane: &PaneId) -> Result<PaneId, HerdrError> {
         #[derive(Deserialize)]
         struct Split {
-            pane: crate::Pane,
+            pane: crate::herdr::Pane,
         }
         let split: Split = self
             .request(
