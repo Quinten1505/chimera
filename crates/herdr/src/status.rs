@@ -38,7 +38,12 @@ impl AgentRecord {
         match record.get("agent") {
             None | Some(serde_json::Value::Null) => return Ok(None),
             Some(serde_json::Value::String(_)) => {}
-            Some(_) => return Err(HerdrError::Protocol("agent is not a string".into())),
+            Some(_) => {
+                return Err(HerdrError::Protocol {
+                    message: "agent is not a string".into(),
+                    uncertain: false,
+                });
+            }
         }
         match record
             .get("agent_status")
@@ -47,9 +52,10 @@ impl AgentRecord {
             Some(status) => Ok(Some(Self {
                 status: status.to_owned(),
             })),
-            None => Err(HerdrError::Protocol(
-                "agent record has no agent_status".into(),
-            )),
+            None => Err(HerdrError::Protocol {
+                message: "agent record has no agent_status".into(),
+                uncertain: false,
+            }),
         }
     }
 }
@@ -226,7 +232,13 @@ mod tests {
     fn other_errors_are_not_mapped() {
         let other = server_error("internal", "boom");
         assert!(turn_status_of_lookup(Err(other)).is_err());
-        assert!(turn_status_of_lookup(Err(HerdrError::Protocol("x".into()))).is_err());
+        assert!(
+            turn_status_of_lookup(Err(HerdrError::Protocol {
+                message: "x".into(),
+                uncertain: false,
+            }))
+            .is_err()
+        );
     }
 
     #[test]
