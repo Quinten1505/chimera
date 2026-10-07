@@ -110,11 +110,10 @@ fn shell_command_line(command: &[String]) -> Result<String, HerdrError> {
     if command.iter().any(|part| part.contains('\0')) {
         return Err(HerdrError::InvalidInput("command must not contain NUL"));
     }
-    Ok(command
-        .iter()
-        .map(|part| shell_quote(part))
-        .collect::<Vec<_>>()
-        .join(" "))
+    // The program is always quoted: bare, it could parse as an assignment (`a=b`) or a reserved word (`if`).
+    let mut parts = vec![force_quote(program)];
+    parts.extend(command[1..].iter().map(|part| shell_quote(part)));
+    Ok(parts.join(" "))
 }
 
 fn shell_quote(text: &str) -> String {
@@ -125,8 +124,12 @@ fn shell_quote(text: &str) -> String {
     if plain {
         text.to_owned()
     } else {
-        format!("'{}'", text.replace('\'', r"'\''"))
+        force_quote(text)
     }
+}
+
+fn force_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 #[cfg(all(test, unix))]

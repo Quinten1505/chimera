@@ -127,7 +127,7 @@ async fn types_the_quoted_command_then_waits_for_an_agent() {
         requests[0]["params"],
         json!({
             "pane_id": "w1:p2",
-            "text": r#"codex --model 'gpt 6' 'it'\''s' '$HOME' 'say "hi"' ''"#,
+            "text": r#"'codex' --model 'gpt 6' 'it'\''s' '$HOME' 'say "hi"' ''"#,
             "keys": ["enter"],
         })
     );
@@ -148,6 +148,14 @@ fn quotes_for_a_posix_shell() {
     assert_eq!(shell_quote("$(rm -rf ~)"), "'$(rm -rf ~)'");
     assert_eq!(shell_quote("a\nb"), "'a\nb'");
     assert_eq!(shell_quote(""), "''");
+}
+
+#[test]
+fn quotes_the_program_so_it_is_never_parsed_as_shell_syntax() {
+    for program in ["launcher=value", "if", "while", "!", "{", "time"] {
+        let line = shell_command_line(&command(&[program, "arg=1"])).unwrap();
+        assert_eq!(line, format!("'{program}' arg=1"));
+    }
 }
 
 #[tokio::test]
