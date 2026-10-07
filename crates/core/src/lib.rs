@@ -13,14 +13,18 @@ use serde::{Deserialize, Serialize};
 
 /// The part an agent plays within a triplet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     Implementation,
     Review,
     Merge,
 }
 
+/// Reset command used when a profile does not name one.
+pub const DEFAULT_RESET_COMMAND: &str = "/clear";
+
 fn default_reset_command() -> String {
-    "/clear".to_string()
+    DEFAULT_RESET_COMMAND.to_string()
 }
 
 /// How one role's agent is launched and prompted.
@@ -364,6 +368,38 @@ mod tests {
         let profile: AgentProfile =
             serde_json::from_str(r#"{"provider":"p","model":"m","prompt_template":"t"}"#).unwrap();
         assert_eq!(profile.reset_command, "/clear");
+        assert_eq!(DEFAULT_RESET_COMMAND, "/clear");
+        let profile: AgentProfile = serde_json::from_str(
+            r#"{"provider":"p","model":"m","prompt_template":"t","reset_command":"/new"}"#,
+        )
+        .unwrap();
+        assert_eq!(profile.reset_command, "/new");
+    }
+
+    #[test]
+    fn role_serializes_snake_case() {
+        for (role, name) in [
+            (Role::Implementation, "implementation"),
+            (Role::Review, "review"),
+            (Role::Merge, "merge"),
+        ] {
+            let json = serde_json::to_string(&role).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<Role>(&json).unwrap(), role);
+        }
+    }
+
+    #[test]
+    fn agent_profile_round_trip_with_settings() {
+        let mut profile = AgentProfile::new("codex", "m", "t");
+        profile
+            .settings
+            .insert("reasoning_effort".into(), serde_json::json!("high"));
+        let json = serde_json::to_string(&profile).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentProfile>(&json).unwrap(),
+            profile
+        );
     }
 
     #[test]
