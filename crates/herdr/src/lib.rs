@@ -10,6 +10,7 @@
 mod agent;
 mod herdr;
 mod session;
+mod status;
 
 pub use agent::{Agent, AgentSessionReference};
 
@@ -17,5 +18,7 @@ pub use herdr::{
     CreatedWorkspace, HerdrClient, HerdrError, Pane, PaneOptions, SplitDirection, Tab, Workspace,
     WorkspaceOptions,
 };
+
+pub use status::{AgentRecord, is_not_found, turn_status, turn_status_of_lookup};
 
 pub use session::{Session, SessionTarget, WorkspacePanes};
