@@ -92,6 +92,7 @@ dependencies = [
  "chimera-herdr",
  "chimera-pipelines",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -145,9 +146,12 @@ dependencies = [
 name = "chimera-herdr"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chimera-core",
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

@@ -9,7 +9,7 @@ modules in a Cargo workspace. All modules run in the same process.
 | --- | --- |
 | `src/main.rs` | Composition root: load configuration, construct modules, and start the application. |
 | `crates/core` | Shared application concepts. |
-| `crates/herdr` | Herdr client: connection, workspace, pane, session, and agent operations. |
+| `crates/herdr` | `Terminal` adapter (`HerdrTerminal`) over Herdr's Unix socket. |
 | `crates/pipelines` | The four orchestration pipelines and the shared services. |
 | `crates/github` | `Forge` adapter: specification plans, issues, and pull requests through the GitHub API. |
 | `crates/git` | `Repository` adapter: branches, worktrees, and remote heads through the `git` CLI. |
@@ -42,8 +42,7 @@ and passes configuration into the modules that need it. Introduce interfaces
 for cross-module behavior when concrete use cases require them, keeping this
 dependency direction and avoiding cycles.
 
-Pipelines remains a scaffold. Configuration loads and validates the YAML settings (see below). The `crates/herdr` crate provides the Herdr
-client below. The executable retains its initial hello-world output.
+Pipelines remains a scaffold. Configuration loads and validates the YAML settings (see below). The `crates/herdr` crate provides the `Terminal` adapter below. The executable retains its initial hello-world output.
 
 ## Development
 
@@ -65,103 +64,67 @@ example, `cargo test -p chimera-pipelines`. The deployable binary is
 
 ## Herdr integration
 
-The `crates/herdr` crate (`chimera-herdr`) exposes a synchronous client for Herdr's local Unix socket API (Linux,
-macOS, and WSL). Start Herdr first and supply its socket path explicitly, for
-example from HERDR_SOCKET_PATH or ~/.config/herdr/herdr.sock. Native Windows
-named pipes are not implemented.
+The `crates/herdr` crate (`chimera-herdr`) implements core's `Terminal` port as
+`HerdrTerminal` over Herdr's local Unix socket API (Linux, macOS, and WSL; native
+Windows named pipes are not implemented). Start Herdr first and supply its socket
+path explicitly, for example from `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`.
+The public API is only `HerdrTerminal::connect`, `HerdrTerminal`, and `HerdrError`.
 
 ```rust
-use chimera_herdr::{
-    HerdrClient, PaneOptions, SplitDirection, WorkspaceOptions,
-};
+use std::sync::Arc;
+use chimera_core::terminal::Terminal;
+use chimera_herdr::HerdrTerminal;
 
-fn provision() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HerdrClient::connect(std::env::var("HERDR_SOCKET_PATH")?)?;
-    let workspace = client.create_workspace(&WorkspaceOptions::new(std::env::current_dir()?))?;
-    let pane = client.add_pane(&PaneOptions::new(
-        workspace.root_pane.pane_id,
-        SplitDirection::Right,
-    ))?;
-    println!("Created pane {}", pane.pane_id);
+async fn provision() -> Result<(), Box<dyn std::error::Error>> {
+    let terminal: Arc<dyn Terminal> =
+        Arc::new(HerdrTerminal::connect(std::env::var("HERDR_SOCKET_PATH")?).await?);
+    let (workspace, pane) = terminal.create_workspace(&std::env::current_dir()?).await?;
+    let second = terminal.split_pane(&workspace, &pane).await?;
+    terminal.launch_agent(&second, "codex --model gpt-6").await?;
+    terminal.send_prompt(&second, "hello").await?;
     Ok(())
 }
 ```
 
-Pane options accept an absolute working directory and focus
-flag; call add_pane repeatedly to add more panes, targeting returned pane IDs.
-Both operations default to leaving focus unchanged.
+The adapter knows nothing about roles, prompts, results, or providers. `launch_agent`
+takes a ready command line (built by `chimera-configuration`), types it into the pane's
+shell and returns once Herdr reports an agent on the pane (up to 30 seconds). Herdr's
+statuses map to `TurnStatus`: working, blocked and unknown are *running*; idle and done are
+*finished*; a missing agent, pane or workspace is *gone*. There is no inactivity timeout.
+`read_output` returns the recent output as plain text, capped at 500 lines and 64 KiB (the
+end is kept). `close_workspace` succeeds when the workspace is already gone.
 
-Connections are verified with ping. Requests use a fresh connection and a
-30-second read/write timeout, configurable with connect_with_timeout. Transport,
-JSON, protocol, validation, and server errors are returned as HerdrError.
-A timeout can happen after a mutation succeeds; requests are not retried
-automatically. Repository trust policy remains Herdr-owned.
+**Reconnecting.** `HerdrTerminal` keeps no workspace, pane, or agent state in memory; every
+operation addresses Herdr by the IDs it is given. After a Chimera restart, build a new
+instance from the socket path alone and use the IDs saved earlier. The count behind
+`prompts_received` is kept in Herdr itself: each send records its own pane metadata token
+(`chimera_p_<nonce>`) before sending, so concurrent sends and restarts never overwrite one
+another. The token is confirmed on delivery and removed on a certain failure; a send whose
+outcome is unknown leaves it pending, and `prompts_received` then reports *uncertain* instead
+of a count. Herdr allows 32 tokens per pane, so each send first folds confirmed tokens into
+one count token (`chimera_count`, `<version>:<count>`): a single report removes them and
+raises the count, carrying the next version as Herdr's per-source `seq`, so Herdr applies it
+whole or not at all and drops it if another fold came first. The count is therefore unbounded,
+and only sends in flight or left pending take further tokens; a send that finds the pane full
+is *failed* and sends nothing. `create_workspace` labels the workspace
+`chimera:<root key>` in the creating request, and `find_workspace` finds a workspace by that
+root token, not by any pane's working directory, so it works after a lost reply or a restart.
+Renaming the workspace in Herdr discards its identity.
 
-Tests use isolated fake Unix sockets. An optional read-only live connection test:
+**Errors.** Every `HerdrError` is *failed* (known not to have happened) or *uncertain*
+(a state-changing request was written and its outcome is unknown, so inspect Herdr before
+retrying); both convert into `PortError`. Requests use a fresh connection and a 30-second
+timeout, and nothing is retried automatically.
+
+Unit tests use isolated fake Unix sockets. Integration tests (`crates/herdr/tests`) drive a
+real Herdr through `dyn Terminal` and are skipped when `HERDR_SOCKET_PATH` is unset or
+unreachable:
 ```sh
-HERDR_SOCKET_PATH="$HOME/.config/herdr/herdr.sock" cargo test -p chimera-herdr live_connection -- --ignored
+HERDR_SOCKET_PATH="$HOME/.config/herdr/herdr.sock" cargo test -p chimera-herdr --test terminal
 ```
 
 The request shapes were checked against the installed Herdr 0.9.3 schema
 (protocol 22); see the [Herdr socket API](https://herdr.dev/docs/socket-api/).
-
-## Starting an application session
-
-Call HerdrClient::start_session with an application-owned ID and
-SessionTarget::Workspace for an existing directory.
-
-```rust
-use chimera_herdr::{HerdrClient, Session, SessionTarget, WorkspaceOptions};
-
-fn start(client: &HerdrClient) -> Result<Session, chimera_herdr::HerdrError> {
-    client.start_session(
-        "my-session",
-        &SessionTarget::Workspace(WorkspaceOptions::new("/home/me/git/project")),
-    )
-}
-```
-
-The returned Session records the workspace ID, initial pane ID, and known
-checkout path. It is populated only when Herdr reports checkout
-metadata; a pane's working directory alone does not establish a Git checkout.
-State is held in the returned struct and supports Serde serialization. Startup
-does not write a session file or launch an AI agent. Additional panes created
-with add_pane must be recorded in the session by the caller.
-
-## Starting Codex agents in an existing session
-
-Load a Chimera YAML file (see `chimera.example.yaml`) and launch one Codex agent
-per tracked pane:
-
-```rust,no_run
-use chimera::start_session_agents;
-use chimera_herdr::{HerdrClient, Session};
-
-fn launch(client: &HerdrClient, session: &mut Session) -> Result<(), Box<dyn std::error::Error>> {
-    start_session_agents(client, session, "chimera.yaml")
-}
-```
-
-`chimera_configuration::load(path)` returns the validated ticket and final
-`AgentConfiguration`s and the `Limits`, or a `ConfigurationError` naming the
-field. `start_session_agents` currently launches the `ticket.implementation`
-profile in every pane, with argv from `codex_launch_args`. The `chimera` binary
-loads its configuration first (path argument, default `chimera.yaml`) and exits
-with the error before any Herdr workspace is created. The mapping uses Codex's
-[configuration overrides](https://learn.chatgpt.com/docs/config-file/config-reference)
-and the installed CLI's `--approve-for-me` option.
-
-Herdr's `agent.start` launches into an existing shell pane and waits for
-interactive readiness. Each successful launch is appended to
-`WorkspacePanes.agents`, including its provider session reference when available.
-Already tracked panes are skipped. Launching stops at the first error and retains
-earlier successes; it is not a transaction and does not roll them back. A timeout
-can leave an agent running without a recorded success, so inspect Herdr before
-retrying. Startup allows Herdr 30 seconds for readiness and at least 35 seconds
-for the socket response.
-
-This helper consumes an already populated session. It does not create the layout,
-save session files, or change the executable's hello-world entry point.
 
 ## Git integration
 
