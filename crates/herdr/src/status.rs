@@ -10,6 +10,7 @@ use crate::HerdrError;
 pub struct AgentRecord {
     /// Herdr's agent status: `idle`, `working`, `blocked`, `done` or `unknown` (protocol 22).
     /// Kept as a string so a status added by a newer Herdr still decodes.
+    #[serde(rename = "agent_status", alias = "status")]
     pub status: String,
 }
 
@@ -77,7 +78,7 @@ mod tests {
 
     fn status_of_agent_info(status: &str) -> TurnStatus {
         let result = json!({"type":"agent_info","agent":{
-            "pane_id":"w2:p1","agent":"codex","status":status,"extra":1
+            "pane_id":"w2:p1","agent":"codex","agent_status":status,"extra":1
         }});
         turn_status(AgentRecord::from_agent_info(&result).unwrap().as_ref())
     }
@@ -112,7 +113,7 @@ mod tests {
     fn pane_info_with_and_without_agent() {
         let with = json!({"type":"pane_info","pane":{
             "pane_id":"w2:p1","workspace_id":"w2","tab_id":"w2:t1",
-            "agent":{"status":"done"}
+            "agent":{"agent_status":"done"}
         }});
         let agent = AgentRecord::from_pane_info(&with).unwrap();
         assert_eq!(turn_status(agent.as_ref()), TurnStatus::Finished);
@@ -144,6 +145,13 @@ mod tests {
         };
         assert!(turn_status_of_lookup(Err(other)).is_err());
         assert!(turn_status_of_lookup(Err(HerdrError::Protocol("x".into()))).is_err());
+    }
+
+    #[test]
+    fn plain_status_field_is_accepted() {
+        let result = json!({"type":"agent_info","agent":{"status":"idle"}});
+        let agent = AgentRecord::from_agent_info(&result).unwrap();
+        assert_eq!(turn_status(agent.as_ref()), TurnStatus::Finished);
     }
 
     #[test]
