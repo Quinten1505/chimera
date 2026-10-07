@@ -21,10 +21,57 @@ const METADATA_SOURCE: &str = "chimera";
 /// a unique nonce, so no send ever reads, rewrites, or counts another's: Herdr merges tokens
 /// per key, which makes concurrent sends, rollbacks, and restarts independent by construction.
 /// A token is [`PENDING`] from before the send until its outcome is known, then [`DELIVERED`]
-/// or removed. Herdr keeps at most 32 tokens per pane, which bounds the prompts one pane records.
+/// or removed. Delivered tokens are later folded into [`COUNT_KEY`].
 const RECEIPT_PREFIX: &str = "chimera_p_";
 const PENDING: &str = "pending";
 const DELIVERED: &str = "ok";
+
+/// The pane token holding `<version>:<count>`: the deliveries folded out of their own tokens,
+/// and the number of folds so far. Herdr keeps at most 32 tokens per pane, so without folding
+/// a pane could record only that many prompts.
+const COUNT_KEY: &str = "chimera_count";
+
+/// The most receipts one fold removes: a report carries at most 16 tokens, one being the count.
+const FOLD_LIMIT: usize = 15;
+
+/// The receipt tokens of a pane, as one atomic read of them shows.
+struct Receipts {
+    version: u64,
+    folded: u64,
+    delivered: Vec<String>,
+    unresolved: u64,
+}
+
+impl Receipts {
+    fn of(tokens: &HashMap<String, String>) -> Result<Self, HerdrError> {
+        let (version, folded) = match tokens.get(COUNT_KEY) {
+            None => (0, 0),
+            Some(value) => value
+                .split_once(':')
+                .and_then(|(version, count)| Some((version.parse().ok()?, count.parse().ok()?)))
+                .ok_or_else(|| HerdrError::Protocol {
+                    message: format!("the pane's prompt count {value:?} is malformed"),
+                    uncertain: true,
+                })?,
+        };
+        let mut receipts = Self {
+            version,
+            folded,
+            delivered: vec![],
+            unresolved: 0,
+        };
+        for (name, value) in tokens {
+            if name.starts_with(RECEIPT_PREFIX) {
+                if value == DELIVERED {
+                    receipts.delivered.push(name.clone());
+                } else {
+                    receipts.unresolved += 1;
+                }
+            }
+        }
+        Ok(receipts)
+    }
+}
 
 /// The [`Terminal`] port over a running Herdr's Unix socket.
 ///
@@ -93,26 +140,66 @@ impl HerdrClient {
     /// The number of confirmed deliveries. Any unresolved send makes the count unknowable, so
     /// that is an uncertain error rather than a number.
     async fn prompts_received(&self, pane: &PaneId) -> Result<u64, HerdrError> {
-        let record = self.get_pane(pane).await?;
-        let (mut delivered, mut unresolved) = (0_u64, 0_u64);
-        for (name, value) in &record.tokens {
-            if name.starts_with(RECEIPT_PREFIX) {
-                if value == DELIVERED {
-                    delivered += 1;
-                } else {
-                    unresolved += 1;
-                }
-            }
-        }
-        if unresolved > 0 {
+        let receipts = Receipts::of(&self.get_pane(pane).await?.tokens)?;
+        if receipts.unresolved > 0 {
             return Err(HerdrError::Protocol {
                 message: format!(
-                    "{unresolved} prompt delivery(ies) to the pane are unresolved, so the count is unknown"
+                    "{} prompt delivery(ies) to the pane are unresolved, so the count is unknown",
+                    receipts.unresolved
                 ),
                 uncertain: true,
             });
         }
-        Ok(delivered)
+        Ok(receipts.folded + receipts.delivered.len() as u64)
+    }
+
+    /// Folds delivered receipts into the count, so a pane's tokens stay bounded however many
+    /// prompts it receives. A fold removes receipts and adds them to the count in one report,
+    /// which Herdr applies whole or not at all, and only if no other fold came first: the report
+    /// carries the next version as its `seq`, and Herdr drops, without an error, any report from
+    /// the source whose `seq` does not exceed the last one it applied. A fold based on a stale
+    /// read therefore changes nothing. Every outcome, including an unknown one, leaves the
+    /// receipts consistent, so a fold that fails is simply left for a later send.
+    async fn fold_receipts(&self, pane: &PaneId) {
+        // A pane holds at most 32 tokens, so three folds clear it.
+        for _ in 0..3 {
+            let Ok(record) = self.get_pane(pane).await else {
+                return;
+            };
+            let Ok(receipts) = Receipts::of(&record.tokens) else {
+                return;
+            };
+            let more = receipts.delivered.len() > FOLD_LIMIT;
+            let batch: Vec<String> = receipts.delivered.into_iter().take(FOLD_LIMIT).collect();
+            let Some(version) = receipts.version.checked_add(1) else {
+                return;
+            };
+            if batch.is_empty() {
+                return;
+            }
+            let mut tokens = serde_json::Map::new();
+            let count = receipts.folded + batch.len() as u64;
+            tokens.insert(COUNT_KEY.into(), format!("{version}:{count}").into());
+            for key in batch {
+                tokens.insert(key, serde_json::Value::Null);
+            }
+            let folded: Result<serde_json::Value, _> = self
+                .request(
+                    "pane.report_metadata",
+                    &json!({
+                        "pane_id": pane.as_str(),
+                        "source": METADATA_SOURCE,
+                        "seq": version,
+                        "tokens": tokens,
+                    }),
+                    "ok",
+                    Effect::Change,
+                )
+                .await;
+            if folded.is_err() || !more {
+                return;
+            }
+        }
     }
 
     async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, HerdrError> {
@@ -244,8 +331,10 @@ impl Terminal for HerdrTerminal {
     /// the outcome is known: confirmed on delivery, removed on a certain failure. A send
     /// whose outcome is unknown, or whose token cannot be settled, leaves the token pending,
     /// which makes `prompts_received` uncertain instead of letting it report a prompt that may
-    /// not have arrived. Nothing is sent unless the pending token was recorded.
+    /// not have arrived. Nothing is sent unless the pending token was recorded. Each send
+    /// first folds earlier confirmed receipts into the count to keep room for its own.
     async fn send_prompt(&self, pane: &PaneId, prompt: &str) -> Result<(), PortError> {
+        self.client.fold_receipts(pane).await;
         let key = receipt_key();
         if let Err(error) = self.client.write_receipt(pane, &key, Some(PENDING)).await {
             if error.is_uncertain() {
@@ -363,6 +452,8 @@ mod tests {
         Confirmations,
         /// Writes that record a pending send.
         Pendings,
+        /// Writes that fold receipts into the count.
+        Folds,
         /// Every write.
         All,
     }
@@ -372,11 +463,13 @@ mod tests {
             let removes = tokens.values().any(Value::is_null);
             let confirms = tokens.values().any(|v| v == DELIVERED);
             let pends = tokens.values().any(|v| v == PENDING);
+            let folds = tokens.contains_key(COUNT_KEY);
             match self {
                 Fault::None => false,
                 Fault::Removals => removes,
                 Fault::Confirmations => confirms,
                 Fault::Pendings => pends,
+                Fault::Folds => folds,
                 Fault::All => true,
             }
         }
@@ -386,6 +479,8 @@ mod tests {
     /// applies each request atomically like the real server.
     struct World {
         tokens: BTreeMap<String, String>,
+        /// The last `seq` applied per metadata source.
+        seqs: BTreeMap<String, u64>,
         workspaces: Vec<(String, String)>,
         panes: Vec<(String, String)>,
         delivered: Vec<String>,
@@ -413,6 +508,7 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(dir.join("api.sock")).unwrap();
             let world = Arc::new(Mutex::new(World {
                 tokens: BTreeMap::new(),
+                seqs: BTreeMap::new(),
                 workspaces: vec![],
                 panes: vec![("w1:p1".into(), "w1".into())],
                 delivered: vec![],
@@ -532,6 +628,14 @@ mod tests {
                     "pane_id":"w1:p2","workspace_id":"w1"}}),
                 "pane.report_metadata" => {
                     let tokens = params["tokens"].as_object().unwrap();
+                    let source = params["source"].as_str().unwrap().to_owned();
+                    let seq = params["seq"].as_u64();
+                    // Like Herdr, a report not newer than the source's last is dropped silently.
+                    if seq
+                        .is_some_and(|seq| self.seqs.get(&source).is_some_and(|last| seq <= *last))
+                    {
+                        return Some(json!({"type":"ok"}));
+                    }
                     let faulty = self.fault.hits(tokens);
                     let mut merged = self.tokens.clone();
                     for (key, value) in tokens {
@@ -544,6 +648,9 @@ mod tests {
                         return Some(json!({"code":"metadata_token_limit","message":"m"}));
                     }
                     self.tokens = merged;
+                    if let Some(seq) = seq {
+                        self.seqs.insert(source, seq);
+                    }
                     if self.lost.hits(tokens) {
                         return None;
                     }
@@ -865,24 +972,117 @@ mod tests {
     #[tokio::test]
     async fn concurrent_sends_from_separate_instances_are_all_counted() {
         let fake = Arc::new(Fake::start("concurrent"));
-        let mut sends = tokio::task::JoinSet::new();
-        for n in 0..24 {
-            let fake = fake.clone();
-            // Rejected sends roll their receipts back while the others confirm theirs.
-            let prompt = if n % 3 == 0 {
-                "bad".to_owned()
-            } else {
-                format!("p{n}")
-            };
-            sends.spawn(async move { send(&fake, &prompt).await });
+        // Three rounds deliver more prompts than a pane has tokens, while the sends' folds race.
+        for round in 1..=3 {
+            let mut sends = tokio::task::JoinSet::new();
+            for n in 0..24 {
+                let fake = fake.clone();
+                // Rejected sends roll their receipts back while the others confirm theirs.
+                let prompt = if n % 3 == 0 {
+                    "bad".to_owned()
+                } else {
+                    format!("p{n}")
+                };
+                sends.spawn(async move { send(&fake, &prompt).await });
+            }
+            let mut accepted = 0;
+            while let Some(result) = sends.join_next().await {
+                accepted += u64::from(result.unwrap().is_ok());
+            }
+            assert_eq!(accepted, 16);
+            assert_eq!(received(&fake).await.unwrap(), 16 * round);
+            assert_eq!(fake.delivered().len() as u64, 16 * round);
         }
-        let mut accepted = 0;
-        while let Some(result) = sends.join_next().await {
-            accepted += u64::from(result.unwrap().is_ok());
+    }
+
+    fn token_count(fake: &Fake) -> usize {
+        fake.world.lock().unwrap().tokens.len()
+    }
+
+    #[tokio::test]
+    async fn a_pane_receives_more_prompts_than_it_has_tokens() {
+        let fake = Fake::start("many");
+        for n in 1..=100 {
+            send(&fake, &format!("p{n}")).await.unwrap();
+            // A fresh instance reads every confirmed delivery.
+            assert_eq!(received(&fake).await.unwrap(), n);
+            assert!(token_count(&fake) <= 2);
         }
-        assert_eq!(accepted, 16);
-        assert_eq!(received(&fake).await.unwrap(), 16);
-        assert_eq!(fake.delivered().len(), 16);
+        assert_eq!(fake.delivered().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn a_pane_full_of_confirmed_receipts_is_folded_and_keeps_its_count() {
+        let fake = Fake::start("full-of-receipts");
+        fake.with(|world| {
+            for n in 0..32 {
+                let key = format!("{RECEIPT_PREFIX}{n}");
+                world.tokens.insert(key, DELIVERED.into());
+            }
+        });
+        send(&fake, "one").await.unwrap();
+        assert_eq!(received(&fake).await.unwrap(), 33);
+        assert_eq!(token_count(&fake), 2);
+    }
+
+    #[tokio::test]
+    async fn fold_applied_but_unanswered_keeps_the_count() {
+        let fake = Fake::start("fold-lost");
+        fake.with(|world| world.lost = Fault::Folds);
+        for n in 1..=40 {
+            send(&fake, &format!("p{n}")).await.unwrap();
+            assert_eq!(received(&fake).await.unwrap(), n);
+        }
+        assert!(token_count(&fake) <= 2);
+    }
+
+    #[tokio::test]
+    async fn failing_folds_never_change_the_count_or_block_a_send_with_room() {
+        let fake = Fake::start("fold-fails");
+        send(&fake, "one").await.unwrap();
+        fake.with(|world| world.fault = Fault::Folds);
+        send(&fake, "two").await.unwrap();
+        assert_eq!(received(&fake).await.unwrap(), 2);
+        fake.with(|world| world.fault = Fault::None);
+        send(&fake, "three").await.unwrap();
+        assert_eq!(received(&fake).await.unwrap(), 3);
+        assert_eq!(token_count(&fake), 2);
+    }
+
+    #[tokio::test]
+    async fn a_fold_based_on_a_stale_read_changes_nothing() {
+        let fake = Fake::start("fold-stale");
+        send(&fake, "one").await.unwrap();
+        send(&fake, "two").await.unwrap();
+        send(&fake, "three").await.unwrap();
+        assert_eq!(received(&fake).await.unwrap(), 3);
+        // The fold of the third send applied version 2 and removed the second's receipt. One
+        // that read the same version before the second confirmed would set a lower count.
+        let count = fake.world.lock().unwrap().tokens[COUNT_KEY].clone();
+        assert_eq!(count, "2:2");
+        let stale: Value = fake
+            .terminal()
+            .client
+            .request(
+                "pane.report_metadata",
+                &json!({"pane_id": "w1:p1", "source": METADATA_SOURCE, "seq": 2,
+                    "tokens": {COUNT_KEY: "2:1"}}),
+                "ok",
+                Effect::Change,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale["type"], "ok");
+        assert_eq!(received(&fake).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_count_is_uncertain() {
+        let fake = Fake::start("malformed");
+        fake.with(|world| {
+            world.tokens.insert(COUNT_KEY.into(), "x".into());
+        });
+        assert!(received(&fake).await.unwrap_err().is_uncertain());
     }
 
     #[tokio::test]

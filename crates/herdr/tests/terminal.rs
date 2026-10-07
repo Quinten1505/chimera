@@ -28,6 +28,17 @@ while IFS= read -r line; do
 done
 "#;
 
+/// As [`AGENT_STUB`], but it answers at once, so many prompts can be sent in a test.
+const FAST_AGENT_STUB: &str = r#"#!/bin/bash
+report() { herdr pane report-agent "$HERDR_PANE_ID" --source chimera-it --agent codex --state "$1" >/dev/null 2>&1; }
+report idle
+while IFS= read -r line; do
+  report working
+  echo "ANSWER: $line"
+  report idle
+done
+"#;
+
 async fn live() -> Option<(PathBuf, Arc<dyn Terminal>)> {
     let Some(path) = std::env::var_os("HERDR_SOCKET_PATH") else {
         eprintln!("skipping: HERDR_SOCKET_PATH is not set");
@@ -66,8 +77,9 @@ async fn wait_for_turn(terminal: &dyn Terminal, pane: &PaneId) {
 struct TempDir(PathBuf);
 
 impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("chimera-herdr-it-{}", std::process::id()));
+    fn new(name: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("chimera-herdr-it-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir.canonicalize().unwrap())
     }
@@ -88,7 +100,7 @@ async fn full_lifecycle_through_dyn_terminal() {
     let Some((socket, terminal)) = live().await else {
         return;
     };
-    let dir = TempDir::new();
+    let dir = TempDir::new("lifecycle");
     let agent = dir.path().join("codex");
     std::fs::write(&agent, AGENT_STUB).unwrap();
     std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -155,6 +167,40 @@ async fn full_lifecycle_through_dyn_terminal() {
     again.close_workspace(&workspace).await.unwrap();
     assert_eq!(again.read_status(&root).await.unwrap(), TurnStatus::Gone);
     assert!(again.find_workspace(dir.path()).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_pane_counts_more_prompts_than_it_has_metadata_tokens_across_restarts() {
+    let Some((socket, terminal)) = live().await else {
+        return;
+    };
+    let dir = TempDir::new("many");
+    let agent = dir.path().join("codex");
+    std::fs::write(&agent, FAST_AGENT_STUB).unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (workspace, root) = terminal.create_workspace(dir.path()).await.unwrap();
+    let steps = {
+        let terminal = terminal.clone();
+        tokio::spawn(async move {
+            terminal
+                .launch_agent(&root, &format!("'{}'", agent.display()))
+                .await
+                .unwrap();
+            // Herdr keeps 32 tokens per pane; every send comes from a fresh instance.
+            for n in 1..=40 {
+                let fresh = HerdrTerminal::connect(&socket).await.unwrap();
+                fresh.send_prompt(&root, &format!("p{n}")).await.unwrap();
+                wait_for_status(&fresh, &root, TurnStatus::Finished).await;
+                let again = HerdrTerminal::connect(&socket).await.unwrap();
+                assert_eq!(again.prompts_received(&root).await.unwrap(), n);
+            }
+        })
+    }
+    .await;
+    let closed = terminal.close_workspace(&workspace).await;
+    steps.unwrap();
+    closed.unwrap();
 }
 
 #[tokio::test]

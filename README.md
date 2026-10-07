@@ -101,8 +101,12 @@ instance from the socket path alone and use the IDs saved earlier. The count beh
 (`chimera_p_<nonce>`) before sending, so concurrent sends and restarts never overwrite one
 another. The token is confirmed on delivery and removed on a certain failure; a send whose
 outcome is unknown leaves it pending, and `prompts_received` then reports *uncertain* instead
-of a count. Herdr allows 32 tokens per pane, which bounds the prompts one pane can record (a
-send past that is *failed* and sends nothing). `create_workspace` labels the workspace
+of a count. Herdr allows 32 tokens per pane, so each send first folds confirmed tokens into
+one count token (`chimera_count`, `<version>:<count>`): a single report removes them and
+raises the count, carrying the next version as Herdr's per-source `seq`, so Herdr applies it
+whole or not at all and drops it if another fold came first. The count is therefore unbounded,
+and only sends in flight or left pending take further tokens; a send that finds the pane full
+is *failed* and sends nothing. `create_workspace` labels the workspace
 `chimera:<root key>` in the creating request, and `find_workspace` finds a workspace by that
 root token, not by any pane's working directory, so it works after a lost reply or a restart.
 Renaming the workspace in Herdr discards its identity.
