@@ -11,18 +11,20 @@ use serde_json::json;
 
 use crate::{
     DEFAULT_READY_TIMEOUT, HerdrClient, HerdrError, herdr::Effect, herdr::require_absolute,
-    workspace::root_key,
+    workspace::root_label,
 };
 
 /// Source name under which Chimera reports metadata to Herdr.
-pub(crate) const METADATA_SOURCE: &str = "chimera";
+const METADATA_SOURCE: &str = "chimera";
 
-/// Pane token holding the number of prompts the pane has received. It lives in Herdr, so the
-/// receipt survives a Chimera restart.
-const PROMPTS_TOKEN: &str = "chimera_prompts";
-
-/// Workspace token holding the key of the directory the workspace was created for.
-pub(crate) const ROOT_TOKEN: &str = "chimera_root";
+/// Prefix of the pane tokens that record prompt deliveries. Each send owns one token, named by
+/// a unique nonce, so no send ever reads, rewrites, or counts another's: Herdr merges tokens
+/// per key, which makes concurrent sends, rollbacks, and restarts independent by construction.
+/// A token is [`PENDING`] from before the send until its outcome is known, then [`DELIVERED`]
+/// or removed. Herdr keeps at most 32 tokens per pane, which bounds the prompts one pane records.
+const RECEIPT_PREFIX: &str = "chimera_p_";
+const PENDING: &str = "pending";
+const DELIVERED: &str = "ok";
 
 /// The [`Terminal`] port over a running Herdr's Unix socket.
 ///
@@ -57,7 +59,7 @@ struct PaneRecord {
 struct WorkspaceRecord {
     workspace_id: String,
     #[serde(default)]
-    tokens: HashMap<String, String>,
+    label: String,
 }
 
 impl HerdrClient {
@@ -88,15 +90,29 @@ impl HerdrClient {
         Ok(found.pane)
     }
 
+    /// The number of confirmed deliveries. Any unresolved send makes the count unknowable, so
+    /// that is an uncertain error rather than a number.
     async fn prompts_received(&self, pane: &PaneId) -> Result<u64, HerdrError> {
         let record = self.get_pane(pane).await?;
-        match record.tokens.get(PROMPTS_TOKEN) {
-            None => Ok(0),
-            Some(value) => value.parse().map_err(|_| HerdrError::Protocol {
-                message: format!("pane token {PROMPTS_TOKEN} is not a count: {value:?}"),
-                uncertain: false,
-            }),
+        let (mut delivered, mut unresolved) = (0_u64, 0_u64);
+        for (name, value) in &record.tokens {
+            if name.starts_with(RECEIPT_PREFIX) {
+                if value == DELIVERED {
+                    delivered += 1;
+                } else {
+                    unresolved += 1;
+                }
+            }
         }
+        if unresolved > 0 {
+            return Err(HerdrError::Protocol {
+                message: format!(
+                    "{unresolved} prompt delivery(ies) to the pane are unresolved, so the count is unknown"
+                ),
+                uncertain: true,
+            });
+        }
+        Ok(delivered)
     }
 
     async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, HerdrError> {
@@ -110,14 +126,20 @@ impl HerdrClient {
         Ok(list.workspaces)
     }
 
-    async fn record_prompt(&self, pane: &PaneId, received: u64) -> Result<(), HerdrError> {
+    /// Sets one receipt token, or removes it with `None`.
+    async fn write_receipt(
+        &self,
+        pane: &PaneId,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), HerdrError> {
         let _: serde_json::Value = self
             .request(
                 "pane.report_metadata",
                 &json!({
                     "pane_id": pane.as_str(),
                     "source": METADATA_SOURCE,
-                    "tokens": {PROMPTS_TOKEN: received.to_string()},
+                    "tokens": {key: value},
                 }),
                 "ok",
                 Effect::Change,
@@ -125,6 +147,26 @@ impl HerdrClient {
             .await?;
         Ok(())
     }
+}
+
+/// A receipt token name that no other send, in this or another process, shares.
+fn receipt_key() -> String {
+    use std::{
+        collections::hash_map::RandomState,
+        hash::{BuildHasher, Hasher},
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    static SENDS: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(SENDS.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u32(std::process::id());
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos()),
+    );
+    format!("{RECEIPT_PREFIX}{:016x}", hasher.finish())
 }
 
 /// The creation number of a pane ID such as `w8:p2`, for ordering panes within a workspace.
@@ -142,22 +184,20 @@ impl Terminal for HerdrTerminal {
     }
 
     /// The first workspace, in Herdr's order, that Chimera created for `directory`. The root is
-    /// recorded in a workspace token at creation, so it does not follow a pane's current
-    /// directory.
+    /// the workspace's label, set by the request that created it, so it does not follow a
+    /// pane's current directory and exists whenever the workspace does.
     async fn find_workspace(
         &self,
         directory: &Path,
     ) -> Result<Option<(WorkspaceId, Vec<PaneId>)>, PortError> {
         require_absolute(directory)?;
-        let key = root_key(directory);
+        let label = root_label(directory);
         let Some(found) = self
             .client
             .list_workspaces()
             .await?
             .into_iter()
-            .find(|workspace| {
-                workspace.tokens.get(ROOT_TOKEN).map(String::as_str) == Some(key.as_str())
-            })
+            .find(|workspace| workspace.label == label)
         else {
             return Ok(None);
         };
@@ -200,28 +240,34 @@ impl Terminal for HerdrTerminal {
             .await?)
     }
 
-    /// Counts the prompt in a Herdr pane token, then sends it. The count is written first, so
-    /// a send whose reply is lost (the prompt may have been delivered) still counts, and it
-    /// survives a Chimera restart. A send that is certain to have failed takes the count back;
-    /// if that fails too, the count may be wrong and the result is uncertain.
+    /// Records the send in a pane token of its own before sending, and settles the token once
+    /// the outcome is known: confirmed on delivery, removed on a certain failure. A send
+    /// whose outcome is unknown, or whose token cannot be settled, leaves the token pending,
+    /// which makes `prompts_received` uncertain instead of letting it report a prompt that may
+    /// not have arrived. Nothing is sent unless the pending token was recorded.
     async fn send_prompt(&self, pane: &PaneId, prompt: &str) -> Result<(), PortError> {
-        let before = self.client.prompts_received(pane).await?;
-        self.client.record_prompt(pane, before + 1).await?;
-        let Err(error) = self.client.send_prompt(pane, prompt).await else {
-            return Ok(());
-        };
-        if error.is_uncertain() {
+        let key = receipt_key();
+        if let Err(error) = self.client.write_receipt(pane, &key, Some(PENDING)).await {
+            if error.is_uncertain() {
+                // Nothing was sent, so the token, if it was written, can go.
+                let _ = self.client.write_receipt(pane, &key, None).await;
+            }
             return Err(error.into());
         }
-        match self.client.record_prompt(pane, before).await {
-            Ok(()) => Err(error.into()),
-            Err(rollback) => Err(HerdrError::Protocol {
-                message: format!(
-                    "prompt failed ({error}) and its count was not undone: {rollback}"
-                ),
-                uncertain: true,
-            }
-            .into()),
+        match self.client.send_prompt(pane, prompt).await {
+            Ok(()) => self
+                .client
+                .write_receipt(pane, &key, Some(DELIVERED))
+                .await
+                .map_err(|error| unsettled("delivered but its receipt was not confirmed", &error)),
+            Err(error) if error.is_uncertain() => Err(error.into()),
+            Err(error) => match self.client.write_receipt(pane, &key, None).await {
+                Ok(()) => Err(error.into()),
+                Err(rollback) => Err(unsettled(
+                    &format!("failed ({error}) but its receipt was not removed"),
+                    &rollback,
+                )),
+            },
         }
     }
 
@@ -242,10 +288,24 @@ impl Terminal for HerdrTerminal {
     }
 }
 
+/// An uncertain error for a send whose receipt could not be settled.
+fn unsettled(what: &str, cause: &HerdrError) -> PortError {
+    HerdrError::Protocol {
+        message: format!("prompt {what}: {cause}"),
+        uncertain: true,
+    }
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[test]
     fn orders_panes_by_creation_number() {
@@ -258,76 +318,230 @@ mod tests {
     #[test]
     fn root_key_is_stable_short_and_follows_the_real_path() {
         let tmp = std::env::temp_dir();
-        assert_eq!(root_key(&tmp.join(".")), root_key(&tmp));
-        assert_ne!(root_key(Path::new("/a/b")), root_key(Path::new("/a/c")));
-        assert_eq!(root_key(Path::new("/a/b")).len(), 32);
+        assert_eq!(
+            crate::workspace::root_key(&tmp.join(".")),
+            crate::workspace::root_key(&tmp)
+        );
+        assert_ne!(
+            crate::workspace::root_key(Path::new("/a/b")),
+            crate::workspace::root_key(Path::new("/a/c"))
+        );
+        assert_eq!(crate::workspace::root_key(Path::new("/a/b")).len(), 32);
+        assert!(root_label(Path::new("/a/b")).len() <= 64);
     }
 
-    /// A fake Herdr: one connection per request, answered from `script` by method. A method
-    /// mapped to `None` drops the connection without a reply. Records every request.
+    #[test]
+    fn receipt_keys_are_unique_and_valid_token_names() {
+        let keys: std::collections::HashSet<_> = (0..1000).map(|_| receipt_key()).collect();
+        assert_eq!(keys.len(), 1000);
+        assert!(keys.iter().all(|key| {
+            key.len() <= 32
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        }));
+    }
+
+    /// What the fake's `agent.prompt` does.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Prompt {
+        Accept,
+        /// Delivered, but the reply is lost.
+        DropAfterDelivery,
+        /// Not delivered and no reply: Chimera restarting before the send.
+        DropBeforeDelivery,
+        Stall,
+    }
+
+    /// Which `pane.report_metadata` writes fail.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fault {
+        None,
+        /// Writes that remove a token.
+        Removals,
+        /// Writes that confirm a delivery.
+        Confirmations,
+        /// Every write.
+        All,
+    }
+
+    /// The state of a fake Herdr. It outlives any `HerdrTerminal`, as Herdr outlives Chimera, and
+    /// applies each request atomically like the real server.
+    struct World {
+        tokens: BTreeMap<String, String>,
+        workspaces: Vec<(String, String)>,
+        panes: Vec<(String, String)>,
+        delivered: Vec<String>,
+        requests: Vec<Value>,
+        prompt: Prompt,
+        fault: Fault,
+        drop_create_reply: bool,
+    }
+
     struct Fake {
         dir: std::path::PathBuf,
-        requests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        world: Arc<Mutex<World>>,
     }
 
     impl Fake {
-        fn start(
-            name: &str,
-            script: impl Fn(&serde_json::Value) -> Option<serde_json::Value> + Send + 'static,
-        ) -> (HerdrTerminal, Self) {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        fn start(name: &str) -> Self {
             let dir = std::env::temp_dir()
                 .join(format!("chimera-herdr-term-{}-{name}", std::process::id()));
             std::fs::create_dir(&dir).unwrap();
-            let socket = dir.join("api.sock");
-            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let seen = requests.clone();
+            let listener = tokio::net::UnixListener::bind(dir.join("api.sock")).unwrap();
+            let world = Arc::new(Mutex::new(World {
+                tokens: BTreeMap::new(),
+                workspaces: vec![],
+                panes: vec![("w1:p1".into(), "w1".into())],
+                delivered: vec![],
+                requests: vec![],
+                prompt: Prompt::Accept,
+                fault: Fault::None,
+                drop_create_reply: false,
+            }));
+            let shared = world.clone();
             tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
-                    let mut stream = BufReader::new(stream);
-                    let mut line = String::new();
-                    stream.read_line(&mut line).await.unwrap();
-                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                    seen.lock().unwrap().push(request.clone());
-                    if let Some(result) = script(&request) {
-                        let reply = match result.get("code") {
-                            Some(_) => json!({"id": request["id"], "error": result}),
-                            None => json!({"id": request["id"], "result": result}),
-                        };
-                        let mut bytes = reply.to_string().into_bytes();
-                        bytes.push(b'\n');
-                        stream.get_mut().write_all(&bytes).await.unwrap();
-                    }
+                    let world = shared.clone();
+                    tokio::spawn(async move {
+                        let mut stream = BufReader::new(stream);
+                        let mut line = String::new();
+                        stream.read_line(&mut line).await.unwrap();
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let result = world.lock().unwrap().handle(&request);
+                        if let Some(result) = result {
+                            let reply = match result.get("code") {
+                                Some(_) => json!({"id": request["id"], "error": result}),
+                                None => json!({"id": request["id"], "result": result}),
+                            };
+                            let _ = stream
+                                .get_mut()
+                                .write_all(format!("{reply}\n").as_bytes())
+                                .await;
+                        }
+                    });
                 }
             });
-            let terminal = HerdrTerminal {
+            Self { dir, world }
+        }
+
+        /// A new instance on the same socket: a Chimera restart.
+        fn terminal(&self) -> HerdrTerminal {
+            HerdrTerminal {
                 client: HerdrClient {
-                    socket_path: socket,
+                    socket_path: self.dir.join("api.sock"),
                     timeout: std::time::Duration::from_secs(2),
                 },
-            };
-            (terminal, Self { dir, requests })
+            }
+        }
+
+        fn with(&self, change: impl FnOnce(&mut World)) {
+            change(&mut self.world.lock().unwrap());
         }
 
         fn methods(&self) -> Vec<String> {
-            self.requests
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|request| request["method"].as_str().unwrap().to_owned())
+            let world = self.world.lock().unwrap();
+            let methods = world.requests.iter();
+            methods
+                .map(|r| r["method"].as_str().unwrap().to_owned())
                 .collect()
         }
 
-        /// Token values written by `pane.report_metadata`, in order.
-        fn written_counts(&self) -> Vec<String> {
-            self.requests
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|request| request["method"] == "pane.report_metadata")
-                .map(|request| request["params"]["tokens"][PROMPTS_TOKEN].to_string())
-                .collect()
+        fn delivered(&self) -> Vec<String> {
+            self.world.lock().unwrap().delivered.clone()
+        }
+    }
+
+    impl World {
+        fn handle(&mut self, request: &Value) -> Option<Value> {
+            self.requests.push(request.clone());
+            let params = &request["params"];
+            Some(match request["method"].as_str().unwrap() {
+                "workspace.create" => {
+                    let id = format!("w{}", self.workspaces.len() + 2);
+                    let label = params["label"].as_str().unwrap_or_default().to_owned();
+                    self.workspaces.push((id.clone(), label));
+                    self.panes.push((format!("{id}:p1"), id.clone()));
+                    if std::mem::take(&mut self.drop_create_reply) {
+                        return None;
+                    }
+                    json!({"type":"workspace_created","workspace":{"workspace_id":id},
+                        "root_pane":{"pane_id":format!("{id}:p1")}})
+                }
+                "workspace.list" => {
+                    let list = self.workspaces.iter();
+                    let list: Vec<_> = list
+                        .map(|(id, label)| json!({"workspace_id": id, "label": label}))
+                        .collect();
+                    json!({"type":"workspace_list","workspaces":list})
+                }
+                "workspace.close" => {
+                    let id = params["workspace_id"].as_str().unwrap();
+                    self.workspaces.retain(|(w, _)| w != id);
+                    self.panes.retain(|(_, w)| w != id);
+                    json!({"type":"ok"})
+                }
+                "pane.list" => {
+                    let list = self.panes.iter();
+                    let list: Vec<_> = list
+                        .map(|(id, ws)| json!({"pane_id": id, "workspace_id": ws}))
+                        .collect();
+                    json!({"type":"pane_list","panes":list})
+                }
+                "pane.get" => {
+                    let id = params["pane_id"].as_str().unwrap();
+                    let Some((_, ws)) = self.panes.iter().find(|(p, _)| p == id) else {
+                        return Some(json!({"code":"pane_not_found","message":"m"}));
+                    };
+                    json!({"type":"pane_info","pane":{"pane_id":id,"workspace_id":ws,
+                        "tokens":self.tokens}})
+                }
+                "pane.split" => json!({"type":"pane_info","pane":{
+                    "pane_id":"w1:p2","workspace_id":"w1"}}),
+                "pane.report_metadata" => {
+                    let tokens = params["tokens"].as_object().unwrap();
+                    let removes = tokens.values().any(Value::is_null);
+                    let confirms = tokens.values().any(|v| v == DELIVERED);
+                    let faulty = match self.fault {
+                        Fault::None => false,
+                        Fault::Removals => removes,
+                        Fault::Confirmations => confirms,
+                        Fault::All => true,
+                    };
+                    let mut merged = self.tokens.clone();
+                    for (key, value) in tokens {
+                        match value.as_str() {
+                            Some(value) => merged.insert(key.clone(), value.to_owned()),
+                            None => merged.remove(key),
+                        };
+                    }
+                    if faulty || merged.len() > 32 {
+                        return Some(json!({"code":"metadata_token_limit","message":"m"}));
+                    }
+                    self.tokens = merged;
+                    json!({"type":"ok"})
+                }
+                "agent.prompt" => {
+                    let text = params["text"].as_str().unwrap().to_owned();
+                    if text == "bad" {
+                        return Some(json!({"code":"agent_blocked","message":"m"}));
+                    }
+                    match self.prompt {
+                        Prompt::DropBeforeDelivery => return None,
+                        Prompt::DropAfterDelivery => {
+                            self.delivered.push(text);
+                            return None;
+                        }
+                        Prompt::Stall => {
+                            self.delivered.push(text);
+                            return Some(json!({"code":"agent_prompt_stalled","message":"m"}));
+                        }
+                        Prompt::Accept => self.delivered.push(text),
+                    }
+                    json!({"type":"agent_prompted","agent":{"agent_status":"working"}})
+                }
+                other => panic!("unexpected {other}"),
+            })
         }
     }
 
@@ -335,11 +549,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
-    }
-
-    fn pane_info(workspace: &str, tokens: serde_json::Value) -> serde_json::Value {
-        json!({"type":"pane_info","pane":{
-            "pane_id":"w1:p1","workspace_id":workspace,"tokens":tokens}})
     }
 
     fn pane(id: &str) -> PaneId {
@@ -352,9 +561,10 @@ mod tests {
 
     #[tokio::test]
     async fn split_with_a_pane_from_another_workspace_is_failed_and_changes_nothing() {
-        let (terminal, fake) = Fake::start("split-mismatch", |_| Some(pane_info("w2", json!({}))));
-        let error = terminal
-            .split_pane(&ws("w1"), &pane("w1:p1"))
+        let fake = Fake::start("split-mismatch");
+        let error = fake
+            .terminal()
+            .split_pane(&ws("w2"), &pane("w1:p1"))
             .await
             .unwrap_err();
         assert!(error.is_failed());
@@ -363,13 +573,9 @@ mod tests {
 
     #[tokio::test]
     async fn split_within_the_workspace_splits() {
-        let (terminal, fake) = Fake::start("split-ok", |request| {
-            Some(match request["method"].as_str().unwrap() {
-                "pane.get" => pane_info("w1", json!({})),
-                _ => json!({"type":"pane_info","pane":{"pane_id":"w1:p2","workspace_id":"w1"}}),
-            })
-        });
-        let new = terminal
+        let fake = Fake::start("split-ok");
+        let new = fake
+            .terminal()
             .split_pane(&ws("w1"), &pane("w1:p1"))
             .await
             .unwrap();
@@ -378,175 +584,192 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_is_found_by_its_recorded_root_not_by_pane_cwd() {
-        let root = std::env::temp_dir();
-        let key = root_key(&root);
-        let (terminal, _fake) = Fake::start("find", move |request| {
-            Some(match request["method"].as_str().unwrap() {
-                "workspace.list" => json!({"type":"workspace_list","workspaces":[
-                    {"workspace_id":"w1","tokens":{}},
-                    {"workspace_id":"w2","tokens":{ROOT_TOKEN: key}}]}),
-                // The first pane has since moved to another directory.
-                _ => json!({"type":"pane_list","panes":[
-                    {"pane_id":"w1:p1","workspace_id":"w1","cwd":"/elsewhere"},
-                    {"pane_id":"w2:p2","workspace_id":"w2","cwd":"/moved"},
-                    {"pane_id":"w2:p1","workspace_id":"w2","cwd":"/also/moved"}]}),
-            })
-        });
-        let (workspace, panes) = terminal.find_workspace(&root).await.unwrap().unwrap();
-        assert_eq!(workspace, ws("w2"));
-        assert_eq!(panes, [pane("w2:p1"), pane("w2:p2")]);
+    async fn created_workspace_is_found_again_by_a_new_instance() {
+        let fake = Fake::start("find");
+        let dir = std::env::temp_dir();
+        let (workspace, root) = fake.terminal().create_workspace(&dir).await.unwrap();
+        let (found, panes) = fake.terminal().find_workspace(&dir).await.unwrap().unwrap();
+        assert_eq!((found, panes), (workspace, vec![root]));
         assert!(
-            terminal
+            fake.terminal()
                 .find_workspace(Path::new("/nowhere/else"))
                 .await
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[tokio::test]
-    async fn create_records_the_root_token() {
-        let dir = std::env::temp_dir();
-        let (terminal, fake) = Fake::start("create", |request| {
-            Some(match request["method"].as_str().unwrap() {
-                "workspace.create" => json!({"type":"workspace_created",
-                    "workspace":{"workspace_id":"w3"},"root_pane":{"pane_id":"w3:p1"}}),
-                _ => json!({"type":"ok"}),
-            })
-        });
-        terminal.create_workspace(&dir).await.unwrap();
-        let requests = fake.requests.lock().unwrap();
-        assert_eq!(requests[1]["method"], "workspace.report_metadata");
-        assert_eq!(requests[1]["params"]["workspace_id"], "w3");
-        assert_eq!(requests[1]["params"]["tokens"][ROOT_TOKEN], root_key(&dir));
-    }
-
-    #[tokio::test]
-    async fn create_whose_root_cannot_be_recorded_is_uncertain_and_closes_the_workspace() {
-        let (terminal, fake) = Fake::start("create-fail", |request| {
-            Some(match request["method"].as_str().unwrap() {
-                "workspace.create" => json!({"type":"workspace_created",
-                    "workspace":{"workspace_id":"w3"},"root_pane":{"pane_id":"w3:p1"}}),
-                "workspace.report_metadata" => json!({"code":"internal","message":"m"}),
-                _ => json!({"type":"ok"}),
-            })
-        });
-        let error = terminal
-            .create_workspace(&std::env::temp_dir())
-            .await
-            .unwrap_err();
-        assert!(error.is_uncertain());
-        assert_eq!(fake.methods().last().unwrap(), "workspace.close");
-    }
-
-    /// Fake whose pane starts with `before` prompts and answers `agent.prompt` with `prompt`.
-    fn prompting(
-        name: &str,
-        before: u64,
-        prompt: Option<serde_json::Value>,
-        report_fails: bool,
-    ) -> (HerdrTerminal, Fake) {
-        let reports = std::sync::atomic::AtomicU64::new(0);
-        Fake::start(name, move |request| {
-            match request["method"].as_str().unwrap() {
-                "pane.get" => Some(pane_info("w1", json!({PROMPTS_TOKEN: before.to_string()}))),
-                "pane.report_metadata" => {
-                    // Only the rollback (the second report) fails when `report_fails`.
-                    let nth = reports.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Some(if report_fails && nth > 0 {
-                        json!({"code":"internal","message":"m"})
-                    } else {
-                        json!({"type":"ok"})
-                    })
-                }
-                _ => prompt.clone(),
-            }
-        })
-    }
-
-    fn accepted() -> Option<serde_json::Value> {
-        Some(json!({"type":"agent_prompted","agent":{"agent_status":"working"}}))
-    }
-
-    #[tokio::test]
-    async fn delivered_prompt_is_counted_before_it_is_sent() {
-        let (terminal, fake) = prompting("sent", 4, accepted(), false);
-        terminal.send_prompt(&pane("w1:p1"), "go").await.unwrap();
+        // Identity is set by the creating request alone.
         assert_eq!(
             fake.methods(),
-            ["pane.get", "pane.report_metadata", "agent.prompt"]
+            [
+                "workspace.create",
+                "workspace.list",
+                "pane.list",
+                "workspace.list"
+            ]
         );
-        assert_eq!(fake.written_counts(), ["\"5\""]);
     }
 
     #[tokio::test]
-    async fn lost_reply_stays_counted_and_uncertain() {
-        // The connection drops after the request was written: the prompt may have arrived.
-        let (terminal, fake) = prompting("lost", 4, None, false);
-        let error = terminal
-            .send_prompt(&pane("w1:p1"), "go")
-            .await
-            .unwrap_err();
+    async fn workspace_whose_create_reply_was_lost_is_still_found() {
+        let fake = Fake::start("create-lost");
+        let dir = std::env::temp_dir();
+        fake.with(|world| world.drop_create_reply = true);
+        let error = fake.terminal().create_workspace(&dir).await.unwrap_err();
         assert!(error.is_uncertain());
-        assert_eq!(fake.written_counts(), ["\"5\""]);
+        // After a restart the workspace is recovered from Herdr alone.
+        let (workspace, panes) = fake.terminal().find_workspace(&dir).await.unwrap().unwrap();
+        assert_eq!(workspace, ws("w2"));
+        assert_eq!(panes, [pane("w2:p1")]);
     }
 
     #[tokio::test]
-    async fn prompt_stalled_after_submission_stays_counted_and_uncertain() {
-        let stalled = Some(json!({"code":"agent_prompt_stalled","message":"m"}));
-        let (terminal, fake) = prompting("stalled", 0, stalled, false);
-        let error = terminal
-            .send_prompt(&pane("w1:p1"), "go")
-            .await
-            .unwrap_err();
-        assert!(error.is_uncertain());
-        assert_eq!(fake.written_counts(), ["\"1\""]);
-    }
-
-    #[tokio::test]
-    async fn rejected_prompt_takes_its_count_back_and_is_failed() {
-        let rejected = Some(json!({"code":"agent_blocked","message":"m"}));
-        let (terminal, fake) = prompting("rejected", 4, rejected, false);
-        let error = terminal
-            .send_prompt(&pane("w1:p1"), "go")
-            .await
-            .unwrap_err();
-        assert!(error.is_failed());
-        assert_eq!(fake.written_counts(), ["\"5\"", "\"4\""]);
-    }
-
-    #[tokio::test]
-    async fn rejected_prompt_whose_count_cannot_be_undone_is_uncertain() {
-        let rejected = Some(json!({"code":"agent_blocked","message":"m"}));
-        let (terminal, _fake) = prompting("rollback-fails", 4, rejected, true);
-        let error = terminal
-            .send_prompt(&pane("w1:p1"), "go")
-            .await
-            .unwrap_err();
-        assert!(error.is_uncertain());
-    }
-
-    #[tokio::test]
-    async fn prompt_is_not_sent_when_its_count_cannot_be_recorded() {
-        let (terminal, fake) = Fake::start("record-fails", |request| {
-            Some(match request["method"].as_str().unwrap() {
-                "pane.get" => pane_info("w1", json!({})),
-                _ => json!({"code":"internal","message":"m"}),
-            })
+    async fn find_matches_only_the_exact_root_and_the_first_such_workspace() {
+        let fake = Fake::start("find-exact");
+        let dir = std::env::temp_dir();
+        fake.with(|world| {
+            world.workspaces = vec![
+                ("w2".into(), "scratch".into()),
+                ("w3".into(), format!("{}x", root_label(&dir))),
+                ("w4".into(), root_label(&dir)),
+                ("w5".into(), root_label(&dir)),
+            ];
+            world.panes = vec![("w4:p1".into(), "w4".into())];
         });
-        let error = terminal
-            .send_prompt(&pane("w1:p1"), "go")
-            .await
-            .unwrap_err();
-        assert!(error.is_failed());
-        assert!(!fake.methods().contains(&"agent.prompt".to_owned()));
+        let (workspace, _) = fake.terminal().find_workspace(&dir).await.unwrap().unwrap();
+        assert_eq!(workspace, ws("w4"));
+    }
+
+    /// Sends `prompt` from a fresh instance.
+    async fn send(fake: &Fake, prompt: &str) -> Result<(), PortError> {
+        fake.terminal().send_prompt(&pane("w1:p1"), prompt).await
+    }
+
+    /// Reads the count from a fresh instance.
+    async fn received(fake: &Fake) -> Result<u64, PortError> {
+        fake.terminal().prompts_received(&pane("w1:p1")).await
     }
 
     #[tokio::test]
-    async fn count_is_read_from_the_pane_so_a_new_instance_sees_it() {
-        let (terminal, _fake) = prompting("count", 7, accepted(), false);
-        assert_eq!(terminal.prompts_received(&pane("w1:p1")).await.unwrap(), 7);
+    async fn delivered_prompts_are_counted_by_any_instance() {
+        let fake = Fake::start("sent");
+        assert_eq!(received(&fake).await.unwrap(), 0);
+        send(&fake, "one").await.unwrap();
+        send(&fake, "two").await.unwrap();
+        assert_eq!(received(&fake).await.unwrap(), 2);
+        assert_eq!(fake.delivered(), ["one", "two"]);
+    }
+
+    #[tokio::test]
+    async fn lost_reply_leaves_the_receipt_uncertain_after_a_restart() {
+        let fake = Fake::start("lost");
+        send(&fake, "one").await.unwrap();
+        fake.with(|world| world.prompt = Prompt::DropAfterDelivery);
+        assert!(send(&fake, "two").await.unwrap_err().is_uncertain());
+        assert!(received(&fake).await.unwrap_err().is_uncertain());
+    }
+
+    #[tokio::test]
+    async fn restart_before_the_send_does_not_confirm_the_prompt() {
+        // The receipt was written and the process died before `agent.prompt` took effect.
+        let fake = Fake::start("restart");
+        fake.with(|world| world.prompt = Prompt::DropBeforeDelivery);
+        assert!(send(&fake, "one").await.unwrap_err().is_uncertain());
+        assert!(fake.delivered().is_empty());
+        fake.with(|world| world.prompt = Prompt::Accept);
+        assert!(received(&fake).await.unwrap_err().is_uncertain());
+    }
+
+    #[tokio::test]
+    async fn stalled_prompt_is_uncertain_to_readers() {
+        let fake = Fake::start("stalled");
+        fake.with(|world| world.prompt = Prompt::Stall);
+        assert!(send(&fake, "one").await.unwrap_err().is_uncertain());
+        assert!(received(&fake).await.unwrap_err().is_uncertain());
+    }
+
+    #[tokio::test]
+    async fn rejected_prompt_is_failed_and_leaves_no_receipt() {
+        let fake = Fake::start("rejected");
+        send(&fake, "one").await.unwrap();
+        assert!(send(&fake, "bad").await.unwrap_err().is_failed());
+        assert_eq!(received(&fake).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_prompt_whose_receipt_cannot_be_removed_is_uncertain_to_readers() {
+        let fake = Fake::start("rollback-fails");
+        send(&fake, "one").await.unwrap();
+        fake.with(|world| world.fault = Fault::Removals);
+        assert!(send(&fake, "bad").await.unwrap_err().is_uncertain());
+        fake.with(|world| world.fault = Fault::None);
+        assert!(received(&fake).await.unwrap_err().is_uncertain());
+    }
+
+    #[tokio::test]
+    async fn delivery_whose_confirmation_is_lost_is_uncertain_not_counted() {
+        let fake = Fake::start("confirm-fails");
+        fake.with(|world| world.fault = Fault::Confirmations);
+        assert!(send(&fake, "one").await.unwrap_err().is_uncertain());
+        assert_eq!(fake.delivered(), ["one"]);
+        fake.with(|world| world.fault = Fault::None);
+        assert!(received(&fake).await.unwrap_err().is_uncertain());
+    }
+
+    #[tokio::test]
+    async fn prompt_is_not_sent_when_its_receipt_cannot_be_recorded() {
+        let fake = Fake::start("record-fails");
+        fake.with(|world| world.fault = Fault::All);
+        let error = send(&fake, "one").await.unwrap_err();
+        assert!(error.is_failed());
+        assert!(fake.delivered().is_empty());
+        assert_eq!(received(&fake).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_full_pane_refuses_prompts_before_sending() {
+        let fake = Fake::start("full");
+        fake.with(|world| {
+            for n in 0..32 {
+                world.tokens.insert(format!("other{n}"), "x".into());
+            }
+        });
+        assert!(send(&fake, "one").await.unwrap_err().is_failed());
+        assert!(fake.delivered().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_sends_from_separate_instances_are_all_counted() {
+        let fake = Arc::new(Fake::start("concurrent"));
+        let mut sends = tokio::task::JoinSet::new();
+        for n in 0..24 {
+            let fake = fake.clone();
+            // Rejected sends roll their receipts back while the others confirm theirs.
+            let prompt = if n % 3 == 0 {
+                "bad".to_owned()
+            } else {
+                format!("p{n}")
+            };
+            sends.spawn(async move { send(&fake, &prompt).await });
+        }
+        let mut accepted = 0;
+        while let Some(result) = sends.join_next().await {
+            accepted += u64::from(result.unwrap().is_ok());
+        }
+        assert_eq!(accepted, 16);
+        assert_eq!(received(&fake).await.unwrap(), 16);
+        assert_eq!(fake.delivered().len(), 16);
+    }
+
+    #[tokio::test]
+    async fn a_read_during_an_unsettled_send_is_uncertain() {
+        let fake = Fake::start("in-flight");
+        send(&fake, "one").await.unwrap();
+        fake.with(|world| {
+            world
+                .tokens
+                .insert(format!("{RECEIPT_PREFIX}other"), PENDING.into());
+        });
+        assert!(received(&fake).await.unwrap_err().is_uncertain());
     }
 
     #[tokio::test]
@@ -558,7 +781,7 @@ mod tests {
                 timeout: std::time::Duration::from_secs(1),
             },
         };
-        let terminal: std::sync::Arc<dyn Terminal> = std::sync::Arc::new(terminal);
+        let terminal: Arc<dyn Terminal> = Arc::new(terminal);
         let error = terminal
             .find_workspace(Path::new("relative"))
             .await

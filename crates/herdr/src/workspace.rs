@@ -1,7 +1,6 @@
 use crate::{
     HerdrClient, HerdrError,
     herdr::{Effect, require_absolute},
-    terminal::{METADATA_SOURCE, ROOT_TOKEN},
 };
 use chimera_core::{PaneId, WorkspaceId};
 use serde::Deserialize;
@@ -13,7 +12,9 @@ const WORKSPACE_NOT_FOUND: &str = "workspace_not_found";
 
 impl HerdrClient {
     /// Open an existing absolute directory in a new workspace and return its ID and root pane.
-    /// Creates no Git checkout.
+    /// Creates no Git checkout. The workspace is labelled with [`root_label`] by the creating
+    /// request itself, so its identity exists exactly when the workspace does, even if the reply
+    /// is lost.
     pub async fn create_workspace_in(
         &self,
         directory: &Path,
@@ -22,43 +23,15 @@ impl HerdrClient {
         let created: crate::herdr::CreatedWorkspace = self
             .request(
                 "workspace.create",
-                &json!({"cwd": directory, "focus": false}),
+                &json!({"cwd": directory, "focus": false, "label": root_label(directory)}),
                 "workspace_created",
                 Effect::Change,
             )
             .await?;
-        let workspace = workspace_id(created.workspace.workspace_id)?;
-        let root = pane_id(created.root_pane.pane_id)?;
-        // Without its root token the workspace could not be found again, so give it up rather
-        // than leave it orphaned.
-        if let Err(error) = self.record_root(&workspace, directory).await {
-            let _ = self.close_workspace(&workspace).await;
-            return Err(HerdrError::Protocol {
-                message: format!("workspace created but its root was not recorded: {error}"),
-                uncertain: true,
-            });
-        }
-        Ok((workspace, root))
-    }
-
-    async fn record_root(
-        &self,
-        workspace: &WorkspaceId,
-        directory: &Path,
-    ) -> Result<(), HerdrError> {
-        let _: serde_json::Value = self
-            .request(
-                "workspace.report_metadata",
-                &json!({
-                    "workspace_id": workspace.as_str(),
-                    "source": METADATA_SOURCE,
-                    "tokens": {ROOT_TOKEN: root_key(directory)},
-                }),
-                "ok",
-                Effect::Change,
-            )
-            .await?;
-        Ok(())
+        Ok((
+            workspace_id(created.workspace.workspace_id)?,
+            pane_id(created.root_pane.pane_id)?,
+        ))
     }
 
     /// Split a pane and return the new pane.
@@ -96,6 +69,16 @@ impl HerdrClient {
         }
     }
 }
+
+/// The label a workspace is created with. It is the workspace's identity: `find_workspace`
+/// matches it, so it survives a lost reply and a Chimera restart. Renaming the workspace
+/// in Herdr discards the identity.
+pub(crate) fn root_label(directory: &Path) -> String {
+    format!("{LABEL_PREFIX}{}", root_key(directory))
+}
+
+/// Prefix of every label [`root_label`] produces.
+const LABEL_PREFIX: &str = "chimera:";
 
 /// A stable key for a workspace root, short enough for a Herdr token (values are cut at about
 /// 64 characters): 128 bits of two FNV-1a hashes of the real path, or of the path as given when
@@ -231,7 +214,7 @@ mod tests {
         assert_eq!(request["method"], "workspace.create");
         assert_eq!(
             request["params"],
-            json!({"cwd": "/work/tree", "focus": false})
+            json!({"cwd": "/work/tree", "focus": false, "label": root_label(Path::new("/work/tree"))})
         );
     }
 

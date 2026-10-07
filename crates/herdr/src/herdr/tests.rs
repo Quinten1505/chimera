@@ -372,7 +372,8 @@ async fn connects_creates_workspace_and_splits_pane_over_socket() {
             ),
             (
                 json!({"method":"workspace.create","params":{
-                    "cwd":"/repo with spaces","focus":false
+                    "cwd":"/repo with spaces","focus":false,
+                    "label": crate::workspace::root_label(Path::new("/repo with spaces"))
                 }}),
                 json!({
                     "type":"workspace_created",
@@ -381,13 +382,6 @@ async fn connects_creates_workspace_and_splits_pane_over_socket() {
                     "tab":{"tab_id":"w2:t1","workspace_id":"w2"},
                     "root_pane":{"pane_id":"w2:p1","workspace_id":"w2","tab_id":"w2:t1"}
                 }),
-            ),
-            (
-                json!({"method":"workspace.report_metadata","params":{
-                    "workspace_id":"w2","source":"chimera",
-                    "tokens":{"chimera_root": crate::workspace::root_key(Path::new("/repo with spaces"))}
-                }}),
-                json!({"type":"ok"}),
             ),
             (
                 json!({"method":"pane.split","params":{

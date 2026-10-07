@@ -97,8 +97,15 @@ end is kept). `close_workspace` succeeds when the workspace is already gone.
 **Reconnecting.** `HerdrTerminal` keeps no workspace, pane, or agent state in memory; every
 operation addresses Herdr by the IDs it is given. After a Chimera restart, build a new
 instance from the socket path alone and use the IDs saved earlier. The count behind
-`prompts_received` is kept in Herdr itself, in a pane metadata token (`chimera_prompts`),
-and `find_workspace` finds a workspace by its first pane's working directory.
+`prompts_received` is kept in Herdr itself: each send records its own pane metadata token
+(`chimera_p_<nonce>`) before sending, so concurrent sends and restarts never overwrite one
+another. The token is confirmed on delivery and removed on a certain failure; a send whose
+outcome is unknown leaves it pending, and `prompts_received` then reports *uncertain* instead
+of a count. Herdr allows 32 tokens per pane, which bounds the prompts one pane can record (a
+send past that is *failed* and sends nothing). `create_workspace` labels the workspace
+`chimera:<root key>` in the creating request, and `find_workspace` finds a workspace by that
+root token, not by any pane's working directory, so it works after a lost reply or a restart.
+Renaming the workspace in Herdr discards its identity.
 
 **Errors.** Every `HerdrError` is *failed* (known not to have happened) or *uncertain*
 (a state-changing request was written and its outcome is unknown, so inspect Herdr before
