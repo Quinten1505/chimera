@@ -86,64 +86,6 @@ impl HerdrClient {
         Ok(result.pane)
     }
 
-    /// Launch Codex in an existing shell pane and wait for interactive readiness.
-    /// No automatic retries: an error can occur after the process has started.
-    pub async fn start_codex_agent(
-        &self,
-        name: &str,
-        pane_id: &str,
-        args: &[String],
-    ) -> Result<crate::Agent, HerdrError> {
-        if name.trim().is_empty() || pane_id.trim().is_empty() {
-            return Err(HerdrError::InvalidInput(
-                "agent name and pane_id must not be empty",
-            ));
-        }
-        if args.iter().any(|arg| arg.contains('\0')) {
-            return Err(HerdrError::InvalidInput(
-                "agent arguments must not contain NUL",
-            ));
-        }
-        #[derive(Deserialize)]
-        struct StartedAgent {
-            name: Option<String>,
-            agent: Option<String>,
-            pane_id: String,
-            #[serde(default)]
-            agent_session: Option<crate::AgentSessionReference>,
-        }
-        #[derive(Deserialize)]
-        struct Started {
-            agent: StartedAgent,
-        }
-        // Allow the server's 30-second readiness wait to finish before the socket expires.
-        let mut client = self.clone();
-        client.timeout = client.timeout.max(Duration::from_secs(35));
-        let started: Started = client
-            .request(
-                "agent.start",
-                &serde_json::json!({
-                    "name": name, "kind": "codex", "pane_id": pane_id,
-                    "args": args, "timeout_ms": 30_000,
-                }),
-                "agent_started",
-                Effect::Change,
-            )
-            .await?;
-        if started.agent.pane_id != pane_id || started.agent.agent.as_deref() != Some("codex") {
-            return Err(HerdrError::Protocol {
-                message: "agent.start returned a different pane or agent kind".into(),
-                uncertain: true,
-            });
-        }
-        Ok(crate::Agent {
-            name: started.agent.name.unwrap_or_else(|| name.to_owned()),
-            kind: "codex".into(),
-            pane_id: started.agent.pane_id,
-            session: started.agent.agent_session,
-        })
-    }
-
     #[cfg(unix)]
     pub(crate) async fn request<T: DeserializeOwned>(
         &self,

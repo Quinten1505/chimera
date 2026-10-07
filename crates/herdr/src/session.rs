@@ -1,4 +1,4 @@
-use crate::{Agent, HerdrClient, HerdrError, WorkspaceOptions};
+use crate::{HerdrClient, HerdrError, WorkspaceOptions};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -8,9 +8,6 @@ pub struct WorkspacePanes {
     /// The Herdr workspace ID, including for workspaces opened at the repo root.
     pub workspace_id: String,
     pub pane_ids: Vec<String>,
-    /// Agents successfully started in this workspace, one per pane.
-    #[serde(default)]
-    pub agents: Vec<Agent>,
     /// Associated Git checkout, when known; may be the repo root or a linked worktree.
     /// None means the association is unknown, not necessarily that this is outside Git.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36,7 +33,7 @@ impl HerdrClient {
     /// Start an application session and record its initial Herdr workspace and pane.
     ///
     /// The caller supplies the application session ID. State is returned in memory;
-    /// callers may serialize it for persistence. This does not launch an AI agent.
+    /// callers may serialize it for persistence. This does not launch an AI agent; see [`HerdrClient::launch_agent`].
     pub async fn start_session(
         &self,
         session_id: impl Into<String>,
@@ -50,7 +47,6 @@ impl HerdrClient {
             SessionTarget::Workspace(options) => {
                 let created = self.create_workspace(options).await?;
                 WorkspacePanes {
-                    agents: Vec::new(),
                     workspace_id: created.workspace.workspace_id,
                     pane_ids: vec![created.root_pane.pane_id],
                     checkout_path: created.workspace.checkout_path,

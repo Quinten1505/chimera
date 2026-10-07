@@ -128,40 +128,20 @@ State is held in the returned struct and supports Serde serialization. Startup
 does not write a session file or launch an AI agent. Additional panes created
 with add_pane must be recorded in the session by the caller.
 
-## Starting Codex agents in an existing session
+## Launching an agent in an existing pane
 
-Load a Chimera YAML file (see `chimera.example.yaml`) and launch one Codex agent
-per tracked pane:
+`HerdrClient::launch_agent(&PaneId, &[String])` takes a ready command line (program
+and arguments as separate entries, as built by `chimera-configuration`) and
+returns once Herdr reports an agent on that pane. The adapter knows no
+providers: Herdr's `agent.start` requires an agent kind, so each entry is
+shell-quoted and typed into the pane's shell (`pane.send_input`), and readiness is
+detected by polling `pane.get` for up to 30 seconds (`launch_agent_within`
+takes another wait).
 
-```rust,no_run
-use chimera::start_session_agents;
-use chimera_herdr::{HerdrClient, Session};
-
-fn launch(client: &HerdrClient, session: &mut Session) -> Result<(), Box<dyn std::error::Error>> {
-    start_session_agents(client, session, "chimera.yaml")
-}
-```
-
-`chimera_configuration::load(path)` returns the validated ticket and final
-`AgentConfiguration`s and the `Limits`, or a `ConfigurationError` naming the
-field. `start_session_agents` currently launches the `ticket.implementation`
-profile in every pane, with argv from `codex_launch_args`. The `chimera` binary
-loads its configuration first (path argument, default `chimera.yaml`) and exits
-with the error before any Herdr workspace is created. The mapping uses Codex's
-[configuration overrides](https://learn.chatgpt.com/docs/config-file/config-reference)
-and the installed CLI's `--approve-for-me` option.
-
-Herdr's `agent.start` launches into an existing shell pane and waits for
-interactive readiness. Each successful launch is appended to
-`WorkspacePanes.agents`, including its provider session reference when available.
-Already tracked panes are skipped. Launching stops at the first error and retains
-earlier successes; it is not a transaction and does not roll them back. A timeout
-can leave an agent running without a recorded success, so inspect Herdr before
-retrying. Startup allows Herdr 30 seconds for readiness and at least 35 seconds
-for the socket response.
-
-This helper consumes an already populated session. It does not create the layout,
-save session files, or change the executable's hello-world entry point.
+An empty program, empty pane ID, or NUL in an argument fails before Herdr is
+contacted. After the command has been sent, a readiness timeout, timeout, or
+dropped connection is *uncertain* (the process may already be running); inspect
+Herdr before retrying. Nothing is retried automatically.
 
 ## Git integration
 

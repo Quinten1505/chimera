@@ -7,13 +7,11 @@
 //! [`HerdrError`] classifies every failure as *failed* or *uncertain* and converts into
 //! `chimera_core::PortError`.
 
-mod agent;
 mod herdr;
+mod launch;
 mod session;
 mod status;
 mod workspace;
-
-pub use agent::{Agent, AgentSessionReference};
 
 pub use herdr::{
     CreatedWorkspace, HerdrClient, HerdrError, OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES, Pane,
@@ -22,4 +20,5 @@ pub use herdr::{
 
 pub use status::{AgentRecord, is_not_found, turn_status, turn_status_of_lookup};
 
+pub use launch::DEFAULT_READY_TIMEOUT;
 pub use session::{Session, SessionTarget, WorkspacePanes};
