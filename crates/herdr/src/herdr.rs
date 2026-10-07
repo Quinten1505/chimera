@@ -23,8 +23,8 @@ pub(crate) enum Effect {
 /// a timeout may occur after Herdr has already performed the operation.
 #[derive(Debug, Clone)]
 pub struct HerdrClient {
-    socket_path: PathBuf,
-    timeout: Duration,
+    pub(crate) socket_path: PathBuf,
+    pub(crate) timeout: Duration,
 }
 
 impl HerdrClient {
@@ -145,7 +145,7 @@ impl HerdrClient {
     }
 
     #[cfg(unix)]
-    async fn request<T: DeserializeOwned>(
+    pub(crate) async fn request<T: DeserializeOwned>(
         &self,
         method: &str,
         params: &impl Serialize,
@@ -164,7 +164,7 @@ impl HerdrClient {
     }
 
     #[cfg(not(unix))]
-    async fn request<T: DeserializeOwned>(
+    pub(crate) async fn request<T: DeserializeOwned>(
         &self,
         _method: &str,
         _params: &impl Serialize,
@@ -339,7 +339,7 @@ impl From<HerdrError> for chimera_core::error::PortError {
     }
 }
 
-fn require_absolute(path: &Path) -> Result<(), HerdrError> {
+pub(crate) fn require_absolute(path: &Path) -> Result<(), HerdrError> {
     if !path.is_absolute() {
         return Err(HerdrError::InvalidInput("cwd and path must be absolute"));
     }

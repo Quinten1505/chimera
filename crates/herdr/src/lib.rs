@@ -11,6 +11,7 @@ mod agent;
 mod herdr;
 mod session;
 mod status;
+mod workspace;
 
 pub use agent::{Agent, AgentSessionReference};
 
